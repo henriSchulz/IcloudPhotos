@@ -195,3 +195,116 @@ async fn missing_interpreter_is_a_spawn_error() {
         "unerwartet: {error:?}"
     );
 }
+
+#[tokio::test]
+async fn sync_downloads_thumbnails() {
+    let python = python_or_skip!();
+    let mut catalog = Catalog::open_in_memory().unwrap();
+    let dir = tempfile::tempdir().unwrap();
+
+    let mut options = options(&python, 5);
+    options.thumbnail_dir = Some(dir.path().to_path_buf());
+
+    let summary = run_sync(&mut catalog, &options, None, None).await.unwrap();
+
+    assert_eq!(summary.stored, 5);
+    assert_eq!(summary.thumbnails, 5);
+    assert_eq!(summary.thumbnails_failed, 0);
+
+    // Jede Katalogzeile zeigt auf eine Datei, die es wirklich gibt.
+    for photo in catalog.page(0, 10).unwrap() {
+        let path = photo.thumb_path.expect("thumb_path fehlt");
+        assert!(path.is_file(), "{} existiert nicht", path.display());
+        assert!(photo.thumb_bytes.unwrap() > 0);
+        assert_eq!(path.metadata().unwrap().len(), photo.thumb_bytes.unwrap());
+    }
+}
+
+#[tokio::test]
+async fn thumbnails_survive_a_resync() {
+    let python = python_or_skip!();
+    let mut catalog = Catalog::open_in_memory().unwrap();
+    let dir = tempfile::tempdir().unwrap();
+
+    let mut options = options(&python, 3);
+    options.thumbnail_dir = Some(dir.path().to_path_buf());
+
+    run_sync(&mut catalog, &options, None, None).await.unwrap();
+    let before: Vec<_> = catalog
+        .page(0, 10)
+        .unwrap()
+        .into_iter()
+        .map(|p| p.thumb_path)
+        .collect();
+
+    run_sync(&mut catalog, &options, None, None).await.unwrap();
+    let after: Vec<_> = catalog
+        .page(0, 10)
+        .unwrap()
+        .into_iter()
+        .map(|p| p.thumb_path)
+        .collect();
+
+    assert_eq!(before, after, "ein Re-Sync darf Vorschauen nicht verlieren");
+    assert!(catalog.ids_without_thumbnail(10).unwrap().is_empty());
+}
+
+#[tokio::test]
+async fn thumbnail_events_reach_the_ui() {
+    let python = python_or_skip!();
+    let mut catalog = Catalog::open_in_memory().unwrap();
+    let dir = tempfile::tempdir().unwrap();
+
+    let mut options = options(&python, 4);
+    options.thumbnail_dir = Some(dir.path().to_path_buf());
+
+    let (tx, mut rx) = mpsc::unbounded_channel();
+    run_sync(&mut catalog, &options, Some(tx), None)
+        .await
+        .unwrap();
+
+    let mut counts = Vec::new();
+    while let Ok(event) = rx.try_recv() {
+        if let SyncEvent::Thumbnails { stored } = event {
+            counts.push(stored);
+        }
+    }
+    assert_eq!(
+        counts,
+        [1, 2, 3, 4],
+        "je Vorschau eine Meldung, aufsteigend"
+    );
+}
+
+#[tokio::test]
+async fn backfill_sends_ids_only_after_authentication() {
+    let python = python_or_skip!();
+    let mut catalog = Catalog::open_in_memory().unwrap();
+    let dir = tempfile::tempdir().unwrap();
+
+    // Erst einen Sync ohne Vorschauen, damit Katalogzeilen ohne thumb_path da sind.
+    run_sync(&mut catalog, &options(&python, 3), None, None)
+        .await
+        .unwrap();
+    let missing = catalog.ids_without_thumbnail(10).unwrap();
+    assert_eq!(missing.len(), 3);
+
+    // Der Fake-Sidecar verlangt hier 2FA. Wuerden die IDs vor dem Code
+    // rausgehen, verschluckte der Sidecar die erste ID als 2FA-Code.
+    let mut options = options(&python, 3);
+    options.thumbnail_dir = Some(dir.path().to_path_buf());
+    options.fetch_thumbnails_for = missing;
+    options.fake_two_factor = true;
+
+    let (tx, mut rx) = mpsc::unbounded_channel::<TwoFactorRequest>();
+    tokio::spawn(async move {
+        let request = rx.recv().await.expect("2FA wurde nicht angefragt");
+        request.send("123456".to_string()).unwrap();
+    });
+
+    let summary = run_sync(&mut catalog, &options, None, Some(tx))
+        .await
+        .unwrap();
+    assert_eq!(summary.thumbnails, 3);
+    assert!(catalog.ids_without_thumbnail(10).unwrap().is_empty());
+}

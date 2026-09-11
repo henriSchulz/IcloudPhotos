@@ -252,6 +252,24 @@ impl Catalog {
         Ok(from_sql_bytes(sum))
     }
 
+    /// IDs von Fotos ohne Vorschau, neueste zuerst.
+    ///
+    /// Der Delta-Sync sieht ältere Assets nicht erneut; fehlt dort eine
+    /// Vorschau, muss sie gezielt nachgeholt werden.
+    pub fn ids_without_thumbnail(&self, limit: u64) -> Result<Vec<String>, CacheError> {
+        let mut stmt = self.conn.prepare(
+            r#"
+            SELECT id
+              FROM photos
+             WHERE thumb_path IS NULL
+             ORDER BY added_date DESC
+             LIMIT ?1
+            "#,
+        )?;
+        let rows = stmt.query_map(params![to_sql_bytes(limit)], |row| row.get(0))?;
+        Ok(rows.collect::<Result<Vec<_>, _>>()?)
+    }
+
     /// Gecachte Originale, am längsten ungenutzte zuerst.
     ///
     /// SQLite sortiert `NULL` bei `ASC` an den Anfang — nie geöffnete Fotos
@@ -501,6 +519,33 @@ mod tests {
         assert!(photo.last_accessed_at.is_some());
         assert_eq!(photo.orig_path, None);
         assert_eq!(photo.orig_bytes, None);
+    }
+
+    #[test]
+    fn lists_photos_missing_a_thumbnail() {
+        let mut catalog = Catalog::open_in_memory().unwrap();
+        catalog
+            .upsert_batch(&[
+                record("a", "2026-01-01T00:00:00Z"),
+                record("b", "2026-02-01T00:00:00Z"),
+                record("c", "2026-03-01T00:00:00Z"),
+            ])
+            .unwrap();
+        catalog
+            .set_thumbnail("b", Path::new("/thumbs/b.jpg"), 10)
+            .unwrap();
+
+        // Neueste zuerst, damit die sichtbaren Kacheln zuerst gefüllt werden.
+        assert_eq!(catalog.ids_without_thumbnail(10).unwrap(), ["c", "a"]);
+        assert_eq!(catalog.ids_without_thumbnail(1).unwrap(), ["c"]);
+
+        catalog
+            .set_thumbnail("a", Path::new("/thumbs/a.jpg"), 10)
+            .unwrap();
+        catalog
+            .set_thumbnail("c", Path::new("/thumbs/c.jpg"), 10)
+            .unwrap();
+        assert!(catalog.ids_without_thumbnail(10).unwrap().is_empty());
     }
 
     #[test]

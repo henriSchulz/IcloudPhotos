@@ -17,6 +17,16 @@ pub enum SidecarMessage {
         trusted: bool,
     },
     Photo(PhotoRecord),
+    /// Eine Vorschau wurde geladen und liegt unter `path`.
+    Thumb {
+        id: String,
+        path: std::path::PathBuf,
+        bytes: u64,
+    },
+    ThumbFailed {
+        id: String,
+        message: String,
+    },
     Done {
         count: u64,
         #[serde(default)]
@@ -43,6 +53,10 @@ pub enum SyncEvent {
     },
     /// So viele Datensätze sind bereits im Katalog.
     Progress {
+        stored: u64,
+    },
+    /// So viele Vorschauen liegen bereits auf der Platte.
+    Thumbnails {
         stored: u64,
     },
 }
@@ -89,6 +103,24 @@ mod tests {
                 expected
             );
         }
+    }
+
+    #[test]
+    fn parses_thumb_lines() {
+        let line = r#"{"type":"thumb","id":"a","path":"/cache/a.jpg","bytes":34567}"#;
+        let msg: SidecarMessage = serde_json::from_str(line).unwrap();
+        assert_eq!(
+            msg,
+            SidecarMessage::Thumb {
+                id: "a".into(),
+                path: std::path::PathBuf::from("/cache/a.jpg"),
+                bytes: 34567,
+            }
+        );
+
+        let line = r#"{"type":"thumb_failed","id":"a","message":"keine Vorschau"}"#;
+        let msg: SidecarMessage = serde_json::from_str(line).unwrap();
+        assert!(matches!(msg, SidecarMessage::ThumbFailed { .. }));
     }
 
     #[test]

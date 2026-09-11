@@ -26,6 +26,10 @@ pub struct SidecarOptions {
     pub cookie_dir: Option<PathBuf>,
     /// Nur Assets neuer als dieser Zeitpunkt abfragen (Delta-Sync).
     pub since: Option<DateTime<Utc>>,
+    /// Wohin Vorschaubilder geladen werden. `None` heisst: nur Metadaten.
+    pub thumbnail_dir: Option<PathBuf>,
+    /// Statt eines Syncs nur Vorschauen fuer diese IDs nachladen.
+    pub fetch_thumbnails_for: Vec<String>,
     /// Testmodus: so viele synthetische Datensätze statt echter iCloud-Zugriffe.
     pub fake: Option<u64>,
     /// Testmodus: den 2FA-Dialog durchspielen.
@@ -44,6 +48,8 @@ impl SidecarOptions {
             username: username.into(),
             cookie_dir: None,
             since: None,
+            thumbnail_dir: None,
+            fetch_thumbnails_for: Vec::new(),
             fake: None,
             fake_two_factor: false,
         }
@@ -51,6 +57,10 @@ impl SidecarOptions {
 
     fn argv(&self) -> Vec<String> {
         let mut args = vec![self.script.to_string_lossy().into_owned()];
+        if let Some(dir) = &self.thumbnail_dir {
+            args.push("--thumbs".into());
+            args.push(dir.to_string_lossy().into_owned());
+        }
         if let Some(count) = self.fake {
             args.push("--fake".into());
             args.push(count.to_string());
@@ -65,11 +75,20 @@ impl SidecarOptions {
             args.push("--cookie-dir".into());
             args.push(dir.to_string_lossy().into_owned());
         }
+        if self.is_thumbnail_backfill() {
+            args.push("--fetch-thumbs".into());
+            return args;
+        }
         if let Some(since) = self.since {
             args.push("--since".into());
             args.push(since.to_rfc3339());
         }
         args
+    }
+
+    /// Im Nachlade-Modus kommen IDs ueber stdin statt eines vollen Syncs.
+    fn is_thumbnail_backfill(&self) -> bool {
+        !self.fetch_thumbnails_for.is_empty()
     }
 }
 
@@ -80,6 +99,10 @@ pub struct SyncSummary {
     pub stored: u64,
     /// Wie viele der Sidecar gemeldet hat.
     pub reported: u64,
+    /// Wie viele Vorschauen im Katalog vermerkt wurden.
+    pub thumbnails: u64,
+    /// Wie viele Vorschauen der Sidecar nicht laden konnte.
+    pub thumbnails_failed: u64,
     /// Neuer Cursor für den nächsten Delta-Sync.
     pub cursor: Option<DateTime<Utc>>,
 }
@@ -152,6 +175,23 @@ pub async fn run_sync(
                     );
                 }
             }
+            SidecarMessage::Thumb { id, path, bytes } => {
+                // Der Katalogeintrag muss existieren, sonst laeuft das Update
+                // ins Leere — deshalb erst den Batch schreiben.
+                summary.stored += flush(catalog, &mut batch)?;
+                catalog.set_thumbnail(&id, &path, bytes)?;
+                summary.thumbnails += 1;
+                emit(
+                    &events,
+                    SyncEvent::Thumbnails {
+                        stored: summary.thumbnails,
+                    },
+                );
+            }
+            SidecarMessage::ThumbFailed { id, message } => {
+                tracing::warn!(%id, %message, "Vorschau konnte nicht geladen werden");
+                summary.thumbnails_failed += 1;
+            }
             SidecarMessage::AuthRequired { method } => {
                 tracing::info!(%method, "Sidecar fordert 2FA-Code an");
                 emit(&events, SyncEvent::TwoFactorRequired);
@@ -179,6 +219,18 @@ pub async fn run_sync(
                     );
                 }
                 emit(&events, SyncEvent::Authenticated { trusted });
+
+                // Erst jetzt die IDs schicken. Vorher waere die erste Zeile als
+                // 2FA-Code verschluckt worden, denn der Sidecar liest beides
+                // von stdin.
+                if options.is_thumbnail_backfill() {
+                    let payload = options.fetch_thumbnails_for.join("\n");
+                    stdin.write_all(payload.as_bytes()).await?;
+                    stdin.write_all(b"\n").await?;
+                    stdin.flush().await?;
+                    // EOF beendet die Leseschleife des Sidecars.
+                    stdin.shutdown().await?;
+                }
             }
             SidecarMessage::Done { count, cursor } => {
                 summary.reported = count;
@@ -228,6 +280,8 @@ pub async fn run_sync(
     tracing::info!(
         stored = summary.stored,
         reported = summary.reported,
+        thumbnails = summary.thumbnails,
+        thumbnails_failed = summary.thumbnails_failed,
         "Sync abgeschlossen"
     );
     Ok(summary)

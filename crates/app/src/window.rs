@@ -69,6 +69,11 @@ impl AppState {
         true
     }
 
+    /// Ob ein Sync ueberhaupt losgeschickt werden kann.
+    pub fn sync_configured(&self) -> bool {
+        !self.config.icloud.username.trim().is_empty() || crate::sync_task::fake_count().is_some()
+    }
+
     /// Verwirft das Modell und lädt von vorn — nach einem Sync.
     fn reload(&self) {
         self.model.remove_all();
@@ -139,14 +144,17 @@ pub fn build(app: &adw::Application, state: Rc<AppState>) {
     state.load_next_page();
     update_status(&state, &status, &stack);
 
-    sync_button.connect_clicked({
+    let trigger = {
         let state = state.clone();
         let status = status.clone();
         let stack = stack.clone();
         let window = window.clone();
         let sync_button = sync_button.clone();
-        move |_| {
+        move || {
+            // Laeuft schon einer, wird nicht nachgelegt. Zwei Sidecars auf
+            // demselben Katalog waeren nur Doppelarbeit.
             if state.syncing.replace(true) {
+                tracing::debug!("Sync laeuft bereits, Anforderung verworfen");
                 return;
             }
             sync_button.set_sensitive(false);
@@ -159,9 +167,31 @@ pub fn build(app: &adw::Application, state: Rc<AppState>) {
                 sync_button.clone(),
             );
         }
+    };
+
+    sync_button.connect_clicked({
+        let trigger = trigger.clone();
+        move |_| trigger()
     });
 
     window.present();
+
+    if state.sync_configured() {
+        // Direkt beim Start einmal syncen, danach im konfigurierten Takt.
+        trigger();
+
+        let interval =
+            std::time::Duration::from_secs(state.config.icloud.sync_interval_minutes * 60);
+        glib::timeout_add_local(interval, move || {
+            trigger();
+            glib::ControlFlow::Continue
+        });
+    } else {
+        status.set_label("Keine Apple-ID konfiguriert");
+        tracing::warn!(
+            "icloud.username ist leer — kein automatischer Sync. Siehe config.example.toml"
+        );
+    }
 }
 
 fn build_grid(state: &Rc<AppState>, window: &adw::ApplicationWindow) -> gtk::GridView {
@@ -361,6 +391,9 @@ fn start_sync(
                 SyncMessage::Progress { stored } => {
                     status.set_label(&format!("Sync läuft … {stored} Fotos"));
                 }
+                SyncMessage::Thumbnails { stored } => {
+                    status.set_label(&format!("Lade Vorschauen … {stored}"));
+                }
                 SyncMessage::TwoFactorRequired { responder } => {
                     let code = ask_two_factor_code(&window).await;
                     match code {
@@ -375,7 +408,12 @@ fn start_sync(
                     }
                 }
                 SyncMessage::Finished(Ok(summary)) => {
-                    tracing::info!(stored = summary.stored, "Sync fertig");
+                    tracing::info!(
+                        stored = summary.stored,
+                        thumbnails = summary.thumbnails,
+                        failed = summary.thumbnails_failed,
+                        "Sync fertig"
+                    );
                     state.reload();
                     update_status(&state, &status, &stack);
                 }

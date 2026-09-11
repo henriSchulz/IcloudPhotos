@@ -6,22 +6,28 @@ Das Protokoll ist zeilenweises JSON; jede Zeile hat ein Feld ``type``:
     {"type": "auth_required", "method": "2fa"}   -> erwartet Code auf stdin
     {"type": "auth_ok", "trusted": true}
     {"type": "photo", "id": ..., "filename": ...}
+    {"type": "thumb", "id": ..., "path": "...", "bytes": 34567}
+    {"type": "thumb_failed", "id": ..., "message": "..."}
     {"type": "done", "count": 1234, "cursor": "2026-01-02T03:04:05+00:00"}
     {"type": "error", "kind": "auth", "message": "..."}
 
 stdout gehoert ausschliesslich dem Protokoll. Alles Menschenlesbare geht nach
 stderr, sonst zerreisst es den Parser auf der Rust-Seite.
 
-Kein Bilddownload — dieser Schritt liefert nur Metadaten.
+Thumbnails laedt dieser Schritt mit ``--thumbs DIR`` gleich mit. Originale
+nicht — die kommen erst beim Oeffnen eines Fotos.
 """
 
 from __future__ import annotations
 
 import argparse
 import json
+import struct
 import sys
+import zlib
 from collections.abc import Iterator
 from datetime import UTC, datetime
+from pathlib import Path
 from typing import Any
 
 EXIT_OK = 0
@@ -145,6 +151,53 @@ def record_for(asset: Any) -> dict[str, Any]:
     }
 
 
+# --------------------------------------------------------------------------
+# Thumbnails
+# --------------------------------------------------------------------------
+
+# Schluessel der Vorschau-Resource in pyicloud (PHOTO_VERSION_LOOKUP).
+THUMB_VERSION = "thumb"
+
+
+def thumb_path_for(directory: Path, asset_id: str) -> Path:
+    """Dateiname aus der Asset-ID.
+
+    iCloud-IDs koennen ``/`` enthalten, deshalb wird die ID vor der Verwendung
+    als Dateiname entschaerft.
+    """
+    safe = "".join(char if char.isalnum() or char in "-_" else "_" for char in asset_id)
+    return directory / f"{safe}.jpg"
+
+
+def download_thumb(asset: Any, directory: Path) -> dict[str, Any]:
+    """Laedt die Vorschau eines Assets. Gibt die zu sendende Protokollzeile zurueck."""
+    target = thumb_path_for(directory, asset.id)
+
+    # Bereits vorhanden: nicht erneut laden. Macht abgebrochene Syncs billig.
+    if target.is_file() and target.stat().st_size > 0:
+        return {
+            "type": "thumb",
+            "id": asset.id,
+            "path": str(target),
+            "bytes": target.stat().st_size,
+        }
+
+    try:
+        data = asset.download(THUMB_VERSION)
+    except Exception as exc:  # noqa: BLE001 - fremde API, jeder Fehler ist hier gleich
+        return {"type": "thumb_failed", "id": asset.id, "message": f"{type(exc).__name__}: {exc}"}
+
+    if not data:
+        return {"type": "thumb_failed", "id": asset.id, "message": "keine Vorschau verfuegbar"}
+
+    # Erst vollstaendig schreiben, dann umbenennen: ein Abbruch hinterlaesst
+    # sonst eine halbe Datei, die spaeter als gueltiger Cache-Treffer gilt.
+    tmp = target.with_suffix(".part")
+    tmp.write_bytes(data)
+    tmp.replace(target)
+    return {"type": "thumb", "id": asset.id, "path": str(target), "bytes": len(data)}
+
+
 def iter_assets(api: Any, since: datetime | None, limit: int | None) -> Iterator[Any]:
     """Liefert Assets, neueste zuerst, und bricht am Cursor ab.
 
@@ -163,20 +216,65 @@ def iter_assets(api: Any, since: datetime | None, limit: int | None) -> Iterator
 
 
 def run_sync(
-    username: str, cookie_dir: str | None, since: datetime | None, limit: int | None
+    username: str,
+    cookie_dir: str | None,
+    since: datetime | None,
+    limit: int | None,
+    thumbs: Path | None,
 ) -> int:
     api = authenticate(username, cookie_dir)
+    if thumbs is not None:
+        thumbs.mkdir(parents=True, exist_ok=True)
 
     count = 0
     newest: datetime | None = None
     for asset in iter_assets(api, since, limit):
-        record = record_for(asset)
-        emit(record)
+        emit(record_for(asset))
         count += 1
         if newest is None or asset.added_date > newest:
             newest = asset.added_date
+        # Erst die Metadaten, dann die Vorschau: faellt der Download aus, steht
+        # das Foto trotzdem schon im Katalog.
+        if thumbs is not None:
+            emit(download_thumb(asset, thumbs))
 
     emit({"type": "done", "count": count, "cursor": iso(newest) or iso(since)})
+    return EXIT_OK
+
+
+def run_fetch_thumbs(username: str, cookie_dir: str | None, thumbs: Path) -> int:
+    """Laedt Vorschauen fuer die IDs, die zeilenweise auf stdin kommen.
+
+    Noetig, weil der Delta-Sync aeltere Assets nicht erneut sieht: fehlt dort
+    eine Vorschau, holt dieser Modus sie nach.
+    """
+    api = authenticate(username, cookie_dir)
+    thumbs.mkdir(parents=True, exist_ok=True)
+    album = api.photos.all
+
+    count = 0
+    for line in sys.stdin:
+        asset_id = line.strip()
+        if not asset_id:
+            continue
+        try:
+            asset = album.get(asset_id)
+        except Exception as exc:  # noqa: BLE001 - fremde API
+            emit(
+                {
+                    "type": "thumb_failed",
+                    "id": asset_id,
+                    "message": f"{type(exc).__name__}: {exc}",
+                }
+            )
+            continue
+        if asset is None:
+            emit({"type": "thumb_failed", "id": asset_id, "message": "Asset nicht gefunden"})
+            continue
+        emit(download_thumb(asset, thumbs))
+        count += 1
+
+    emit({"type": "done", "count": count, "cursor": None})
     return EXIT_OK
 
 
@@ -185,7 +283,32 @@ def run_sync(
 # --------------------------------------------------------------------------
 
 
-def run_fake(count: int, needs_2fa: bool) -> int:
+def fake_png(size: int, index: int) -> bytes:
+    """Minimales, gueltiges Truecolor-PNG in einer Farbe.
+
+    Handgeschrieben, damit der Fake-Modus keine Bildbibliothek braucht und
+    weiterhin allein mit der Standardbibliothek laeuft.
+    """
+    red = (index * 67) % 256
+    green = (index * 113) % 256
+    blue = (index * 197) % 256
+    row = b"\x00" + bytes([red, green, blue]) * size
+    raw = row * size
+
+    def chunk(tag: bytes, data: bytes) -> bytes:
+        body = tag + data
+        return struct.pack(">I", len(data)) + body + struct.pack(">I", zlib.crc32(body))
+
+    header = struct.pack(">IIBBBBB", size, size, 8, 2, 0, 0, 0)
+    return (
+        b"\x89PNG\r\n\x1a\n"
+        + chunk(b"IHDR", header)
+        + chunk(b"IDAT", zlib.compress(raw))
+        + chunk(b"IEND", b"")
+    )
+
+
+def run_fake(count: int, needs_2fa: bool, thumbs: Path | None) -> int:
     """Erzeugt synthetische Datensaetze ohne iCloud-Zugriff.
 
     Damit laesst sich die gesamte Rust-Seite inklusive 2FA-Pfad testen, ohne
@@ -198,6 +321,8 @@ def run_fake(count: int, needs_2fa: bool) -> int:
             emit({"type": "error", "kind": "auth", "message": "2FA-Code abgelehnt"})
             return EXIT_AUTH
     emit({"type": "auth_ok", "trusted": True})
+    if thumbs is not None:
+        thumbs.mkdir(parents=True, exist_ok=True)
 
     newest = None
     for index in range(count):
@@ -215,6 +340,17 @@ def run_fake(count: int, needs_2fa: bool) -> int:
                 "height": 3024,
             }
         )
+        if thumbs is not None:
+            target = thumb_path_for(thumbs, f"fake-{index:05d}").with_suffix(".png")
+            target.write_bytes(fake_png(64, index))
+            emit(
+                {
+                    "type": "thumb",
+                    "id": f"fake-{index:05d}",
+                    "path": str(target),
+                    "bytes": target.stat().st_size,
+                }
+            )
     emit({"type": "done", "count": count, "cursor": iso(newest)})
     return EXIT_OK
 
@@ -236,16 +372,33 @@ def main(argv: list[str] | None = None) -> int:
         action="store_true",
         help="Im Fake-Modus den 2FA-Dialog durchspielen (Code: 123456)",
     )
+    parser.add_argument(
+        "--thumbs",
+        metavar="DIR",
+        help="Vorschaubilder in dieses Verzeichnis laden",
+    )
+    parser.add_argument(
+        "--fetch-thumbs",
+        action="store_true",
+        help="Nur Vorschauen nachladen; Asset-IDs kommen zeilenweise ueber stdin",
+    )
     args = parser.parse_args(argv)
 
+    thumbs = Path(args.thumbs).expanduser() if args.thumbs else None
+
     if args.fake is not None:
-        return run_fake(args.fake, args.fake_2fa)
+        return run_fake(args.fake, args.fake_2fa, thumbs)
 
     if not args.username:
         parser.error("--username ist ohne --fake erforderlich")
+    if args.fetch_thumbs and thumbs is None:
+        parser.error("--fetch-thumbs braucht --thumbs")
 
     try:
-        return run_sync(args.username, args.cookie_dir, parse_since(args.since), args.limit)
+        if args.fetch_thumbs:
+            assert thumbs is not None
+            return run_fetch_thumbs(args.username, args.cookie_dir, thumbs)
+        return run_sync(args.username, args.cookie_dir, parse_since(args.since), args.limit, thumbs)
     except SystemExit:
         raise
     except Exception as exc:  # pragma: no cover - Netz-/API-Fehler

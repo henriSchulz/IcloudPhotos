@@ -14,6 +14,7 @@ use tokio::sync::{mpsc, oneshot};
 /// Was der Sync-Thread der UI meldet.
 pub enum SyncMessage {
     Progress { stored: u64 },
+    Thumbnails { stored: u64 },
     TwoFactorRequired { responder: oneshot::Sender<String> },
     Finished(Result<SyncSummary, String>),
 }
@@ -25,6 +26,7 @@ pub fn spawn(config: &Config) -> mpsc::UnboundedReceiver<SyncMessage> {
     let db_path = config.paths.db_path.clone();
     let cookie_dir = config.paths.db_path.parent().map(|p| p.join("cookies"));
     let username = config.icloud.username.clone();
+    let thumbnail_dir = config.paths.thumbnail_dir.clone();
 
     std::thread::spawn(move || {
         let runtime = match tokio::runtime::Builder::new_current_thread()
@@ -54,6 +56,7 @@ pub fn spawn(config: &Config) -> mpsc::UnboundedReceiver<SyncMessage> {
             let mut options = SidecarOptions::new(python_path(), script_path(), username);
             options.cookie_dir = cookie_dir;
             options.since = catalog.sync_cursor().ok().flatten();
+            options.thumbnail_dir = Some(thumbnail_dir);
             options.fake = fake_count();
 
             let (event_tx, mut event_rx) = mpsc::unbounded_channel::<SyncEvent>();
@@ -67,6 +70,9 @@ pub fn spawn(config: &Config) -> mpsc::UnboundedReceiver<SyncMessage> {
                             event = event_rx.recv() => match event {
                                 Some(SyncEvent::Progress { stored }) => {
                                     let _ = tx.send(SyncMessage::Progress { stored });
+                                }
+                                Some(SyncEvent::Thumbnails { stored }) => {
+                                    let _ = tx.send(SyncMessage::Thumbnails { stored });
                                 }
                                 Some(_) => {}
                                 None => break,
@@ -82,7 +88,31 @@ pub fn spawn(config: &Config) -> mpsc::UnboundedReceiver<SyncMessage> {
                 })
             };
 
-            let result = run_sync(&mut catalog, &options, Some(event_tx), Some(tfa_tx)).await;
+            let mut result = run_sync(
+                &mut catalog,
+                &options,
+                Some(event_tx.clone()),
+                Some(tfa_tx.clone()),
+            )
+            .await;
+
+            // Der Delta-Sync sieht aeltere Assets nicht erneut. Fehlt dort eine
+            // Vorschau — erster Lauf, Netzfehler, abgebrochener Sync — wird sie
+            // in einem zweiten Durchgang gezielt nachgeholt.
+            if let Ok(summary) = &mut result {
+                match backfill_thumbnails(&mut catalog, &options, event_tx, tfa_tx).await {
+                    Ok(extra) => {
+                        summary.thumbnails += extra.thumbnails;
+                        summary.thumbnails_failed += extra.thumbnails_failed;
+                    }
+                    // Die Metadaten stehen schon im Katalog; fehlende Vorschauen
+                    // holt der naechste Lauf. Das ist kein gescheiterter Sync.
+                    Err(error) => {
+                        tracing::warn!(%error, "Vorschauen konnten nicht nachgeladen werden");
+                    }
+                }
+            }
+
             forwarder.abort();
 
             let _ = tx.send(SyncMessage::Finished(result.map_err(|e| e.to_string())));
@@ -90,6 +120,28 @@ pub fn spawn(config: &Config) -> mpsc::UnboundedReceiver<SyncMessage> {
     });
 
     rx
+}
+
+/// Hoechstens so viele Vorschauen pro Lauf nachladen, damit ein erster Sync
+/// einer grossen Bibliothek nicht endlos blockiert.
+const BACKFILL_LIMIT: u64 = 500;
+
+/// Holt fehlende Vorschauen nach. Gibt `Ok(default)` zurueck, wenn nichts fehlt.
+async fn backfill_thumbnails(
+    catalog: &mut Catalog,
+    base: &SidecarOptions,
+    events: mpsc::UnboundedSender<SyncEvent>,
+    two_factor: mpsc::UnboundedSender<oneshot::Sender<String>>,
+) -> Result<SyncSummary, icloud_photos_sync::SyncError> {
+    let missing = catalog.ids_without_thumbnail(BACKFILL_LIMIT)?;
+    if missing.is_empty() {
+        return Ok(SyncSummary::default());
+    }
+    tracing::info!(count = missing.len(), "lade fehlende Vorschauen nach");
+
+    let mut options = base.clone();
+    options.fetch_thumbnails_for = missing;
+    run_sync(catalog, &options, Some(events), Some(two_factor)).await
 }
 
 /// Testmodus: `ICLOUD_PHOTOS_FAKE=500` synchronisiert synthetische Daten.

@@ -164,6 +164,8 @@ Protokoll, alles Menschenlesbare geht nach stderr.
 {"type": "auth_required", "method": "2fa"}
 {"type": "auth_ok", "trusted": true}
 {"type": "photo", "id": "...", "filename": "IMG_1234.HEIC", "added_date": "...", "asset_date": "...", "checksum": "...", "width": 4032, "height": 3024}
+{"type": "thumb", "id": "...", "path": "...", "bytes": 34567}
+{"type": "thumb_failed", "id": "...", "message": "..."}
 {"type": "done", "count": 1234, "cursor": "2026-01-02T03:04:05+00:00"}
 {"type": "error", "kind": "auth", "message": "..."}
 ```
@@ -178,12 +180,23 @@ echten Subprozess.
 
 - [x] 2FA-UX: blockierender `AdwAlertDialog`, Code geht über stdin an den
       Sidecar. Notification verworfen — der Code ist nur Minuten gültig.
+- [x] Periodischer Sync: beim Start einmal, danach im Takt von
+      `sync_interval_minutes`. Ein laufender Sync verwirft Nachforderungen.
 - [x] Entscheidung: Sidecar pro Sync-Lauf neu gestartet. Für Metadaten reicht
       das. **Aber:** für Full-Res on demand ist der Auth-Overhead pro Prozess
       zu hoch, dafür braucht es einen dauerhaften `--serve`-Modus.
-- [ ] **Bild-Download fehlt komplett** — weder Thumbnails noch Full-Res werden
-      geladen. Der Katalog hat die Spalten, die UI zeigt vorhandene Dateien an,
-      aber nichts füllt sie. Grösster offener Brocken.
+- [x] **Thumbnail-Download** — `--thumbs DIR` lädt die Vorschau (`resJPEGThumb`)
+      direkt beim Sync mit. Vorhandene Dateien werden übersprungen, geschrieben
+      wird über `.part` + `rename`, damit ein Abbruch keine halbe Datei als
+      gültigen Treffer hinterlässt.
+      `--fetch-thumbs` holt Vorschauen für IDs von stdin nach — nötig, weil der
+      Delta-Sync ältere Assets nicht erneut sieht. Die App hängt diesen
+      Durchgang automatisch an jeden Sync an (max. 500 pro Lauf).
+- [ ] **Full-Res-Download fehlt** — der Viewer zeigt nur, was schon im Cache
+      liegt. Dafür braucht der Sidecar einen dauerhaften `--serve`-Modus, weil
+      Prozessstart plus Auth pro geöffnetem Foto zu teuer sind.
+- [ ] Vorschauen erscheinen erst, wenn der Sync durch ist — das Modell wird am
+      Ende neu geladen statt einzelne Kacheln zu aktualisieren.
 - [ ] Löschungen: `added_date`-Cursor bemerkt in iCloud gelöschte Fotos nie.
       `PhotosService.iter_changes(since=...)` liefert sie — umstellen.
 - [ ] Session-Refresh-Handling bei abgelaufener pyicloud-Session
@@ -205,8 +218,13 @@ cargo test --workspace
 # UI ohne Apple-Konto ausprobieren: erzeugt 240 Fotos mit Thumbnails
 cargo run -p icloud-photos-app -- --demo
 
-# Sync gegen synthetische Daten statt iCloud
+# Sync gegen synthetische Daten statt iCloud — erzeugt echte Thumbnail-Dateien
 ICLOUD_PHOTOS_FAKE=500 cargo run -p icloud-photos-app
+
+# Sidecar direkt, gegen die echte Bibliothek
+.venv/bin/python sidecar/pyicloud_sync.py --username "$APPLE_ID" \
+    --cookie-dir ~/.local/share/icloud-photos/cookies \
+    --thumbs ~/.cache/icloud-photos/thumbnails --limit 5
 ```
 
 Umgebungsvariablen: `ICLOUD_PHOTOS_PYTHON` und `ICLOUD_PHOTOS_SIDECAR`
