@@ -64,6 +64,12 @@ impl SidecarOptions {
             args.push("--thumbs".into());
             args.push(dir.to_string_lossy().into_owned());
         }
+        // Vor dem Fake-Zweig: der Fake-Sidecar muss denselben Filter anwenden,
+        // sonst testet er ein anderes Verhalten als der echte.
+        if let Some(since) = self.since {
+            args.push("--since".into());
+            args.push(since.to_rfc3339());
+        }
         if let Some(count) = self.fake {
             args.push("--fake".into());
             args.push(count.to_string());
@@ -84,10 +90,6 @@ impl SidecarOptions {
         if self.is_thumbnail_backfill() {
             args.push("--fetch-thumbs".into());
             return args;
-        }
-        if let Some(since) = self.since {
-            args.push("--since".into());
-            args.push(since.to_rfc3339());
         }
         args
     }

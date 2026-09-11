@@ -179,7 +179,20 @@ erfolgreicher Anmeldung legt der Sidecar das Passwort im Keyring ab
 
 `--fake N` erzeugt N synthetische Datensätze ohne iCloud-Zugriff und ohne
 Import von `pyicloud`; damit läuft die komplette Rust-Seite im Test gegen einen
-echten Subprozess.
+echten Subprozess. Die erzeugten `added_date` sind bewusst **unsortiert**, weil
+die echte API das auch ist — ein Sidecar, der Sortierung voraussetzt, fällt im
+Test auf.
+
+## Wiederaufnahme
+
+Ein abgebrochener Sync wird vom nächsten Lauf vervollständigt:
+
+- Metadaten werden per Upsert geschrieben; Cache-Spalten bleiben unangetastet.
+- Vorschauen, deren Datei schon existiert, werden nicht erneut geladen.
+- Geschrieben wird über `.part` + `rename`, eine abgebrochene Datei gilt also
+  nie als gültiger Treffer.
+- Der Durchlauf paginiert immer die ganze Bibliothek (siehe offene Punkte),
+  sodass Lücken irgendwo in der Mitte zuverlässig gefunden werden.
 
 ## Offene Punkte / TODO
 
@@ -208,8 +221,17 @@ echten Subprozess.
       Prozessstart plus Auth pro geöffnetem Foto zu teuer sind.
 - [ ] Vorschauen erscheinen erst, wenn der Sync durch ist — das Modell wird am
       Ende neu geladen statt einzelne Kacheln zu aktualisieren.
-- [ ] Löschungen: `added_date`-Cursor bemerkt in iCloud gelöschte Fotos nie.
-      `PhotosService.iter_changes(since=...)` liefert sie — umstellen.
+- [ ] **Skalierung des Sync.** `photos.all` ist **nicht** nach `added_date`
+      sortiert — an einer echten Bibliothek springen die Daten zwischen
+      aufeinanderfolgenden Assets beliebig (rowid 1: 2024-06, rowid 3: 2023-01,
+      Ende: 2022-07). Ein `added_date`-Cursor als Abbruchbedingung verschluckt
+      deshalb den Rest der Bibliothek; er ist entfernt, jeder Sync paginiert
+      vollständig. Das ist korrekt und wiederaufnehmbar, kostet bei sehr großen
+      Bibliotheken aber jedes Mal den vollen Durchlauf.
+      Lösung: `PhotosService.iter_changes(since=zone_cursor)` — serverseitiges
+      Delta, meldet zusätzlich **Löschungen**, die der `added_date`-Ansatz
+      prinzipiell nie bemerkt. `--since` bleibt als reiner Filter erhalten und
+      beendet den Durchlauf nie.
 - [ ] Session-Refresh-Handling bei abgelaufener pyicloud-Session
 - [ ] `GListModel`-Implementierung für paginierte SQLite-Queries.
       Zwischenlösung: `gio::ListStore`, der beim Scrollen seitenweise nachlädt

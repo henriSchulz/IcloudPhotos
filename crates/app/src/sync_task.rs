@@ -81,7 +81,12 @@ pub fn spawn(
 
             let mut options = SidecarOptions::new(python_path(), script_path(), username);
             options.cookie_dir = cookie_dir;
-            options.since = catalog.sync_cursor().ok().flatten();
+            // Bewusst kein Cursor: `photos.all` ist nicht nach `added_date`
+            // sortiert, ein Cursor wuerde einen abgebrochenen Sync nicht
+            // fortsetzen, sondern den Rest der Bibliothek ueberspringen. Der
+            // volle Durchlauf ist idempotent — vorhandene Vorschauen werden
+            // uebersprungen, Metadaten nur aktualisiert.
+            options.since = None;
             options.thumbnail_dir = Some(thumbnail_dir);
             options.fake = fake_count();
             // Erlaubt, den kompletten Anmeldeweg ohne Apple-Konto durchzuspielen.

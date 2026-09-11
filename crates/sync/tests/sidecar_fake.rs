@@ -466,3 +466,93 @@ async fn missing_password_channel_aborts() {
         "unerwartet: {error:?}"
     );
 }
+
+/// `photos.all` ist nicht nach `added_date` sortiert. Ein Sidecar, der beim
+/// ersten "zu alten" Asset abbricht, verschluckt den Rest der Bibliothek.
+#[tokio::test]
+async fn since_filters_without_ending_the_walk() {
+    let python = python_or_skip!();
+
+    // Erst alles holen, um die Datumslage zu kennen.
+    let mut full = Catalog::open_in_memory().unwrap();
+    run_sync(&mut full, &options(&python, 24), &Prompts::default())
+        .await
+        .unwrap();
+
+    let mut dates: Vec<_> = full
+        .page(0, 100)
+        .unwrap()
+        .into_iter()
+        .map(|p| p.record.added_date)
+        .collect();
+    dates.sort();
+    let cutoff = dates[dates.len() / 2];
+    let expected = dates.iter().filter(|d| **d > cutoff).count() as u64;
+    assert!(
+        expected > 0 && expected < 24,
+        "Schnitt muss mittendrin liegen"
+    );
+
+    // Jetzt derselbe Lauf mit Cursor. Die Zahl muss exakt stimmen — bei einem
+    // vorzeitigen Abbruch käme deutlich weniger an.
+    let mut filtered = Catalog::open_in_memory().unwrap();
+    let mut options = options(&python, 24);
+    options.since = Some(cutoff);
+
+    let summary = run_sync(&mut filtered, &options, &Prompts::default())
+        .await
+        .unwrap();
+
+    assert_eq!(summary.stored, expected);
+    assert_eq!(filtered.count().unwrap(), expected);
+    for photo in filtered.page(0, 100).unwrap() {
+        assert!(photo.record.added_date > cutoff);
+    }
+}
+
+/// Ein abgebrochener Sync muss sich durch einen erneuten Lauf vervollstaendigen.
+#[tokio::test]
+async fn interrupted_sync_is_completed_by_the_next_run() {
+    let python = python_or_skip!();
+    let dir = tempfile::tempdir().unwrap();
+    let mut catalog = Catalog::open_in_memory().unwrap();
+
+    let mut options = options(&python, 12);
+    options.thumbnail_dir = Some(dir.path().to_path_buf());
+
+    run_sync(&mut catalog, &options, &Prompts::default())
+        .await
+        .unwrap();
+    assert_eq!(catalog.count().unwrap(), 12);
+
+    // Abbruch nachstellen: ein Teil der Bibliothek kam nie im Katalog an.
+    let keep: Vec<String> = catalog
+        .page(0, 5)
+        .unwrap()
+        .iter()
+        .map(|p| p.id().to_string())
+        .collect();
+    let mut fresh = Catalog::open_in_memory().unwrap();
+    for photo in catalog.page(0, 100).unwrap() {
+        if keep.contains(&photo.id().to_string()) {
+            fresh.upsert_record(&photo.record).unwrap();
+        }
+    }
+    assert_eq!(fresh.count().unwrap(), 5);
+
+    // Der naechste Lauf holt den Rest — ohne Cursor, so wie die App ihn startet.
+    let summary = run_sync(&mut fresh, &options, &Prompts::default())
+        .await
+        .unwrap();
+
+    assert_eq!(
+        summary.stored, 12,
+        "der volle Durchlauf emittiert alles erneut"
+    );
+    assert_eq!(
+        fresh.count().unwrap(),
+        12,
+        "die fehlenden Fotos sind nachgetragen"
+    );
+    assert!(fresh.ids_without_thumbnail(20).unwrap().is_empty());
+}

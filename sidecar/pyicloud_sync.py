@@ -27,7 +27,7 @@ import struct
 import sys
 import zlib
 from collections.abc import Iterator
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any
 
@@ -234,18 +234,24 @@ def download_thumb(asset: Any, directory: Path) -> dict[str, Any]:
 
 
 def iter_assets(api: Any, since: datetime | None, limit: int | None) -> Iterator[Any]:
-    """Liefert Assets, neueste zuerst, und bricht am Cursor ab.
+    """Laeuft die gesamte Bibliothek durch.
 
-    ``photos.all`` liefert absteigend nach ``added_date``. Sobald ein Asset
-    aelter als der Cursor ist, sind alle folgenden es auch — dann kann der
-    Durchlauf abbrechen, statt die ganze Bibliothek zu paginieren.
+    ``photos.all`` ist **nicht** nach ``added_date`` sortiert — gemessen an
+    einer echten Bibliothek wechseln die Daten zwischen aufeinanderfolgenden
+    Assets beliebig hin und her. Ein vorzeitiger Abbruch beim ersten "zu alten"
+    Asset wuerde den Rest der Bibliothek verschlucken; deshalb wird immer
+    vollstaendig paginiert.
+
+    ``since`` filtert nur, welche Assets ausgegeben werden, und beendet den
+    Durchlauf nie.
     """
-    for seen, asset in enumerate(api.photos.all):
+    emitted = 0
+    for asset in api.photos.all:
         if since is not None and asset.added_date <= since:
-            log(f"Cursor erreicht nach {seen} Assets")
-            return
+            continue
         yield asset
-        if limit is not None and seen + 1 >= limit:
+        emitted += 1
+        if limit is not None and emitted >= limit:
             log(f"Limit {limit} erreicht")
             return
 
@@ -347,7 +353,13 @@ FAKE_PASSWORD = "geheim"
 FAKE_2FA_CODE = "123456"
 
 
-def run_fake(count: int, needs_2fa: bool, needs_password: bool, thumbs: Path | None) -> int:
+def run_fake(
+    count: int,
+    needs_2fa: bool,
+    needs_password: bool,
+    thumbs: Path | None,
+    since: datetime | None,
+) -> int:
     """Erzeugt synthetische Datensaetze ohne iCloud-Zugriff.
 
     Damit laesst sich die gesamte Rust-Seite inklusive 2FA-Pfad testen, ohne
@@ -368,8 +380,18 @@ def run_fake(count: int, needs_2fa: bool, needs_password: bool, thumbs: Path | N
         thumbs.mkdir(parents=True, exist_ok=True)
 
     newest = None
+    emitted = 0
     for index in range(count):
-        added = datetime(2026, 1, 1, tzinfo=UTC).replace(minute=index % 60, hour=(index // 60) % 24)
+        # Bewusst unsortiert: die echte Bibliothek liefert ebenfalls keine
+        # monotone Folge von added_date. Ein Sidecar, der das voraussetzt,
+        # faellt hier auf.
+        added = datetime(2024, 1, 1, tzinfo=UTC) + timedelta(
+            days=(index * 7919) % 365, minutes=index % 60
+        )
+        # Wie im Echtbetrieb: filtern, aber den Durchlauf nicht abbrechen.
+        if since is not None and added <= since:
+            continue
+        emitted += 1
         newest = added if newest is None or added > newest else newest
         emit(
             {
@@ -394,7 +416,7 @@ def run_fake(count: int, needs_2fa: bool, needs_password: bool, thumbs: Path | N
                     "bytes": target.stat().st_size,
                 }
             )
-    emit({"type": "done", "count": count, "cursor": iso(newest)})
+    emit({"type": "done", "count": emitted, "cursor": iso(newest)})
     return EXIT_OK
 
 
@@ -435,7 +457,9 @@ def main(argv: list[str] | None = None) -> int:
     thumbs = Path(args.thumbs).expanduser() if args.thumbs else None
 
     if args.fake is not None:
-        return run_fake(args.fake, args.fake_2fa, args.fake_password, thumbs)
+        return run_fake(
+            args.fake, args.fake_2fa, args.fake_password, thumbs, parse_since(args.since)
+        )
 
     if not args.username:
         parser.error("--username ist ohne --fake erforderlich")
