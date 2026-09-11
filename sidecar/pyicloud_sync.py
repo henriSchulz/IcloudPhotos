@@ -46,11 +46,27 @@ EXIT_AUTH = 2
 def emit(payload: dict[str, Any]) -> None:
     """Schreibt eine Protokollzeile und flusht sofort.
 
+    Erst vollstaendig serialisieren, dann schreiben: ``json.dump`` wuerde direkt
+    in den Stream schreiben und bei einem nicht serialisierbaren Wert eine halbe
+    Zeile hinterlassen. Der Parser auf der Rust-Seite bekaeme dann eine
+    zerrissene Zeile und der ganze Lauf waere verloren — statt nur dieses einen
+    Feldes.
+
     Ohne Flush puffert Python bei Pipe-stdout bis zu 8 KB, und die UI zeigt
     minutenlang keinen Fortschritt.
     """
-    json.dump(payload, sys.stdout, separators=(",", ":"), ensure_ascii=False)
-    sys.stdout.write("\n")
+    try:
+        line = json.dumps(payload, separators=(",", ":"), ensure_ascii=False)
+    except (TypeError, ValueError) as exc:
+        line = json.dumps(
+            {
+                "type": "error",
+                "kind": "protocol",
+                "message": f"Nachricht nicht serialisierbar: {exc}",
+            },
+            separators=(",", ":"),
+        )
+    sys.stdout.write(line + "\n")
     sys.stdout.flush()
 
 
@@ -278,7 +294,7 @@ OFFSET_REPORT_EVERY = 50
 def zone_token(api: Any) -> str | None:
     """Aktueller CloudKit-syncToken der Foto-Zone."""
     try:
-        return api.photos.sync_cursor
+        return api.photos.sync_cursor()
     except Exception as exc:  # noqa: BLE001 - fremde API
         log(f"syncToken nicht abrufbar: {type(exc).__name__}: {exc}")
         return None
