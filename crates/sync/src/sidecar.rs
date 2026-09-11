@@ -153,6 +153,8 @@ pub struct SyncSummary {
     pub token_expired: bool,
     /// Geaenderte Records ohne zugehoeriges Asset.
     pub unresolved: u64,
+    /// Bestand laut iCloud, sofern der Sidecar ihn gemeldet hat.
+    pub library_count: Option<u64>,
     /// Neuer Cursor für den nächsten Delta-Sync.
     pub cursor: Option<DateTime<Utc>>,
 }
@@ -315,6 +317,9 @@ pub async fn run_sync(
                     },
                 );
             }
+            SidecarMessage::LibraryCount { value } => {
+                summary.library_count = Some(value);
+            }
             SidecarMessage::BaselineComplete { count } => {
                 tracing::info!(count, "vollstaendiger Durchlauf beendet");
                 summary.baseline_complete = true;
@@ -434,6 +439,22 @@ pub async fn run_sync(
 
     if summary.baseline_complete {
         catalog.set_baseline_progress(0, true, Utc::now())?;
+    }
+
+    // Bestandsabgleich: weicht der lokale Stand nach einem Delta-Lauf vom
+    // gemeldeten Bestand ab, wurde eine Aenderung verpasst. Dann den
+    // Erstaufbau-Merker zuruecksetzen, damit der naechste Lauf vollstaendig
+    // durchgeht — statt still weiter auseinanderzudriften.
+    if let Some(expected) = summary.library_count {
+        let local = catalog.count()?;
+        if local != expected {
+            tracing::warn!(
+                local,
+                expected,
+                "Bestand weicht ab — naechster Lauf gleicht vollstaendig ab"
+            );
+            catalog.set_baseline_progress(0, false, Utc::now())?;
+        }
     }
 
     // Den Token nur uebernehmen, wenn der lokale Stand ihn auch verdient.

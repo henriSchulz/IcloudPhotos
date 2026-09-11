@@ -11,6 +11,7 @@ Das Protokoll ist zeilenweises JSON; jede Zeile hat ein Feld ``type``:
     {"type": "unchanged"}                       nichts zu tun (Token unveraendert)
     {"type": "thumb", "id": ..., "path": "...", "bytes": 34567}
     {"type": "deleted", "id": "..."}            in iCloud geloescht
+    {"type": "library_count", "value": 19624}   Bestandsabgleich nach einem Delta
     {"type": "offset", "value": 1200}           Fortschritt des Erstaufbaus
     {"type": "baseline_complete", "count": 17000}
     {"type": "token_expired", "message": "..."} Delta nicht moeglich
@@ -330,6 +331,12 @@ def run_baseline(
     return count
 
 
+# Album-Zugehoerigkeit heisst in CloudKit "<asset>-IN-<album>". Ein Tombstone
+# darauf bedeutet "aus Album entfernt" — das Foto existiert weiter. Wuerde man
+# danach loeschen, verschwaenden Fotos aus dem Katalog, die es noch gibt.
+MEMBERSHIP_MARKER = "-IN-"
+
+
 def run_changes(api: Any, thumbs: Path | None, since_token: str) -> int:
     """Nur die Aenderungen seit ``since_token`` — der Normalfall.
 
@@ -339,6 +346,12 @@ def run_changes(api: Any, thumbs: Path | None, since_token: str) -> int:
     count = 0
     for event in api.photos.iter_changes(since=since_token):
         record_name = event.record_name
+
+        if MEMBERSHIP_MARKER in record_name:
+            # Album-Mitgliedschaft, kein Asset. Betrifft uns nicht: Alben sind
+            # in v1 ohnehin nicht abgebildet.
+            continue
+
         if event.deleted:
             # Tombstones geben nur den Namen her. Ob der zu einem unserer Fotos
             # gehoert, entscheidet die Rust-Seite anhand ihres Katalogs.
@@ -412,6 +425,14 @@ def run_sync(
             log(f"Delta-Abgleich fehlgeschlagen, falle auf Vollabgleich zurueck: {exc}")
             emit({"type": "token_expired", "message": f"{type(exc).__name__}: {exc}"})
         else:
+            # Bestandsabgleich: eine verpasste Aenderung faellt hier auf, und
+            # die App kann einen Vollabgleich nachziehen. Nur im Delta-Fall —
+            # die Zaehlung kostet einen Request, den der unveraenderte Fall
+            # nicht ausgeben soll.
+            try:
+                emit({"type": "library_count", "value": len(api.photos.all)})
+            except Exception as exc:  # noqa: BLE001 - nur ein Sicherheitsnetz
+                log(f"Bestand nicht zaehlbar: {exc}")
             emit({"type": "done", "count": count, "cursor": None})
             return EXIT_OK
 
@@ -589,6 +610,7 @@ def run_fake(
         for index in range(count, previous):
             emit({"type": "deleted", "id": f"fake-{index:05d}"})
             changed += 1
+        emit({"type": "library_count", "value": count})
         emit({"type": "done", "count": changed, "cursor": None})
         return EXIT_OK
 

@@ -733,3 +733,54 @@ async fn baseline_resumes_from_the_stored_offset() {
         Some("fake-token-10")
     );
 }
+
+/// Weicht der lokale Bestand nach einem Delta ab, wurde eine Änderung
+/// verpasst — der nächste Lauf muss dann vollständig abgleichen.
+#[tokio::test]
+async fn count_mismatch_forces_a_new_baseline() {
+    let python = python_or_skip!();
+    let mut catalog = Catalog::open_in_memory().unwrap();
+
+    run_sync(&mut catalog, &options(&python, 8), &Prompts::default())
+        .await
+        .unwrap();
+    assert!(catalog.sync_state().unwrap().baseline_done);
+
+    // Eine Zeile verschwindet hinter dem Rücken des Sync.
+    catalog.delete_photo("fake-00003").unwrap();
+    assert_eq!(catalog.count().unwrap(), 7);
+
+    // Delta-Lauf: der Sidecar meldet 8, lokal sind es 7.
+    let mut options = options(&python, 8);
+    options.since_token = Some("fake-token-7".to_string());
+
+    let summary = run_sync(&mut catalog, &options, &Prompts::default())
+        .await
+        .unwrap();
+
+    assert_eq!(summary.library_count, Some(8));
+    assert!(
+        !catalog.sync_state().unwrap().baseline_done,
+        "Abweichung muss einen Vollabgleich erzwingen"
+    );
+}
+
+/// Album-Zugehörigkeiten (`<asset>-IN-<album>`) sind keine Löschungen.
+#[test]
+fn membership_tombstones_are_not_deletions() {
+    // Gegen die echte Bibliothek gemessen: von 4000 Change-Events waren 461
+    // solche Zugehörigkeits-Records. Würden sie als Löschung durchgehen,
+    // verschwänden Fotos aus dem Katalog, die nur aus einem Album geflogen sind.
+    let source = std::fs::read_to_string(
+        std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../sidecar/pyicloud_sync.py"),
+    )
+    .unwrap();
+    assert!(
+        source.contains("MEMBERSHIP_MARKER = \"-IN-\""),
+        "der Filter für Album-Zugehörigkeiten fehlt"
+    );
+    assert!(
+        source.contains("if MEMBERSHIP_MARKER in record_name:"),
+        "der Filter wird nicht angewendet"
+    );
+}

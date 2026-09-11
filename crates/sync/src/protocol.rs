@@ -38,6 +38,11 @@ pub enum SidecarMessage {
     Offset {
         value: u64,
     },
+    /// Wie viele Assets die Bibliothek insgesamt hat — Bestandsabgleich nach
+    /// einem Delta-Lauf.
+    LibraryCount {
+        value: u64,
+    },
     BaselineComplete {
         count: u64,
     },
