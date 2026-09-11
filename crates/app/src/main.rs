@@ -57,7 +57,7 @@ fn main() -> anyhow::Result<()> {
     // beendet sich sofort — deshalb bekommt der Testmodus eine eigene ID.
     let app = if sync_task::fake_count().is_some() {
         adw::Application::builder()
-            .application_id(&format!("{APP_ID}.Fake"))
+            .application_id(format!("{APP_ID}.Fake"))
             .flags(gtk::gio::ApplicationFlags::NON_UNIQUE)
             .build()
     } else {
