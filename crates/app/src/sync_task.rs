@@ -280,7 +280,7 @@ pub fn fake_count() -> Option<u64> {
 
 /// Python-Interpreter: `ICLOUD_PHOTOS_PYTHON`, sonst das venv im Projekt,
 /// sonst das System-Python.
-fn python_path() -> PathBuf {
+pub fn python_path() -> PathBuf {
     if let Ok(path) = std::env::var("ICLOUD_PHOTOS_PYTHON") {
         return PathBuf::from(path);
     }
@@ -292,7 +292,7 @@ fn python_path() -> PathBuf {
 }
 
 /// Sidecar-Skript: `ICLOUD_PHOTOS_SIDECAR`, sonst relativ zum Projekt.
-fn script_path() -> PathBuf {
+pub fn script_path() -> PathBuf {
     if let Ok(path) = std::env::var("ICLOUD_PHOTOS_SIDECAR") {
         return PathBuf::from(path);
     }

@@ -2,9 +2,11 @@
 //! und schreibt die Metadaten in den Katalog.
 
 pub mod protocol;
+pub mod session;
 pub mod sidecar;
 
 pub use protocol::{SidecarMessage, SyncEvent};
+pub use session::{Original, SidecarSession};
 pub use sidecar::{Prompts, SecretRequest, SidecarOptions, SyncSummary, run_sync};
 
 /// Fehler eines Sync-Laufs.

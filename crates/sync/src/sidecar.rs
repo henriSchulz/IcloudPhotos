@@ -131,6 +131,26 @@ impl SidecarOptions {
         args
     }
 
+    /// Argumente fuer den dauerhaft laufenden Serve-Modus.
+    pub fn serve_argv(&self) -> Vec<String> {
+        let mut args = vec![self.script.to_string_lossy().into_owned(), "--serve".into()];
+        if let Some(count) = self.fake {
+            args.push("--fake".into());
+            args.push(count.to_string());
+            if self.fake_password {
+                args.push("--fake-password".into());
+            }
+            return args;
+        }
+        args.push("--username".into());
+        args.push(self.username.clone());
+        if let Some(dir) = &self.cookie_dir {
+            args.push("--cookie-dir".into());
+            args.push(dir.to_string_lossy().into_owned());
+        }
+        args
+    }
+
     /// Im Nachlade-Modus kommen IDs ueber stdin statt eines vollen Syncs.
     fn is_thumbnail_backfill(&self) -> bool {
         !self.fetch_thumbnails_for.is_empty()
@@ -190,6 +210,16 @@ impl Prompts {
             events: Some(events),
             ..Default::default()
         }
+    }
+
+    /// Fragt nach dem Apple-ID-Passwort.
+    pub async fn ask_password(&self) -> Option<String> {
+        Self::ask(&self.password).await
+    }
+
+    /// Fragt nach dem 2FA-Code.
+    pub async fn ask_two_factor(&self) -> Option<String> {
+        Self::ask(&self.two_factor).await
     }
 
     /// Fragt über `channel` nach einem Geheimnis und wartet auf die Antwort.

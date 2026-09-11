@@ -9,6 +9,7 @@ use icloud_photos_cache::Catalog;
 use icloud_photos_core::Config;
 use std::path::PathBuf;
 
+use crate::downloader::{self, DownloadMessage, Downloader};
 use crate::photo_object::PhotoObject;
 use crate::sync_task::{self, SyncMessage};
 
@@ -74,6 +75,17 @@ pub struct AppState {
     expected_total: Cell<u64>,
     /// Katalogstand beim letzten Nachziehen, um unnoetige Arbeit zu sparen.
     last_seen_count: Cell<u64>,
+    /// Laeuft im Hintergrund und holt Originale auf Abruf.
+    downloader: RefCell<Option<Downloader>>,
+    /// Das gerade offene Foto, damit ein eintreffendes Original dorthin findet.
+    open_photo: RefCell<Option<OpenPhoto>>,
+}
+
+/// Das im Viewer gezeigte Foto und die Stellen, die ein Original ersetzt.
+struct OpenPhoto {
+    id: String,
+    picture: gtk::Picture,
+    stack: gtk::Stack,
 }
 
 /// Die Teile der Anmeldemaske, die von aussen gesteuert werden.
@@ -101,6 +113,8 @@ impl AppState {
             syncing: Cell::new(false),
             expected_total: Cell::new(0),
             last_seen_count: Cell::new(0),
+            downloader: RefCell::new(None),
+            open_photo: RefCell::new(None),
         })
     }
 
@@ -183,6 +197,37 @@ impl AppState {
             widgets.error.set_label(message);
             widgets.error.set_visible(true);
             widgets.username.grab_focus();
+        }
+    }
+
+    /// Fordert das Original eines Fotos an.
+    fn request_original(&self, id: &str) {
+        if let Some(downloader) = self.downloader.borrow().as_ref() {
+            downloader.request(id);
+        } else {
+            tracing::warn!("kein Download-Thread — Original kann nicht geholt werden");
+        }
+    }
+
+    /// Traegt ein eingetroffenes Original in den offenen Viewer ein.
+    ///
+    /// Gehoert es zu einem inzwischen geschlossenen Fenster, passiert nichts.
+    fn deliver_original(&self, id: &str, path: &std::path::Path) {
+        let open = self.open_photo.borrow();
+        let Some(open) = open.as_ref() else { return };
+        if open.id != id {
+            return;
+        }
+        set_image(&open.picture, Some(&path.to_string_lossy()));
+        open.stack.set_visible_child_name("image");
+    }
+
+    /// Meldet dem offenen Viewer, dass das Original nicht zu haben ist.
+    fn deliver_failure(&self, id: &str) {
+        let open = self.open_photo.borrow();
+        let Some(open) = open.as_ref() else { return };
+        if open.id == id {
+            open.stack.set_visible_child_name("failed");
         }
     }
 
@@ -359,6 +404,7 @@ pub fn build(app: &adw::Application, state: Rc<AppState>) {
     stack.add_named(&login, Some("login"));
 
     install_skeleton_css();
+    start_downloader(&state, &status, &stack, &window);
 
     // Waehrend eines Syncs laufend nachziehen, statt erst am Ende umzuschalten.
     glib::timeout_add_local(LIVE_REFRESH, {
@@ -380,6 +426,24 @@ pub fn build(app: &adw::Application, state: Rc<AppState>) {
 
     update_status(&state, &status, &stack);
     window.present();
+
+    // Ohne gesetzten Fokus landen Tastatureingaben auf der Werkzeugleiste —
+    // Enter loest dann einen Sync aus, statt ein Foto zu oeffnen. Ein leeres
+    // Raster kann den Fokus aber nicht halten, deshalb erst, sobald die ersten
+    // Fotos da sind.
+    let focus_taken = std::cell::Cell::new(false);
+    state.model.connect_items_changed({
+        let grid = grid.clone();
+        move |model, _, _, _| {
+            if !focus_taken.get() && model.n_items() > 0 {
+                focus_taken.set(true);
+                grid.grab_focus();
+            }
+        }
+    });
+    if state.model.n_items() > 0 {
+        grid.grab_focus();
+    }
 
     if state.sync_configured() {
         // Direkt beim Start einmal syncen, danach im konfigurierten Takt.
@@ -550,6 +614,73 @@ fn build_login_page(state: &Rc<AppState>, trigger: Rc<dyn Fn()>) -> gtk::Widget 
     page.upcast()
 }
 
+/// Startet den Download-Thread und verarbeitet seine Meldungen in der UI.
+fn start_downloader(
+    state: &Rc<AppState>,
+    status: &gtk::Label,
+    stack: &gtk::Stack,
+    window: &adw::ApplicationWindow,
+) {
+    let (downloader, mut messages) =
+        downloader::spawn(&state.config.borrow(), sync_task::fake_count());
+    *state.downloader.borrow_mut() = Some(downloader);
+
+    let state = state.clone();
+    let status = status.clone();
+    let stack = stack.clone();
+    let window = window.clone();
+
+    glib::spawn_future_local(async move {
+        while let Some(message) = messages.recv().await {
+            match message {
+                DownloadMessage::Ready { id, path } => {
+                    tracing::info!(%id, path = %path.display(), "Original geladen");
+                    state.deliver_original(&id, &path);
+                }
+                DownloadMessage::Failed { id, message } => {
+                    tracing::warn!(%id, %message, "Original nicht ladbar");
+                    state.deliver_failure(&id);
+                }
+                DownloadMessage::CacheChanged => {
+                    // Die Belegung in der Kopfzeile stimmt nach einer Eviction
+                    // nicht mehr.
+                    update_status(&state, &status, &stack);
+                }
+                DownloadMessage::PasswordRequired { responder } => {
+                    match ask_secret(
+                        &window,
+                        "Passwort für iCloud",
+                        "Im Schlüsselbund liegt kein Passwort für diese Apple-ID.",
+                        SecretKind::Password,
+                    )
+                    .await
+                    {
+                        Some(password) => {
+                            let _ = responder.send(password);
+                        }
+                        None => drop(responder),
+                    }
+                }
+                DownloadMessage::TwoFactorRequired { responder } => {
+                    match ask_secret(
+                        &window,
+                        "Zwei-Faktor-Authentifizierung",
+                        "Apple hat einen Bestätigungscode an deine Geräte geschickt.",
+                        SecretKind::TwoFactor,
+                    )
+                    .await
+                    {
+                        Some(code) => {
+                            let _ = responder.send(code);
+                        }
+                        None => drop(responder),
+                    }
+                }
+            }
+        }
+    });
+}
+
 /// Haengt die Skelett-Optik in den Stil des Bildschirms.
 fn install_skeleton_css() {
     let provider = gtk::CssProvider::new();
@@ -680,21 +811,40 @@ fn open_viewer(state: &Rc<AppState>, parent: &adw::ApplicationWindow, photo: &Ph
         .hexpand(true)
         .build();
 
-    let body: gtk::Widget = match photo.cached_original() {
+    let spinner = gtk::Spinner::builder().spinning(true).build();
+    let loading = adw::StatusPage::builder()
+        .title("Original wird geladen …")
+        .description("Die Vorschau liegt lokal, das Original kommt aus iCloud.")
+        .child(&spinner)
+        .build();
+
+    let failed = adw::StatusPage::builder()
+        .icon_name("dialog-warning-symbolic")
+        .title("Original nicht verfügbar")
+        .build();
+
+    let stack = gtk::Stack::new();
+    stack.add_named(&picture, Some("image"));
+    stack.add_named(&loading, Some("loading"));
+    stack.add_named(&failed, Some("failed"));
+
+    match photo.cached_original() {
+        // Schon im Cache: sofort zeigen, kein Netz nötig.
         Some(path) => {
             set_image(&picture, Some(&path));
-            picture.upcast()
+            stack.set_visible_child_name("image");
         }
-        None => adw::StatusPage::builder()
-            .icon_name("folder-download-symbolic")
-            .title("Original nicht im Cache")
-            .description(
-                "Der Full-Res-Download ist noch nicht angebunden — \
-                 siehe offene Punkte in CLAUDE.md.",
-            )
-            .build()
-            .upcast(),
-    };
+        None => {
+            stack.set_visible_child_name("loading");
+            state.request_original(&photo.id());
+        }
+    }
+
+    *state.open_photo.borrow_mut() = Some(OpenPhoto {
+        id: photo.id(),
+        picture,
+        stack: stack.clone(),
+    });
 
     let header = adw::HeaderBar::new();
     let viewer = adw::Window::builder()
@@ -705,9 +855,34 @@ fn open_viewer(state: &Rc<AppState>, parent: &adw::ApplicationWindow, photo: &Ph
         .default_height(700)
         .build();
 
+    // AdwWindow schliesst nicht von selbst auf Escape — fuer einen Viewer ist
+    // das aber die erwartete Geste.
+    let keys = gtk::EventControllerKey::new();
+    keys.connect_key_pressed({
+        let viewer = viewer.clone();
+        move |_, key, _, _| {
+            if key == gdk::Key::Escape {
+                viewer.close();
+                glib::Propagation::Stop
+            } else {
+                glib::Propagation::Proceed
+            }
+        }
+    });
+    viewer.add_controller(keys);
+
+    // Trifft ein Original nach dem Schliessen ein, soll es nirgends landen.
+    viewer.connect_close_request({
+        let state = state.clone();
+        move |_| {
+            state.open_photo.borrow_mut().take();
+            glib::Propagation::Proceed
+        }
+    });
+
     let content = gtk::Box::new(gtk::Orientation::Vertical, 0);
     content.append(&header);
-    content.append(&body);
+    content.append(&stack);
     viewer.set_content(Some(&content));
     viewer.present();
 }

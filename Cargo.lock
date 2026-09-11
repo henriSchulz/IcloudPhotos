@@ -591,6 +591,7 @@ dependencies = [
  "icloud-photos-core",
  "icloud-photos-sync",
  "libadwaita",
+ "tempfile",
  "tokio",
  "tracing",
  "tracing-subscriber",

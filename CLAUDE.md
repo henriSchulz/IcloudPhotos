@@ -171,6 +171,9 @@ Protokoll, alles Menschenlesbare geht nach stderr.
 {"type": "error", "kind": "auth", "message": "..."}
 ```
 
+Im Serve-Modus (`--serve`) kommen Befehle als JSON-Zeilen über stdin:
+`{"cmd": "original", "id": ..., "dest": ...}` und `{"cmd": "quit"}`.
+
 Auf `password_required` bzw. `auth_required` erwartet der Sidecar das Passwort
 bzw. den 2FA-Code als eine Zeile auf stdin — nie über `argv`, denn
 Kommandozeilen sind in `/proc` für jeden Prozess des Nutzers lesbar. Nach
@@ -252,9 +255,12 @@ Ein abgebrochener Sync wird vom nächsten Lauf vervollständigt:
       `--fetch-thumbs` holt Vorschauen für IDs von stdin nach — nötig, weil der
       Delta-Sync ältere Assets nicht erneut sieht. Die App hängt diesen
       Durchgang automatisch an jeden Sync an (max. 500 pro Lauf).
-- [ ] **Full-Res-Download fehlt** — der Viewer zeigt nur, was schon im Cache
-      liegt. Dafür braucht der Sidecar einen dauerhaften `--serve`-Modus, weil
-      Prozessstart plus Auth pro geöffnetem Foto zu teuer sind.
+- [x] **Full-Res-Download auf Abruf.** Der Sidecar hat dafür einen dauerhaft
+      laufenden `--serve`-Modus: Prozessstart plus Anmeldung kosten Sekunden
+      und dürfen nicht bei jedem geöffneten Foto anfallen. Er wird erst beim
+      ersten Auftrag gestartet — wer nie ein Foto öffnet, zahlt keine Anmeldung.
+      Damit läuft die LRU-Eviction erstmals im Echtbetrieb: nach jedem Download
+      wird das Limit durchgesetzt, wie in der Cache-Strategie festgelegt.
 - [x] **Fotos laufen live ein.** Die Ansicht zieht alle 2 Sekunden nach,
       solange ein Sync läuft (`LIVE_REFRESH`), statt erst am Ende umzuschalten.
       Fotos ohne Vorschau und noch nicht synchronisierte Plätze erscheinen als

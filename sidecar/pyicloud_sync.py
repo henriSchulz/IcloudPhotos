@@ -12,6 +12,8 @@ Das Protokoll ist zeilenweises JSON; jede Zeile hat ein Feld ``type``:
     {"type": "thumb", "id": ..., "path": "...", "bytes": 34567}
     {"type": "deleted", "id": "..."}            in iCloud geloescht
     {"type": "library_count", "value": 19624}   Bestandsabgleich nach einem Delta
+    {"type": "ready"}                           Serve-Modus nimmt Befehle entgegen
+    {"type": "original", "id": ..., "path": "...", "bytes": 4200000}
     {"type": "offset", "value": 1200}           Fortschritt des Erstaufbaus
     {"type": "baseline_complete", "count": 17000}
     {"type": "token_expired", "message": "..."} Delta nicht moeglich
@@ -450,6 +452,152 @@ def run_sync(
     return EXIT_OK
 
 
+# --------------------------------------------------------------------------
+# Serve-Modus: dauerhaft laufend, fuer Originale auf Abruf
+# --------------------------------------------------------------------------
+
+ORIGINAL_VERSION = "original"
+VIDEO_ORIGINAL_VERSION = "original"
+
+
+def original_version_for(asset: Any) -> str:
+    """Schluessel der Original-Resource."""
+    try:
+        return VIDEO_ORIGINAL_VERSION if asset.item_type == "movie" else ORIGINAL_VERSION
+    except Exception:  # noqa: BLE001 - fremde API, im Zweifel das Foto-Verhalten
+        return ORIGINAL_VERSION
+
+
+def download_original(asset: Any, dest: Path) -> dict[str, Any]:
+    """Laedt das Original nach ``dest``. Gibt die Protokollzeile zurueck."""
+    if dest.is_file() and dest.stat().st_size > 0:
+        return {
+            "type": "original",
+            "id": asset.id,
+            "path": str(dest),
+            "bytes": dest.stat().st_size,
+        }
+
+    try:
+        data = asset.download(original_version_for(asset))
+    except Exception as exc:  # noqa: BLE001 - fremde API
+        return {
+            "type": "original_failed",
+            "id": asset.id,
+            "message": f"{type(exc).__name__}: {exc}",
+        }
+
+    if not data:
+        return {"type": "original_failed", "id": asset.id, "message": "kein Original verfuegbar"}
+
+    dest.parent.mkdir(parents=True, exist_ok=True)
+    # Wie bei den Vorschauen: erst vollstaendig schreiben, dann umbenennen.
+    tmp = dest.with_suffix(dest.suffix + ".part")
+    tmp.write_bytes(data)
+    tmp.replace(dest)
+    return {"type": "original", "id": asset.id, "path": str(dest), "bytes": len(data)}
+
+
+def run_serve(username: str, cookie_dir: str | None) -> int:
+    """Bleibt laufen und beantwortet Befehle von stdin.
+
+    Fuer Originale auf Abruf: ein Prozessstart samt Anmeldung kostet Sekunden,
+    das kann nicht bei jedem geoeffneten Foto anfallen.
+
+    Befehle sind JSON-Zeilen: ``{"cmd": "original", "id": ..., "dest": ...}``
+    und ``{"cmd": "quit"}``.
+    """
+    api = authenticate(username, cookie_dir)
+    album = api.photos.all
+    emit({"type": "ready"})
+
+    for line in sys.stdin:
+        line = line.strip()
+        if not line:
+            continue
+        try:
+            command = json.loads(line)
+        except json.JSONDecodeError as exc:
+            emit({"type": "error", "kind": "protocol", "message": f"unlesbarer Befehl: {exc}"})
+            continue
+
+        name = command.get("cmd")
+        if name == "quit":
+            break
+        if name != "original":
+            emit({"type": "error", "kind": "protocol", "message": f"unbekannter Befehl: {name}"})
+            continue
+
+        asset_id = command.get("id")
+        dest = command.get("dest")
+        if not asset_id or not dest:
+            emit({"type": "original_failed", "id": asset_id or "", "message": "id oder dest fehlt"})
+            continue
+
+        try:
+            asset = album.get(asset_id)
+        except Exception as exc:  # noqa: BLE001 - fremde API
+            emit(
+                {
+                    "type": "original_failed",
+                    "id": asset_id,
+                    "message": f"{type(exc).__name__}: {exc}",
+                }
+            )
+            continue
+
+        if asset is None:
+            emit({"type": "original_failed", "id": asset_id, "message": "Asset nicht gefunden"})
+            continue
+
+        emit(download_original(asset, Path(dest)))
+
+    return EXIT_OK
+
+
+def run_fake_serve(count: int, needs_password: bool) -> int:
+    """Serve-Modus ohne iCloud: liefert erzeugte Originale."""
+    if needs_password:
+        emit({"type": "password_required", "username": "fake@example.com"})
+        if read_secret() != FAKE_PASSWORD:
+            emit({"type": "error", "kind": "credentials", "message": "Anmeldung abgelehnt"})
+            return EXIT_AUTH
+    emit({"type": "auth_ok", "trusted": True})
+    emit({"type": "ready"})
+
+    for line in sys.stdin:
+        line = line.strip()
+        if not line:
+            continue
+        command = json.loads(line)
+        if command.get("cmd") == "quit":
+            break
+        asset_id = command.get("id", "")
+        dest = Path(command["dest"])
+
+        if not asset_id.startswith("fake-"):
+            emit({"type": "original_failed", "id": asset_id, "message": "Asset nicht gefunden"})
+            continue
+        number = int(asset_id.removeprefix("fake-"))
+        if number >= count:
+            emit({"type": "original_failed", "id": asset_id, "message": "Asset nicht gefunden"})
+            continue
+
+        dest.parent.mkdir(parents=True, exist_ok=True)
+        # Deutlich groesser als eine Vorschau, damit die Eviction etwas zu tun hat.
+        dest.write_bytes(fake_png(320, number))
+        emit(
+            {
+                "type": "original",
+                "id": asset_id,
+                "path": str(dest),
+                "bytes": dest.stat().st_size,
+            }
+        )
+
+    return EXIT_OK
+
+
 def run_fetch_thumbs(username: str, cookie_dir: str | None, thumbs: Path) -> int:
     """Laedt Vorschauen fuer die IDs, die zeilenweise auf stdin kommen.
 
@@ -714,11 +862,18 @@ def main(argv: list[str] | None = None) -> int:
         action="store_true",
         help="Nur Vorschauen nachladen; Asset-IDs kommen zeilenweise ueber stdin",
     )
+    parser.add_argument(
+        "--serve",
+        action="store_true",
+        help="Dauerhaft laufen und Befehle von stdin beantworten (Originale auf Abruf)",
+    )
     args = parser.parse_args(argv)
 
     thumbs = Path(args.thumbs).expanduser() if args.thumbs else None
 
     if args.fake is not None:
+        if args.serve:
+            return run_fake_serve(args.fake, args.fake_password)
         return run_fake(
             args.fake,
             args.fake_2fa,
@@ -737,6 +892,8 @@ def main(argv: list[str] | None = None) -> int:
         parser.error("--fetch-thumbs braucht --thumbs")
 
     try:
+        if args.serve:
+            return run_serve(args.username, args.cookie_dir)
         if args.fetch_thumbs:
             assert thumbs is not None
             return run_fetch_thumbs(args.username, args.cookie_dir, thumbs)
