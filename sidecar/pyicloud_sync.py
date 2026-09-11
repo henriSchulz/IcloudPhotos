@@ -155,8 +155,18 @@ def record_for(asset: Any) -> dict[str, Any]:
 # Thumbnails
 # --------------------------------------------------------------------------
 
-# Schluessel der Vorschau-Resource in pyicloud (PHOTO_VERSION_LOOKUP).
+# Schluessel der Vorschau-Resource in pyicloud.
+# Bei Fotos ist "thumb" das JPEG (resJPEGThumb). Bei Videos zeigt "thumb"
+# dagegen auf resVidSmall — ein Video. Das Standbild heisst dort "thumb_image".
 THUMB_VERSION = "thumb"
+VIDEO_THUMB_VERSION = "thumb_image"
+
+
+def thumb_version_for(asset: Any) -> str:
+    try:
+        return VIDEO_THUMB_VERSION if asset.item_type == "movie" else THUMB_VERSION
+    except Exception:  # noqa: BLE001 - fremde API, im Zweifel das Foto-Verhalten
+        return THUMB_VERSION
 
 
 def thumb_path_for(directory: Path, asset_id: str) -> Path:
@@ -183,7 +193,7 @@ def download_thumb(asset: Any, directory: Path) -> dict[str, Any]:
         }
 
     try:
-        data = asset.download(THUMB_VERSION)
+        data = asset.download(thumb_version_for(asset))
     except Exception as exc:  # noqa: BLE001 - fremde API, jeder Fehler ist hier gleich
         return {"type": "thumb_failed", "id": asset.id, "message": f"{type(exc).__name__}: {exc}"}
 
