@@ -4,7 +4,7 @@ pub mod db;
 pub mod evict;
 pub mod housekeeping;
 
-pub use db::Catalog;
+pub use db::{Catalog, SyncState};
 pub use evict::{EvictionReport, enforce_limit};
 
 /// Fehler aus Katalog- und Cache-Operationen.

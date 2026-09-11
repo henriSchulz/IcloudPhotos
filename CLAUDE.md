@@ -183,6 +183,42 @@ echten Subprozess. Die erzeugten `added_date` sind bewusst **unsortiert**, weil
 die echte API das auch ist — ein Sidecar, der Sortierung voraussetzt, fällt im
 Test auf.
 
+## Sync-Strategie
+
+`photos.all` ist **nicht** nach `added_date` sortiert — an einer echten
+Bibliothek gemessen springen die Daten zwischen aufeinanderfolgenden Assets
+(rowid 1: 2024-06, rowid 3: 2023-01, Ende: 2022-07). Sortiert ist das Album
+nach `asset_date` aufsteigend (1748 von 1756 Paaren). Ein `added_date`-Cursor
+als Abbruchbedingung ist deshalb unbrauchbar.
+
+Der Abgleich läuft stattdessen so, wie Apples eigene Clients es tun — über den
+CloudKit-**syncToken** der Foto-Zone:
+
+| Schicht | Wann | Kosten bei 17.000 Fotos |
+|---|---|---|
+| 1. Token-Vergleich (`sync_cursor`) | jeder Sync | **1 Request**, wenn unverändert |
+| 2. `iter_changes(since=token)` | Token geändert | proportional zur Zahl der Änderungen |
+| 3. Vollständiger Durchlauf | Erstaufbau, abgelehnter Token, 24-h-Abgleich | ~170 Seitenabrufe, einmalig |
+
+Zustand liegt in `sync_state` (einzeilig): `zone_sync_token`, `baseline_done`,
+`baseline_offset`, `last_baseline_at`.
+
+**Zwei Regeln, an denen die Korrektheit hängt:**
+
+- Der Token wird **vor** dem Durchlauf geholt. Änderungen während des Laufs
+  kommen dann beim nächsten Mal erneut — andersherum gingen sie verloren.
+- Der Token wird **nur übernommen**, wenn der lokale Stand ihn verdient:
+  unverändert, vollständiger Durchlauf beendet, oder sauberer Delta-Lauf. Nach
+  einem abgebrochenen Erstaufbau wäre er eine Lüge — der nächste Lauf zöge ein
+  Delta und sähe den Rest der Bibliothek nie.
+
+Ein durch `--limit` abgeschnittener Durchlauf meldet deshalb bewusst kein
+`baseline_complete`, sondern nur seinen `offset`.
+
+Alle 24 Stunden läuft trotzdem ein vollständiger Abgleich (`RECONCILE_AFTER`)
+— Sicherheitsnetz gegen langsames Abdriften durch Records, die sich keinem
+Asset zuordnen lassen.
+
 ## Wiederaufnahme
 
 Ein abgebrochener Sync wird vom nächsten Lauf vervollständigt:
@@ -191,8 +227,8 @@ Ein abgebrochener Sync wird vom nächsten Lauf vervollständigt:
 - Vorschauen, deren Datei schon existiert, werden nicht erneut geladen.
 - Geschrieben wird über `.part` + `rename`, eine abgebrochene Datei gilt also
   nie als gültiger Treffer.
-- Der Durchlauf paginiert immer die ganze Bibliothek (siehe offene Punkte),
-  sodass Lücken irgendwo in der Mitte zuverlässig gefunden werden.
+- Ein abgebrochener Erstaufbau setzt bei `baseline_offset` fort, statt von
+  vorn zu paginieren. Der Fortschritt wird alle 50 Assets festgehalten.
 
 ## Offene Punkte / TODO
 
@@ -221,17 +257,12 @@ Ein abgebrochener Sync wird vom nächsten Lauf vervollständigt:
       Prozessstart plus Auth pro geöffnetem Foto zu teuer sind.
 - [ ] Vorschauen erscheinen erst, wenn der Sync durch ist — das Modell wird am
       Ende neu geladen statt einzelne Kacheln zu aktualisieren.
-- [ ] **Skalierung des Sync.** `photos.all` ist **nicht** nach `added_date`
-      sortiert — an einer echten Bibliothek springen die Daten zwischen
-      aufeinanderfolgenden Assets beliebig (rowid 1: 2024-06, rowid 3: 2023-01,
-      Ende: 2022-07). Ein `added_date`-Cursor als Abbruchbedingung verschluckt
-      deshalb den Rest der Bibliothek; er ist entfernt, jeder Sync paginiert
-      vollständig. Das ist korrekt und wiederaufnehmbar, kostet bei sehr großen
-      Bibliotheken aber jedes Mal den vollen Durchlauf.
-      Lösung: `PhotosService.iter_changes(since=zone_cursor)` — serverseitiges
-      Delta, meldet zusätzlich **Löschungen**, die der `added_date`-Ansatz
-      prinzipiell nie bemerkt. `--since` bleibt als reiner Filter erhalten und
-      beendet den Durchlauf nie.
+- [x] **Inkrementeller Sync über den CloudKit-Zone-Token** (siehe eigener
+      Abschnitt). Löst auch Löschungen, die über `added_date` prinzipiell
+      unsichtbar sind.
+- [ ] `change_unresolved` beobachten: welche `record_type`-Werte in der Zone
+      auftauchen, die kein Asset sind. Bislang nur gegen den Fake-Sidecar
+      geprüft, nicht gegen die echte API.
 - [ ] Session-Refresh-Handling bei abgelaufener pyicloud-Session
 - [ ] `GListModel`-Implementierung für paginierte SQLite-Queries.
       Zwischenlösung: `gio::ListStore`, der beim Scrollen seitenweise nachlädt

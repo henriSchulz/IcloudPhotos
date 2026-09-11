@@ -8,7 +8,7 @@ use rusqlite::{Connection, OptionalExtension, Row, params};
 
 use crate::CacheError;
 
-const SCHEMA_VERSION: i32 = 1;
+const SCHEMA_VERSION: i32 = 2;
 
 /// Der lokale Foto-Katalog.
 pub struct Catalog {
@@ -73,6 +73,18 @@ impl Catalog {
             -- gecachte Originale betrachten.
             CREATE INDEX IF NOT EXISTS idx_photos_cached_lru
                 ON photos(last_accessed_at) WHERE is_orig_cached = 1;
+
+            -- Einzeiliger Zustand des Sync. Der zone_sync_token ist das
+            -- CloudKit-Pendant zu Apples eigenem Abgleich: aendert er sich
+            -- nicht, hat sich in der Bibliothek nichts getan.
+            CREATE TABLE IF NOT EXISTS sync_state (
+                id               INTEGER PRIMARY KEY CHECK (id = 1),
+                zone_sync_token  TEXT,
+                baseline_done    INTEGER NOT NULL DEFAULT 0,
+                baseline_offset  INTEGER NOT NULL DEFAULT 0,
+                last_baseline_at TEXT
+            );
+            INSERT OR IGNORE INTO sync_state (id) VALUES (1);
             "#,
         )?;
         self.conn
@@ -252,6 +264,80 @@ impl Catalog {
         Ok(from_sql_bytes(sum))
     }
 
+    /// Der gespeicherte Sync-Zustand.
+    pub fn sync_state(&self) -> Result<SyncState, CacheError> {
+        let (token, done, offset, baseline_at): (Option<String>, i64, i64, Option<String>) =
+            self.conn.query_row(
+                "SELECT zone_sync_token, baseline_done, baseline_offset, last_baseline_at
+                   FROM sync_state WHERE id = 1",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+            )?;
+        Ok(SyncState {
+            zone_token: token,
+            baseline_done: done != 0,
+            baseline_offset: from_sql_bytes(offset),
+            last_baseline_at: baseline_at.as_deref().map(decode_ts).transpose()?,
+        })
+    }
+
+    /// Vermerkt den Token, mit dem der naechste Sync vergleicht.
+    pub fn set_zone_token(&self, token: Option<&str>) -> Result<(), CacheError> {
+        self.conn.execute(
+            "UPDATE sync_state SET zone_sync_token = ?1 WHERE id = 1",
+            params![token],
+        )?;
+        Ok(())
+    }
+
+    /// Haelt fest, wie weit ein Erstaufbau gekommen ist.
+    ///
+    /// Solange `done` falsch ist, faengt der naechste Lauf bei `offset` wieder
+    /// an, statt die Bibliothek von vorn zu paginieren.
+    pub fn set_baseline_progress(
+        &self,
+        offset: u64,
+        done: bool,
+        now: DateTime<Utc>,
+    ) -> Result<(), CacheError> {
+        self.conn.execute(
+            r#"
+            UPDATE sync_state
+               SET baseline_offset  = ?1,
+                   baseline_done    = ?2,
+                   last_baseline_at = CASE WHEN ?2 THEN ?3 ELSE last_baseline_at END
+             WHERE id = 1
+            "#,
+            params![to_sql_bytes(offset), done, encode_ts(now)],
+        )?;
+        Ok(())
+    }
+
+    /// Entfernt ein in iCloud geloeschtes Foto aus dem Katalog.
+    ///
+    /// Gibt die Cache-Dateien zurueck, die der Aufrufer noch loeschen muss —
+    /// der Katalog fasst das Dateisystem selbst nicht an.
+    pub fn delete_photo(&self, id: &str) -> Result<Vec<PathBuf>, CacheError> {
+        let paths: Option<(Option<String>, Option<String>)> = self
+            .conn
+            .query_row(
+                "SELECT thumb_path, orig_path FROM photos WHERE id = ?1",
+                params![id],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .optional()?;
+        let Some((thumb, orig)) = paths else {
+            return Ok(Vec::new());
+        };
+        self.conn
+            .execute("DELETE FROM photos WHERE id = ?1", params![id])?;
+        Ok([thumb, orig]
+            .into_iter()
+            .flatten()
+            .map(PathBuf::from)
+            .collect())
+    }
+
     /// IDs von Fotos ohne Vorschau, neueste zuerst.
     ///
     /// Der Delta-Sync sieht ältere Assets nicht erneut; fehlt dort eine
@@ -304,6 +390,18 @@ impl Catalog {
         )?;
         Ok(())
     }
+}
+
+/// Wie weit der Sync ist.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct SyncState {
+    /// CloudKit-syncToken der Foto-Zone beim letzten erfolgreichen Lauf.
+    pub zone_token: Option<String>,
+    /// Ob die Bibliothek schon einmal vollstaendig durchlaufen wurde.
+    pub baseline_done: bool,
+    /// Position, an der ein abgebrochener Erstaufbau weitermacht.
+    pub baseline_offset: u64,
+    pub last_baseline_at: Option<DateTime<Utc>>,
 }
 
 /// Ein im Full-Res-Cache liegendes Original.
@@ -519,6 +617,62 @@ mod tests {
         assert!(photo.last_accessed_at.is_some());
         assert_eq!(photo.orig_path, None);
         assert_eq!(photo.orig_bytes, None);
+    }
+
+    #[test]
+    fn sync_state_starts_empty_and_persists() {
+        let catalog = Catalog::open_in_memory().unwrap();
+        let state = catalog.sync_state().unwrap();
+        assert_eq!(state.zone_token, None);
+        assert!(!state.baseline_done);
+        assert_eq!(state.baseline_offset, 0);
+
+        catalog.set_zone_token(Some("token-abc")).unwrap();
+        let now = Utc::now();
+        catalog.set_baseline_progress(1200, false, now).unwrap();
+
+        let state = catalog.sync_state().unwrap();
+        assert_eq!(state.zone_token.as_deref(), Some("token-abc"));
+        assert_eq!(state.baseline_offset, 1200);
+        assert!(!state.baseline_done);
+        // Der Zeitstempel zaehlt erst, wenn der Durchlauf wirklich durch ist.
+        assert_eq!(state.last_baseline_at, None);
+
+        catalog.set_baseline_progress(1700, true, now).unwrap();
+        let state = catalog.sync_state().unwrap();
+        assert!(state.baseline_done);
+        assert!(state.last_baseline_at.is_some());
+    }
+
+    #[test]
+    fn delete_photo_reports_files_to_remove() {
+        let catalog = Catalog::open_in_memory().unwrap();
+        catalog
+            .upsert_record(&record("a", "2026-01-01T00:00:00Z"))
+            .unwrap();
+        catalog
+            .set_thumbnail("a", Path::new("/thumbs/a.jpg"), 10)
+            .unwrap();
+        catalog
+            .set_original_cached("a", Path::new("/fullres/a.heic"), 99, Utc::now())
+            .unwrap();
+
+        let files = catalog.delete_photo("a").unwrap();
+        assert_eq!(
+            files,
+            vec![
+                PathBuf::from("/thumbs/a.jpg"),
+                PathBuf::from("/fullres/a.heic")
+            ]
+        );
+        assert_eq!(catalog.get("a").unwrap(), None);
+        assert_eq!(catalog.cached_bytes().unwrap(), 0);
+    }
+
+    #[test]
+    fn deleting_an_unknown_photo_is_harmless() {
+        let catalog = Catalog::open_in_memory().unwrap();
+        assert!(catalog.delete_photo("gibt-es-nicht").unwrap().is_empty());
     }
 
     #[test]

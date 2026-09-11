@@ -21,7 +21,41 @@ pub enum SidecarMessage {
         #[serde(default)]
         trusted: bool,
     },
+    /// Zone-Token vor dem Durchlauf. Stimmt er beim naechsten Mal noch, hat
+    /// sich in der Bibliothek nichts getan.
+    Cursor {
+        #[serde(default)]
+        token: Option<String>,
+    },
+    /// Token unveraendert — nichts zu tun.
+    Unchanged,
     Photo(PhotoRecord),
+    /// In iCloud geloescht.
+    Deleted {
+        id: String,
+    },
+    /// Fortschritt des Erstaufbaus, damit ein Abbruch nicht alles kostet.
+    Offset {
+        value: u64,
+    },
+    BaselineComplete {
+        count: u64,
+    },
+    /// Der Delta-Abgleich war nicht moeglich; der Sidecar faellt selbst auf
+    /// einen vollstaendigen Durchlauf zurueck.
+    TokenExpired {
+        #[serde(default)]
+        message: String,
+    },
+    /// Ein geaenderter Record liess sich keinem Asset zuordnen — in der Zone
+    /// liegen auch Alben und Hilfsrecords.
+    ChangeUnresolved {
+        id: String,
+        #[serde(default)]
+        record_type: Option<String>,
+        #[serde(default)]
+        message: String,
+    },
     /// Eine Vorschau wurde geladen und liegt unter `path`.
     Thumb {
         id: String,
@@ -65,6 +99,12 @@ pub enum SyncEvent {
     /// So viele Vorschauen liegen bereits auf der Platte.
     Thumbnails {
         stored: u64,
+    },
+    /// Die Bibliothek ist unveraendert; dieser Lauf kostete einen Request.
+    Unchanged,
+    /// So viele in iCloud geloeschte Fotos wurden ausgetragen.
+    Deleted {
+        removed: u64,
     },
 }
 
@@ -122,6 +162,48 @@ mod tests {
                 username: "a@b.c".into()
             }
         );
+    }
+
+    #[test]
+    fn parses_change_tracking_lines() {
+        let cases: Vec<(&str, SidecarMessage)> = vec![
+            (
+                r#"{"type":"cursor","token":"AQAAAF8="}"#,
+                SidecarMessage::Cursor {
+                    token: Some("AQAAAF8=".into()),
+                },
+            ),
+            (
+                r#"{"type":"cursor","token":null}"#,
+                SidecarMessage::Cursor { token: None },
+            ),
+            (r#"{"type":"unchanged"}"#, SidecarMessage::Unchanged),
+            (
+                r#"{"type":"deleted","id":"abc"}"#,
+                SidecarMessage::Deleted { id: "abc".into() },
+            ),
+            (
+                r#"{"type":"offset","value":1200}"#,
+                SidecarMessage::Offset { value: 1200 },
+            ),
+            (
+                r#"{"type":"baseline_complete","count":17000}"#,
+                SidecarMessage::BaselineComplete { count: 17000 },
+            ),
+        ];
+        for (line, expected) in cases {
+            assert_eq!(
+                serde_json::from_str::<SidecarMessage>(line).unwrap(),
+                expected
+            );
+        }
+    }
+
+    #[test]
+    fn parses_unresolved_change() {
+        let line = r#"{"type":"change_unresolved","id":"x","record_type":"CPLAlbum","message":"kein Asset"}"#;
+        let msg: SidecarMessage = serde_json::from_str(line).unwrap();
+        assert!(matches!(msg, SidecarMessage::ChangeUnresolved { .. }));
     }
 
     #[test]

@@ -52,7 +52,17 @@ fn main() -> anyhow::Result<()> {
 
     let state = window::AppState::new(config, config_path, catalog);
 
-    let app = adw::Application::builder().application_id(APP_ID).build();
+    // GApplication ist per D-Bus Single-Instance. Ein Testlauf mit derselben
+    // ID reicht seine Aktivierung an eine bereits laufende Instanz weiter und
+    // beendet sich sofort — deshalb bekommt der Testmodus eine eigene ID.
+    let app = if sync_task::fake_count().is_some() {
+        adw::Application::builder()
+            .application_id(&format!("{APP_ID}.Fake"))
+            .flags(gtk::gio::ApplicationFlags::NON_UNIQUE)
+            .build()
+    } else {
+        adw::Application::builder().application_id(APP_ID).build()
+    };
     app.connect_activate({
         let state = state.clone();
         move |app| {

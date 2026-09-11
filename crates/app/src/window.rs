@@ -650,6 +650,12 @@ fn start_sync(
                 SyncMessage::Thumbnails { stored } => {
                     status.set_label(&format!("Lade Vorschauen … {stored}"));
                 }
+                SyncMessage::Unchanged => {
+                    tracing::debug!("Bibliothek unveraendert");
+                }
+                SyncMessage::Deleted { removed } => {
+                    status.set_label(&format!("Entferne gelöschte Fotos … {removed}"));
+                }
                 SyncMessage::Authenticated { trusted } => {
                     // Erst hier ist die Anmeldung wirklich durch — Passwort und
                     // 2FA sind bestaetigt. Jetzt darf die Maske weichen.

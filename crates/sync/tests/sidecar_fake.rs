@@ -96,7 +96,18 @@ async fn reports_progress_and_auth() {
             _ => None,
         })
         .collect();
-    assert_eq!(progress, [256, 300], "ein Zwischenstand und der Abschluss");
+
+    // Der Erstaufbau meldet regelmaessig Zwischenstaende, damit ein Abbruch
+    // nicht den ganzen Durchlauf kostet.
+    assert!(
+        progress.len() > 2,
+        "zu wenige Zwischenstaende: {progress:?}"
+    );
+    assert!(
+        progress.windows(2).all(|w| w[0] <= w[1]),
+        "Fortschritt muss monoton sein: {progress:?}"
+    );
+    assert_eq!(progress.last().copied(), Some(300));
 }
 
 #[tokio::test]
@@ -555,4 +566,170 @@ async fn interrupted_sync_is_completed_by_the_next_run() {
         "die fehlenden Fotos sind nachgetragen"
     );
     assert!(fresh.ids_without_thumbnail(20).unwrap().is_empty());
+}
+
+// --------------------------------------------------------------------------
+// Inkrementeller Abgleich über den CloudKit-Zone-Token
+// --------------------------------------------------------------------------
+
+/// Schicht 1: unveränderter Token heißt, es gibt schlicht nichts zu tun.
+#[tokio::test]
+async fn unchanged_token_skips_the_whole_walk() {
+    let python = python_or_skip!();
+    let mut catalog = Catalog::open_in_memory().unwrap();
+
+    // Erstaufbau.
+    let first = run_sync(&mut catalog, &options(&python, 6), &Prompts::default())
+        .await
+        .unwrap();
+    assert!(first.baseline_complete);
+    assert_eq!(catalog.count().unwrap(), 6);
+
+    let state = catalog.sync_state().unwrap();
+    assert!(state.baseline_done, "Erstaufbau muss vermerkt sein");
+    assert_eq!(state.zone_token.as_deref(), Some("fake-token-6"));
+
+    // Zweiter Lauf mit demselben Token.
+    let mut options = options(&python, 6);
+    options.since_token = state.zone_token.clone();
+
+    let (tx, mut rx) = mpsc::unbounded_channel();
+    let second = run_sync(&mut catalog, &options, &Prompts::events_only(tx))
+        .await
+        .unwrap();
+
+    assert!(second.unchanged);
+    assert_eq!(second.stored, 0, "kein einziger Datensatz wurde geholt");
+    assert_eq!(second.deleted, 0);
+    assert_eq!(catalog.count().unwrap(), 6);
+
+    let mut events = Vec::new();
+    while let Ok(event) = rx.try_recv() {
+        events.push(event);
+    }
+    assert!(events.contains(&SyncEvent::Unchanged));
+}
+
+/// Schicht 2: neue Fotos kommen als Delta, nicht als voller Durchlauf.
+#[tokio::test]
+async fn changed_token_fetches_only_the_difference() {
+    let python = python_or_skip!();
+    let dir = tempfile::tempdir().unwrap();
+    let mut catalog = Catalog::open_in_memory().unwrap();
+
+    let mut base = options(&python, 6);
+    base.thumbnail_dir = Some(dir.path().to_path_buf());
+    run_sync(&mut catalog, &base, &Prompts::default())
+        .await
+        .unwrap();
+
+    // Die Bibliothek ist auf 9 gewachsen.
+    let mut options = options(&python, 9);
+    options.thumbnail_dir = Some(dir.path().to_path_buf());
+    options.since_token = catalog.sync_state().unwrap().zone_token;
+
+    let summary = run_sync(&mut catalog, &options, &Prompts::default())
+        .await
+        .unwrap();
+
+    assert_eq!(summary.stored, 3, "nur die drei neuen, nicht alle neun");
+    assert_eq!(summary.thumbnails, 3);
+    assert!(!summary.baseline_complete, "kein voller Durchlauf");
+    assert_eq!(catalog.count().unwrap(), 9);
+    assert_eq!(
+        catalog.sync_state().unwrap().zone_token.as_deref(),
+        Some("fake-token-9")
+    );
+}
+
+/// Schicht 2: in iCloud gelöschte Fotos verschwinden samt Cache-Dateien.
+#[tokio::test]
+async fn deletions_remove_rows_and_cached_files() {
+    let python = python_or_skip!();
+    let dir = tempfile::tempdir().unwrap();
+    let mut catalog = Catalog::open_in_memory().unwrap();
+
+    let mut base = options(&python, 6);
+    base.thumbnail_dir = Some(dir.path().to_path_buf());
+    run_sync(&mut catalog, &base, &Prompts::default())
+        .await
+        .unwrap();
+
+    let doomed = catalog.get("fake-00005").unwrap().unwrap();
+    let thumb = doomed.thumb_path.expect("Vorschau fehlt");
+    assert!(thumb.is_file());
+
+    // Die Bibliothek ist auf 4 geschrumpft.
+    let mut options = options(&python, 4);
+    options.thumbnail_dir = Some(dir.path().to_path_buf());
+    options.since_token = catalog.sync_state().unwrap().zone_token;
+
+    let summary = run_sync(&mut catalog, &options, &Prompts::default())
+        .await
+        .unwrap();
+
+    assert_eq!(summary.deleted, 2);
+    assert_eq!(catalog.count().unwrap(), 4);
+    assert_eq!(catalog.get("fake-00005").unwrap(), None);
+    assert!(!thumb.is_file(), "die Cache-Datei muss mit verschwinden");
+}
+
+/// Ein abgebrochener Erstaufbau darf den Token nicht übernehmen — sonst
+/// zieht der nächste Lauf ein Delta und sieht den Rest der Bibliothek nie.
+#[tokio::test]
+async fn incomplete_baseline_does_not_claim_the_token() {
+    let python = python_or_skip!();
+    let mut catalog = Catalog::open_in_memory().unwrap();
+
+    let mut options = options(&python, 8);
+    options.limit = Some(3);
+
+    let summary = run_sync(&mut catalog, &options, &Prompts::default())
+        .await
+        .unwrap();
+
+    assert!(!summary.baseline_complete);
+    assert_eq!(
+        catalog.sync_state().unwrap().zone_token,
+        None,
+        "ein halber Durchlauf verdient den Token nicht"
+    );
+    assert!(!catalog.sync_state().unwrap().baseline_done);
+}
+
+/// Der Erstaufbau setzt an der gemerkten Position fort.
+#[tokio::test]
+async fn baseline_resumes_from_the_stored_offset() {
+    let python = python_or_skip!();
+    let mut catalog = Catalog::open_in_memory().unwrap();
+
+    // Ersten Teil holen und so tun, als wäre dort abgebrochen worden.
+    let mut first = options(&python, 10);
+    first.limit = Some(4);
+    run_sync(&mut catalog, &first, &Prompts::default())
+        .await
+        .unwrap();
+    assert_eq!(catalog.count().unwrap(), 4);
+    catalog
+        .set_baseline_progress(4, false, chrono::Utc::now())
+        .unwrap();
+
+    // Fortsetzung ab Offset 4.
+    let mut second = options(&python, 10);
+    second.offset = catalog.sync_state().unwrap().baseline_offset;
+
+    let summary = run_sync(&mut catalog, &second, &Prompts::default())
+        .await
+        .unwrap();
+
+    assert_eq!(
+        summary.stored, 6,
+        "nur der Rest, nicht die ganze Bibliothek"
+    );
+    assert!(summary.baseline_complete);
+    assert_eq!(catalog.count().unwrap(), 10);
+    assert_eq!(
+        catalog.sync_state().unwrap().zone_token.as_deref(),
+        Some("fake-token-10")
+    );
 }

@@ -6,6 +6,7 @@
 
 use std::path::PathBuf;
 
+use chrono::Utc;
 use icloud_photos_cache::Catalog;
 use icloud_photos_core::Config;
 use icloud_photos_sync::{
@@ -20,6 +21,11 @@ pub enum SyncMessage {
     },
     Thumbnails {
         stored: u64,
+    },
+    /// Die Bibliothek ist unveraendert — dieser Lauf kostete einen Request.
+    Unchanged,
+    Deleted {
+        removed: u64,
     },
     /// Die Anmeldung ist vollstaendig durch — inklusive 2FA. Erst ab hier darf
     /// die UI die Anmeldemaske verlassen.
@@ -81,12 +87,20 @@ pub fn spawn(
 
             let mut options = SidecarOptions::new(python_path(), script_path(), username);
             options.cookie_dir = cookie_dir;
-            // Bewusst kein Cursor: `photos.all` ist nicht nach `added_date`
-            // sortiert, ein Cursor wuerde einen abgebrochenen Sync nicht
-            // fortsetzen, sondern den Rest der Bibliothek ueberspringen. Der
-            // volle Durchlauf ist idempotent — vorhandene Vorschauen werden
-            // uebersprungen, Metadaten nur aktualisiert.
+            // Kein `added_date`-Cursor: `photos.all` ist danach nicht sortiert.
+            // Der Abgleich laeuft stattdessen ueber den CloudKit-Zone-Token.
             options.since = None;
+
+            let state = match catalog.sync_state() {
+                Ok(state) => state,
+                Err(error) => {
+                    let _ = tx.send(SyncMessage::Finished(Err(format!(
+                        "Sync-Zustand nicht lesbar: {error}"
+                    ))));
+                    return;
+                }
+            };
+            apply_sync_state(&mut options, &state);
             options.thumbnail_dir = Some(thumbnail_dir);
             options.fake = fake_count();
             // Erlaubt, den kompletten Anmeldeweg ohne Apple-Konto durchzuspielen.
@@ -111,6 +125,12 @@ pub fn spawn(
                                 }
                                 Some(SyncEvent::Authenticated { trusted }) => {
                                     let _ = tx.send(SyncMessage::Authenticated { trusted });
+                                }
+                                Some(SyncEvent::Unchanged) => {
+                                    let _ = tx.send(SyncMessage::Unchanged);
+                                }
+                                Some(SyncEvent::Deleted { removed }) => {
+                                    let _ = tx.send(SyncMessage::Deleted { removed });
                                 }
                                 Some(_) => {}
                                 None => break,
@@ -187,6 +207,40 @@ pub fn spawn(
 /// einer grossen Bibliothek nicht endlos blockiert.
 const BACKFILL_LIMIT: u64 = 500;
 
+/// Auch bei unveraendertem Token gelegentlich vollstaendig abgleichen.
+///
+/// Der Delta-Weg kann Records enthalten, die sich keinem Asset zuordnen
+/// lassen; ohne diesen Abgleich koennte der Katalog langsam abdriften, ohne
+/// dass es jemand merkt.
+const RECONCILE_AFTER: chrono::TimeDelta = chrono::TimeDelta::hours(24);
+
+/// Uebersetzt den gespeicherten Zustand in Sidecar-Schalter.
+///
+/// Der Token geht nur mit, wenn der Erstaufbau wirklich durch ist — sonst
+/// zoege der Sidecar ein Delta und der Rest der Bibliothek bliebe ungesehen.
+fn apply_sync_state(options: &mut SidecarOptions, state: &icloud_photos_cache::SyncState) {
+    if !state.baseline_done {
+        options.since_token = None;
+        options.offset = state.baseline_offset;
+        if options.offset > 0 {
+            tracing::info!(offset = options.offset, "setze Erstaufbau fort");
+        }
+        return;
+    }
+
+    options.offset = 0;
+    let stale = state
+        .last_baseline_at
+        .is_none_or(|at| Utc::now() - at > RECONCILE_AFTER);
+    if stale {
+        tracing::info!("periodischer Vollabgleich faellig");
+        options.force_baseline = true;
+        options.since_token = None;
+    } else {
+        options.since_token = state.zone_token.clone();
+    }
+}
+
 /// Holt fehlende Vorschauen nach. Gibt `Ok(default)` zurueck, wenn nichts fehlt.
 async fn backfill_thumbnails(
     catalog: &mut Catalog,
@@ -201,6 +255,11 @@ async fn backfill_thumbnails(
 
     let mut options = base.clone();
     options.fetch_thumbnails_for = missing;
+    // Der Nachlade-Lauf ist kein Abgleich: er darf weder den Token uebernehmen
+    // noch einen Erstaufbau als abgeschlossen melden.
+    options.since_token = None;
+    options.force_baseline = false;
+    options.offset = 0;
     run_sync(catalog, &options, prompts).await
 }
 

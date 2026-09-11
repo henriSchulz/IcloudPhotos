@@ -7,7 +7,13 @@ Das Protokoll ist zeilenweises JSON; jede Zeile hat ein Feld ``type``:
     {"type": "auth_required", "method": "2fa"}   -> erwartet Code auf stdin
     {"type": "auth_ok", "trusted": true}
     {"type": "photo", "id": ..., "filename": ...}
+    {"type": "cursor", "token": "..."}          Zone-Token vor dem Durchlauf
+    {"type": "unchanged"}                       nichts zu tun (Token unveraendert)
     {"type": "thumb", "id": ..., "path": "...", "bytes": 34567}
+    {"type": "deleted", "id": "..."}            in iCloud geloescht
+    {"type": "offset", "value": 1200}           Fortschritt des Erstaufbaus
+    {"type": "baseline_complete", "count": 17000}
+    {"type": "token_expired", "message": "..."} Delta nicht moeglich
     {"type": "thumb_failed", "id": ..., "message": "..."}
     {"type": "done", "count": 1234, "cursor": "2026-01-02T03:04:05+00:00"}
     {"type": "error", "kind": "auth", "message": "..."}
@@ -22,6 +28,7 @@ nicht — die kommen erst beim Oeffnen eines Fotos.
 from __future__ import annotations
 
 import argparse
+import itertools
 import json
 import struct
 import sys
@@ -233,7 +240,9 @@ def download_thumb(asset: Any, directory: Path) -> dict[str, Any]:
     return {"type": "thumb", "id": asset.id, "path": str(target), "bytes": len(data)}
 
 
-def iter_assets(api: Any, since: datetime | None, limit: int | None) -> Iterator[Any]:
+def iter_assets(
+    api: Any, since: datetime | None, limit: int | None, offset: int = 0
+) -> Iterator[Any]:
     """Laeuft die gesamte Bibliothek durch.
 
     ``photos.all`` ist **nicht** nach ``added_date`` sortiert — gemessen an
@@ -246,7 +255,12 @@ def iter_assets(api: Any, since: datetime | None, limit: int | None) -> Iterator
     Durchlauf nie.
     """
     emitted = 0
-    for asset in api.photos.all:
+    source = api.photos.all
+    if offset:
+        # Serverseitiger Versatz: ein abgebrochener Erstaufbau muss nicht die
+        # bereits erledigten Seiten erneut holen.
+        source = itertools.islice(source, offset, None)
+    for asset in source:
         if since is not None and asset.added_date <= since:
             continue
         yield asset
@@ -256,30 +270,138 @@ def iter_assets(api: Any, since: datetime | None, limit: int | None) -> Iterator
             return
 
 
+# Alle so viele Assets meldet der Erstaufbau seinen Fortschritt, damit ein
+# Abbruch nicht den ganzen Durchlauf kostet.
+OFFSET_REPORT_EVERY = 50
+
+
+def zone_token(api: Any) -> str | None:
+    """Aktueller CloudKit-syncToken der Foto-Zone."""
+    try:
+        return api.photos.sync_cursor
+    except Exception as exc:  # noqa: BLE001 - fremde API
+        log(f"syncToken nicht abrufbar: {type(exc).__name__}: {exc}")
+        return None
+
+
+def run_baseline(
+    api: Any,
+    thumbs: Path | None,
+    offset: int,
+    limit: int | None,
+) -> int:
+    """Vollstaendiger Durchlauf ab ``offset``.
+
+    Nur fuer den Erstaufbau, einen abgelehnten Token oder den periodischen
+    Abgleich. Der laufende Betrieb geht ueber ``run_changes``.
+    """
+    count = 0
+    for index, asset in enumerate(iter_assets(api, None, limit, offset=offset), start=offset):
+        emit(record_for(asset))
+        count += 1
+        if thumbs is not None:
+            emit(download_thumb(asset, thumbs))
+        if count % OFFSET_REPORT_EVERY == 0:
+            emit({"type": "offset", "value": index + 1})
+
+    # Ein durch --limit abgeschnittener Lauf ist kein vollstaendiger Abgleich.
+    # Wuerde er sich so melden, uebernaehme die App den Zone-Token und sehe den
+    # Rest der Bibliothek nie wieder.
+    if limit is None or count < limit:
+        emit({"type": "baseline_complete", "count": count})
+    else:
+        emit({"type": "offset", "value": offset + count})
+    return count
+
+
+def run_changes(api: Any, thumbs: Path | None, since_token: str) -> int:
+    """Nur die Aenderungen seit ``since_token`` — der Normalfall.
+
+    Kosten haengen an der Zahl der Aenderungen, nicht an der Bibliotheksgroesse.
+    """
+    album = api.photos.all
+    count = 0
+    for event in api.photos.iter_changes(since=since_token):
+        record_name = event.record_name
+        if event.deleted:
+            # Tombstones geben nur den Namen her. Ob der zu einem unserer Fotos
+            # gehoert, entscheidet die Rust-Seite anhand ihres Katalogs.
+            emit({"type": "deleted", "id": record_name})
+            count += 1
+            continue
+
+        try:
+            asset = album.get(record_name)
+        except Exception as exc:  # noqa: BLE001 - fremde API
+            emit(
+                {
+                    "type": "change_unresolved",
+                    "id": record_name,
+                    "record_type": event.record_type,
+                    "message": f"{type(exc).__name__}: {exc}",
+                }
+            )
+            continue
+
+        if asset is None:
+            # Nicht jeder Record in der Zone ist ein Asset — Alben und
+            # Hilfsrecords tauchen hier ebenfalls auf.
+            emit(
+                {
+                    "type": "change_unresolved",
+                    "id": record_name,
+                    "record_type": event.record_type,
+                    "message": "kein Asset",
+                }
+            )
+            continue
+
+        emit(record_for(asset))
+        count += 1
+        if thumbs is not None:
+            emit(download_thumb(asset, thumbs))
+    return count
+
+
 def run_sync(
     username: str,
     cookie_dir: str | None,
     since: datetime | None,
     limit: int | None,
     thumbs: Path | None,
+    since_token: str | None,
+    offset: int,
+    force_baseline: bool,
 ) -> int:
     api = authenticate(username, cookie_dir)
     if thumbs is not None:
         thumbs.mkdir(parents=True, exist_ok=True)
 
-    count = 0
-    newest: datetime | None = None
-    for asset in iter_assets(api, since, limit):
-        emit(record_for(asset))
-        count += 1
-        if newest is None or asset.added_date > newest:
-            newest = asset.added_date
-        # Erst die Metadaten, dann die Vorschau: faellt der Download aus, steht
-        # das Foto trotzdem schon im Katalog.
-        if thumbs is not None:
-            emit(download_thumb(asset, thumbs))
+    # Den Token *vor* dem Durchlauf holen: Aenderungen waehrend des Laufs
+    # kommen dann beim naechsten Mal erneut. Andersherum gingen sie verloren.
+    current = zone_token(api)
+    emit({"type": "cursor", "token": current})
 
-    emit({"type": "done", "count": count, "cursor": iso(newest) or iso(since)})
+    # Schicht 1: gleicher Token heisst, in der Bibliothek hat sich nichts getan.
+    if since_token is not None and current is not None and since_token == current:
+        emit({"type": "unchanged"})
+        emit({"type": "done", "count": 0, "cursor": None})
+        return EXIT_OK
+
+    # Schicht 2: nur die Aenderungen.
+    if since_token is not None and not force_baseline:
+        try:
+            count = run_changes(api, thumbs, since_token)
+        except Exception as exc:  # noqa: BLE001 - abgelaufener Token sieht je nach Server anders aus
+            log(f"Delta-Abgleich fehlgeschlagen, falle auf Vollabgleich zurueck: {exc}")
+            emit({"type": "token_expired", "message": f"{type(exc).__name__}: {exc}"})
+        else:
+            emit({"type": "done", "count": count, "cursor": None})
+            return EXIT_OK
+
+    # Schicht 3: vollstaendiger Durchlauf.
+    count = run_baseline(api, thumbs, offset, limit)
+    emit({"type": "done", "count": count, "cursor": None})
     return EXIT_OK
 
 
@@ -353,12 +475,63 @@ FAKE_PASSWORD = "geheim"
 FAKE_2FA_CODE = "123456"
 
 
+def fake_token(count: int) -> str:
+    """Der Token haengt an der Bibliotheksgroesse.
+
+    Damit laesst sich jeder Fall nachstellen: gleicher Token heisst unveraendert,
+    ein hoeherer Stand bedeutet neue Fotos, ein niedrigerer Loeschungen.
+    """
+    return f"fake-token-{count}"
+
+
+def parse_fake_token(token: str | None) -> int | None:
+    if token is None or not token.startswith("fake-token-"):
+        return None
+    try:
+        return int(token.removeprefix("fake-token-"))
+    except ValueError:
+        return None
+
+
+def fake_record(index: int) -> dict[str, Any]:
+    # Bewusst unsortiert: die echte Bibliothek liefert ebenfalls keine
+    # monotone Folge von added_date. Ein Sidecar, der das voraussetzt,
+    # faellt hier auf.
+    added = datetime(2024, 1, 1, tzinfo=UTC) + timedelta(
+        days=(index * 7919) % 365, minutes=index % 60
+    )
+    return {
+        "type": "photo",
+        "id": f"fake-{index:05d}",
+        "filename": f"IMG_{index:04d}.HEIC",
+        "added_date": iso(added),
+        "asset_date": iso(added),
+        "checksum": f"checksum-{index:05d}",
+        "width": 4032,
+        "height": 3024,
+    }
+
+
+def fake_thumb(index: int, thumbs: Path) -> dict[str, Any]:
+    target = thumb_path_for(thumbs, f"fake-{index:05d}").with_suffix(".png")
+    target.write_bytes(fake_png(64, index))
+    return {
+        "type": "thumb",
+        "id": f"fake-{index:05d}",
+        "path": str(target),
+        "bytes": target.stat().st_size,
+    }
+
+
 def run_fake(
     count: int,
     needs_2fa: bool,
     needs_password: bool,
     thumbs: Path | None,
     since: datetime | None,
+    since_token: str | None,
+    offset: int,
+    limit: int | None,
 ) -> int:
     """Erzeugt synthetische Datensaetze ohne iCloud-Zugriff.
 
@@ -379,43 +552,58 @@ def run_fake(
     if thumbs is not None:
         thumbs.mkdir(parents=True, exist_ok=True)
 
+    current = fake_token(count)
+    emit({"type": "cursor", "token": current})
+
+    # Schicht 1: unveraendert.
+    if since_token is not None and since_token == current:
+        emit({"type": "unchanged"})
+        emit({"type": "done", "count": 0, "cursor": None})
+        return EXIT_OK
+
+    # Schicht 2: Aenderungen gegenueber dem alten Stand.
+    previous = parse_fake_token(since_token)
+    if previous is not None:
+        changed = 0
+        for index in range(previous, count):
+            emit(fake_record(index))
+            changed += 1
+            if thumbs is not None:
+                emit(fake_thumb(index, thumbs))
+        for index in range(count, previous):
+            emit({"type": "deleted", "id": f"fake-{index:05d}"})
+            changed += 1
+        emit({"type": "done", "count": changed, "cursor": None})
+        return EXIT_OK
+
+    # Schicht 3: vollstaendiger Durchlauf ab offset.
     newest = None
     emitted = 0
-    for index in range(count):
+    truncated = False
+    for index in range(offset, count):
+        if limit is not None and emitted >= limit:
+            truncated = True
+            break
         # Bewusst unsortiert: die echte Bibliothek liefert ebenfalls keine
         # monotone Folge von added_date. Ein Sidecar, der das voraussetzt,
         # faellt hier auf.
-        added = datetime(2024, 1, 1, tzinfo=UTC) + timedelta(
-            days=(index * 7919) % 365, minutes=index % 60
-        )
+        record = fake_record(index)
+        added = parse_since(record["added_date"])
         # Wie im Echtbetrieb: filtern, aber den Durchlauf nicht abbrechen.
-        if since is not None and added <= since:
+        if since is not None and added is not None and added <= since:
             continue
         emitted += 1
-        newest = added if newest is None or added > newest else newest
-        emit(
-            {
-                "type": "photo",
-                "id": f"fake-{index:05d}",
-                "filename": f"IMG_{index:04d}.HEIC",
-                "added_date": iso(added),
-                "asset_date": iso(added),
-                "checksum": f"checksum-{index:05d}",
-                "width": 4032,
-                "height": 3024,
-            }
-        )
+        newest = added if newest is None or (added is not None and added > newest) else newest
+        emit(record)
         if thumbs is not None:
-            target = thumb_path_for(thumbs, f"fake-{index:05d}").with_suffix(".png")
-            target.write_bytes(fake_png(64, index))
-            emit(
-                {
-                    "type": "thumb",
-                    "id": f"fake-{index:05d}",
-                    "path": str(target),
-                    "bytes": target.stat().st_size,
-                }
-            )
+            emit(fake_thumb(index, thumbs))
+        if emitted % OFFSET_REPORT_EVERY == 0:
+            emit({"type": "offset", "value": index + 1})
+
+    if truncated:
+        emit({"type": "offset", "value": offset + emitted})
+    else:
+        emit({"type": "baseline_complete", "count": emitted})
     emit({"type": "done", "count": emitted, "cursor": iso(newest)})
     return EXIT_OK
 
@@ -448,6 +636,22 @@ def main(argv: list[str] | None = None) -> int:
         help="Vorschaubilder in dieses Verzeichnis laden",
     )
     parser.add_argument(
+        "--since-token",
+        metavar="TOKEN",
+        help="CloudKit-syncToken des letzten Laufs; gleich = nichts zu tun",
+    )
+    parser.add_argument(
+        "--offset",
+        type=int,
+        default=0,
+        help="Erstaufbau an dieser Position fortsetzen",
+    )
+    parser.add_argument(
+        "--force-baseline",
+        action="store_true",
+        help="Delta ueberspringen und vollstaendig durchlaufen",
+    )
+    parser.add_argument(
         "--fetch-thumbs",
         action="store_true",
         help="Nur Vorschauen nachladen; Asset-IDs kommen zeilenweise ueber stdin",
@@ -458,7 +662,14 @@ def main(argv: list[str] | None = None) -> int:
 
     if args.fake is not None:
         return run_fake(
-            args.fake, args.fake_2fa, args.fake_password, thumbs, parse_since(args.since)
+            args.fake,
+            args.fake_2fa,
+            args.fake_password,
+            thumbs,
+            parse_since(args.since),
+            args.since_token,
+            args.offset,
+            args.limit,
         )
 
     if not args.username:
@@ -470,7 +681,16 @@ def main(argv: list[str] | None = None) -> int:
         if args.fetch_thumbs:
             assert thumbs is not None
             return run_fetch_thumbs(args.username, args.cookie_dir, thumbs)
-        return run_sync(args.username, args.cookie_dir, parse_since(args.since), args.limit, thumbs)
+        return run_sync(
+            args.username,
+            args.cookie_dir,
+            parse_since(args.since),
+            args.limit,
+            thumbs,
+            args.since_token,
+            args.offset,
+            args.force_baseline,
+        )
     except SystemExit:
         raise
     except Exception as exc:  # pragma: no cover - Netz-/API-Fehler

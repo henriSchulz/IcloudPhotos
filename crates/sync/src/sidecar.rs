@@ -26,6 +26,17 @@ pub struct SidecarOptions {
     pub cookie_dir: Option<PathBuf>,
     /// Nur Assets neuer als dieser Zeitpunkt abfragen (Delta-Sync).
     pub since: Option<DateTime<Utc>>,
+    /// Zone-Token des letzten erfolgreichen Laufs. Nur setzen, wenn der
+    /// Erstaufbau durch ist — sonst ueberspringt der Delta-Lauf den Rest der
+    /// Bibliothek.
+    pub since_token: Option<String>,
+    /// Position, an der ein abgebrochener Erstaufbau weitermacht.
+    pub offset: u64,
+    /// Hoechstens so viele Assets pro Lauf. Ein so abgeschnittener Durchlauf
+    /// gilt nicht als vollstaendiger Abgleich.
+    pub limit: Option<u64>,
+    /// Delta ueberspringen und vollstaendig durchlaufen (periodischer Abgleich).
+    pub force_baseline: bool,
     /// Wohin Vorschaubilder geladen werden. `None` heisst: nur Metadaten.
     pub thumbnail_dir: Option<PathBuf>,
     /// Statt eines Syncs nur Vorschauen fuer diese IDs nachladen.
@@ -50,6 +61,10 @@ impl SidecarOptions {
             username: username.into(),
             cookie_dir: None,
             since: None,
+            since_token: None,
+            offset: 0,
+            limit: None,
+            force_baseline: false,
             thumbnail_dir: None,
             fetch_thumbnails_for: Vec::new(),
             fake: None,
@@ -64,11 +79,26 @@ impl SidecarOptions {
             args.push("--thumbs".into());
             args.push(dir.to_string_lossy().into_owned());
         }
-        // Vor dem Fake-Zweig: der Fake-Sidecar muss denselben Filter anwenden,
-        // sonst testet er ein anderes Verhalten als der echte.
+        // Vor dem Fake-Zweig: der Fake-Sidecar muss dieselben Schalter
+        // auswerten, sonst testet er ein anderes Verhalten als der echte.
         if let Some(since) = self.since {
             args.push("--since".into());
             args.push(since.to_rfc3339());
+        }
+        if let Some(token) = &self.since_token {
+            args.push("--since-token".into());
+            args.push(token.clone());
+        }
+        if self.offset > 0 {
+            args.push("--offset".into());
+            args.push(self.offset.to_string());
+        }
+        if self.force_baseline {
+            args.push("--force-baseline".into());
+        }
+        if let Some(limit) = self.limit {
+            args.push("--limit".into());
+            args.push(limit.to_string());
         }
         if let Some(count) = self.fake {
             args.push("--fake".into());
@@ -111,6 +141,18 @@ pub struct SyncSummary {
     pub thumbnails: u64,
     /// Wie viele Vorschauen der Sidecar nicht laden konnte.
     pub thumbnails_failed: u64,
+    /// Die Bibliothek war unveraendert — dieser Lauf kostete einen Request.
+    pub unchanged: bool,
+    /// So viele in iCloud geloeschte Fotos wurden ausgetragen.
+    pub deleted: u64,
+    /// Neuer Zone-Token fuer den naechsten Lauf.
+    pub new_token: Option<String>,
+    /// Ob in diesem Lauf ein vollstaendiger Durchlauf zu Ende kam.
+    pub baseline_complete: bool,
+    /// Der Delta-Abgleich war nicht moeglich.
+    pub token_expired: bool,
+    /// Geaenderte Records ohne zugehoeriges Asset.
+    pub unresolved: u64,
     /// Neuer Cursor für den nächsten Delta-Sync.
     pub cursor: Option<DateTime<Utc>>,
 }
@@ -230,6 +272,65 @@ pub async fn run_sync(
                     },
                 );
             }
+            SidecarMessage::Cursor { token } => {
+                summary.new_token = token;
+            }
+            SidecarMessage::Unchanged => {
+                tracing::info!("Bibliothek unveraendert, kein Durchlauf noetig");
+                summary.unchanged = true;
+                emit(events, SyncEvent::Unchanged);
+            }
+            SidecarMessage::Deleted { id } => {
+                // Erst ausstehende Metadaten schreiben, damit ein in derselben
+                // Runde angelegtes Foto auch wirklich wieder verschwindet.
+                summary.stored += flush(catalog, &mut batch)?;
+                for path in catalog.delete_photo(&id)? {
+                    if let Err(error) = std::fs::remove_file(&path)
+                        && error.kind() != std::io::ErrorKind::NotFound
+                    {
+                        tracing::warn!(
+                            path = %path.display(),
+                            %error,
+                            "Cache-Datei eines geloeschten Fotos blieb liegen"
+                        );
+                    }
+                }
+                summary.deleted += 1;
+                emit(
+                    events,
+                    SyncEvent::Deleted {
+                        removed: summary.deleted,
+                    },
+                );
+            }
+            SidecarMessage::Offset { value } => {
+                // Fortschritt sofort festhalten: ein Abbruch soll nicht den
+                // ganzen Erstaufbau kosten.
+                summary.stored += flush(catalog, &mut batch)?;
+                catalog.set_baseline_progress(value, false, Utc::now())?;
+                emit(
+                    events,
+                    SyncEvent::Progress {
+                        stored: summary.stored,
+                    },
+                );
+            }
+            SidecarMessage::BaselineComplete { count } => {
+                tracing::info!(count, "vollstaendiger Durchlauf beendet");
+                summary.baseline_complete = true;
+            }
+            SidecarMessage::TokenExpired { message } => {
+                tracing::warn!(%message, "Delta nicht moeglich, Sidecar faellt zurueck");
+                summary.token_expired = true;
+            }
+            SidecarMessage::ChangeUnresolved {
+                id,
+                record_type,
+                message,
+            } => {
+                tracing::debug!(%id, ?record_type, %message, "geaenderter Record ohne Asset");
+                summary.unresolved += 1;
+            }
             SidecarMessage::ThumbFailed { id, message } => {
                 tracing::warn!(%id, %message, "Vorschau konnte nicht geladen werden");
                 summary.thumbnails_failed += 1;
@@ -323,6 +424,28 @@ pub async fn run_sync(
     // Fällt der Cursor aus, hilft der Katalog selbst weiter.
     if summary.cursor.is_none() {
         summary.cursor = catalog.sync_cursor()?;
+    }
+
+    // Ein reiner Nachlade-Lauf fuer Vorschauen ist kein Abgleich und sagt
+    // ueber den Stand der Bibliothek nichts aus.
+    if options.is_thumbnail_backfill() {
+        return Ok(summary);
+    }
+
+    if summary.baseline_complete {
+        catalog.set_baseline_progress(0, true, Utc::now())?;
+    }
+
+    // Den Token nur uebernehmen, wenn der lokale Stand ihn auch verdient.
+    // Nach einem abgebrochenen Erstaufbau waere er eine Luege: der naechste
+    // Lauf wuerde ein Delta ziehen und den Rest der Bibliothek nie sehen.
+    let token_is_earned = summary.unchanged
+        || summary.baseline_complete
+        || (options.since_token.is_some() && !summary.token_expired);
+    if token_is_earned && let Some(token) = &summary.new_token {
+        catalog.set_zone_token(Some(token))?;
+    } else if !token_is_earned {
+        tracing::info!("Durchlauf unvollstaendig — Zone-Token wird nicht uebernommen");
     }
 
     tracing::info!(
