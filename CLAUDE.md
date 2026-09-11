@@ -161,6 +161,7 @@ Zeilenweises JSON auf stdout, jede Zeile mit `type`. stdout gehört allein dem
 Protokoll, alles Menschenlesbare geht nach stderr.
 
 ```json
+{"type": "password_required", "username": "..."}
 {"type": "auth_required", "method": "2fa"}
 {"type": "auth_ok", "trusted": true}
 {"type": "photo", "id": "...", "filename": "IMG_1234.HEIC", "added_date": "...", "asset_date": "...", "checksum": "...", "width": 4032, "height": 3024}
@@ -170,7 +171,11 @@ Protokoll, alles Menschenlesbare geht nach stderr.
 {"type": "error", "kind": "auth", "message": "..."}
 ```
 
-Auf `auth_required` erwartet der Sidecar den 2FA-Code als eine Zeile auf stdin.
+Auf `password_required` bzw. `auth_required` erwartet der Sidecar das Passwort
+bzw. den 2FA-Code als eine Zeile auf stdin — nie über `argv`, denn
+Kommandozeilen sind in `/proc` für jeden Prozess des Nutzers lesbar. Nach
+erfolgreicher Anmeldung legt der Sidecar das Passwort im Keyring ab
+(`pyicloud://icloud-password`), sodass kein weiterer Lauf danach fragt.
 
 `--fake N` erzeugt N synthetische Datensätze ohne iCloud-Zugriff und ohne
 Import von `pyicloud`; damit läuft die komplette Rust-Seite im Test gegen einen
@@ -178,6 +183,12 @@ echten Subprozess.
 
 ## Offene Punkte / TODO
 
+- [x] **Anmeldung in der App**, kein Terminal nötig: Beim ersten Start zeigt die
+      App eine Maske für Apple-ID und Passwort. Die Apple-ID landet in
+      `config.toml` (0600), das Passwort geht über stdin an den Sidecar und von
+      dort in den Keyring — nie in eine Datei. Lehnt Apple die Anmeldung ab,
+      führt `SyncError::Credentials` zurück auf die Maske statt in einen
+      generischen Fehler.
 - [x] 2FA-UX: blockierender `AdwAlertDialog`, Code geht über stdin an den
       Sidecar. Notification verworfen — der Code ist nur Minuten gültig.
 - [x] Periodischer Sync: beim Start einmal, danach im Takt von
@@ -220,6 +231,9 @@ cargo run -p icloud-photos-app -- --demo
 
 # Sync gegen synthetische Daten statt iCloud — erzeugt echte Thumbnail-Dateien
 ICLOUD_PHOTOS_FAKE=500 cargo run -p icloud-photos-app
+
+# Kompletten Anmeldeweg ohne Apple-Konto durchspielen (Passwort: geheim)
+ICLOUD_PHOTOS_FAKE=40 ICLOUD_PHOTOS_FAKE_PASSWORD=1 cargo run -p icloud-photos-app
 
 # Sidecar direkt, gegen die echte Bibliothek
 .venv/bin/python sidecar/pyicloud_sync.py --username "$APPLE_ID" \

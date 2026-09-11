@@ -3,6 +3,7 @@
 
 Das Protokoll ist zeilenweises JSON; jede Zeile hat ein Feld ``type``:
 
+    {"type": "password_required", "username": "..."}  -> erwartet Passwort auf stdin
     {"type": "auth_required", "method": "2fa"}   -> erwartet Code auf stdin
     {"type": "auth_ok", "trusted": true}
     {"type": "photo", "id": ..., "filename": ...}
@@ -72,30 +73,54 @@ def parse_since(raw: str | None) -> datetime | None:
 # --------------------------------------------------------------------------
 
 
+def read_secret() -> str:
+    """Liest eine Geheimniszeile von stdin.
+
+    Kein ``strip()`` — nur der Zeilenumbruch faellt weg. Ein Passwort darf
+    fuehrende oder folgende Leerzeichen enthalten.
+    """
+    return sys.stdin.readline().rstrip("\r\n")
+
+
 def authenticate(username: str, cookie_dir: str | None):
-    """Meldet sich an und erledigt 2FA interaktiv ueber stdin."""
+    """Meldet sich an und erledigt Passwort- und 2FA-Abfrage ueber stdin."""
     from pyicloud import PyiCloudService
-    from pyicloud.utils import get_password_from_keyring
+    from pyicloud.exceptions import PyiCloudFailedLoginException
+    from pyicloud.utils import get_password_from_keyring, store_password_in_keyring
 
     password = get_password_from_keyring(username)
+    from_keyring = password is not None
+
     if password is None:
-        emit(
-            {
-                "type": "error",
-                "kind": "auth",
-                "message": (
-                    f"Kein Passwort im Keyring fuer {username}. "
-                    "Einmalig hinterlegen, z. B. mit `icloud --username ...`."
-                ),
-            }
-        )
+        # Die App fragt das Passwort ab und schickt es ueber stdin. Bewusst
+        # nicht ueber argv — Kommandozeilen sind in /proc fuer jeden Prozess
+        # des Nutzers lesbar.
+        emit({"type": "password_required", "username": username})
+        password = read_secret()
+        if not password:
+            emit({"type": "error", "kind": "auth", "message": "Kein Passwort erhalten"})
+            sys.exit(EXIT_AUTH)
+
+    try:
+        api = PyiCloudService(username, password, cookie_directory=cookie_dir)
+    except PyiCloudFailedLoginException as exc:
+        # Eigene Fehlerart, damit die App gezielt erneut nach dem Passwort
+        # fragen kann statt den Sync als kaputt zu melden.
+        emit({"type": "error", "kind": "credentials", "message": str(exc) or "Anmeldung abgelehnt"})
         sys.exit(EXIT_AUTH)
 
-    api = PyiCloudService(username, password, cookie_directory=cookie_dir)
+    # Erst nach erfolgreicher Anmeldung speichern — sonst landet ein Tippfehler
+    # im Keyring und jeder weitere Lauf scheitert daran.
+    if not from_keyring:
+        try:
+            store_password_in_keyring(username, password)
+            log("Passwort im Keyring hinterlegt")
+        except Exception as exc:  # noqa: BLE001 - Keyring-Backends scheitern vielfaeltig
+            log(f"Passwort konnte nicht im Keyring gespeichert werden: {exc}")
 
     if api.requires_2fa:
         emit({"type": "auth_required", "method": "2fa"})
-        code = sys.stdin.readline().strip()
+        code = read_secret().strip()
         if not code:
             emit({"type": "error", "kind": "auth", "message": "Kein 2FA-Code erhalten"})
             sys.exit(EXIT_AUTH)
@@ -318,16 +343,24 @@ def fake_png(size: int, index: int) -> bytes:
     )
 
 
-def run_fake(count: int, needs_2fa: bool, thumbs: Path | None) -> int:
+FAKE_PASSWORD = "geheim"
+FAKE_2FA_CODE = "123456"
+
+
+def run_fake(count: int, needs_2fa: bool, needs_password: bool, thumbs: Path | None) -> int:
     """Erzeugt synthetische Datensaetze ohne iCloud-Zugriff.
 
     Damit laesst sich die gesamte Rust-Seite inklusive 2FA-Pfad testen, ohne
     Zugangsdaten und ohne Netz.
     """
+    if needs_password:
+        emit({"type": "password_required", "username": "fake@example.com"})
+        if read_secret() != FAKE_PASSWORD:
+            emit({"type": "error", "kind": "credentials", "message": "Anmeldung abgelehnt"})
+            return EXIT_AUTH
     if needs_2fa:
         emit({"type": "auth_required", "method": "2fa"})
-        code = sys.stdin.readline().strip()
-        if code != "123456":
+        if read_secret().strip() != FAKE_2FA_CODE:
             emit({"type": "error", "kind": "auth", "message": "2FA-Code abgelehnt"})
             return EXIT_AUTH
     emit({"type": "auth_ok", "trusted": True})
@@ -383,6 +416,11 @@ def main(argv: list[str] | None = None) -> int:
         help="Im Fake-Modus den 2FA-Dialog durchspielen (Code: 123456)",
     )
     parser.add_argument(
+        "--fake-password",
+        action="store_true",
+        help=f"Im Fake-Modus nach dem Passwort fragen (korrekt: {FAKE_PASSWORD})",
+    )
+    parser.add_argument(
         "--thumbs",
         metavar="DIR",
         help="Vorschaubilder in dieses Verzeichnis laden",
@@ -397,7 +435,7 @@ def main(argv: list[str] | None = None) -> int:
     thumbs = Path(args.thumbs).expanduser() if args.thumbs else None
 
     if args.fake is not None:
-        return run_fake(args.fake, args.fake_2fa, thumbs)
+        return run_fake(args.fake, args.fake_2fa, args.fake_password, thumbs)
 
     if not args.username:
         parser.error("--username ist ohne --fake erforderlich")

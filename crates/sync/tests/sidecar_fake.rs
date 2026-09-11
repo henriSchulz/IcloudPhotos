@@ -7,8 +7,7 @@
 use std::path::PathBuf;
 
 use icloud_photos_cache::Catalog;
-use icloud_photos_sync::sidecar::TwoFactorRequest;
-use icloud_photos_sync::{SidecarOptions, SyncError, SyncEvent, run_sync};
+use icloud_photos_sync::{Prompts, SecretRequest, SidecarOptions, SyncError, SyncEvent, run_sync};
 use tokio::sync::mpsc;
 
 fn script() -> PathBuf {
@@ -56,7 +55,7 @@ async fn stores_all_records_from_fake_run() {
     let mut catalog = Catalog::open_in_memory().unwrap();
 
     // Mehr als BATCH_SIZE (256), damit auch das Zwischen-Flushen läuft.
-    let summary = run_sync(&mut catalog, &options(&python, 300), None, None)
+    let summary = run_sync(&mut catalog, &options(&python, 300), &Prompts::default())
         .await
         .unwrap();
 
@@ -76,9 +75,13 @@ async fn reports_progress_and_auth() {
     let mut catalog = Catalog::open_in_memory().unwrap();
     let (tx, mut rx) = mpsc::unbounded_channel();
 
-    run_sync(&mut catalog, &options(&python, 300), Some(tx), None)
-        .await
-        .unwrap();
+    run_sync(
+        &mut catalog,
+        &options(&python, 300),
+        &Prompts::events_only(tx),
+    )
+    .await
+    .unwrap();
 
     let mut events = Vec::new();
     while let Ok(event) = rx.try_recv() {
@@ -104,15 +107,22 @@ async fn two_factor_code_is_forwarded_to_stdin() {
     let mut options = options(&python, 2);
     options.fake_two_factor = true;
 
-    let (tx, mut rx) = mpsc::unbounded_channel::<TwoFactorRequest>();
+    let (tx, mut rx) = mpsc::unbounded_channel::<SecretRequest>();
     let responder = tokio::spawn(async move {
         let request = rx.recv().await.expect("2FA wurde nicht angefragt");
         request.send("123456".to_string()).unwrap();
     });
 
-    let summary = run_sync(&mut catalog, &options, None, Some(tx))
-        .await
-        .unwrap();
+    let summary = run_sync(
+        &mut catalog,
+        &options,
+        &Prompts {
+            two_factor: Some(tx),
+            ..Default::default()
+        },
+    )
+    .await
+    .unwrap();
     responder.await.unwrap();
 
     assert_eq!(summary.stored, 2);
@@ -126,15 +136,22 @@ async fn wrong_two_factor_code_fails_the_sync() {
     let mut options = options(&python, 2);
     options.fake_two_factor = true;
 
-    let (tx, mut rx) = mpsc::unbounded_channel::<TwoFactorRequest>();
+    let (tx, mut rx) = mpsc::unbounded_channel::<SecretRequest>();
     tokio::spawn(async move {
         let request = rx.recv().await.unwrap();
         request.send("000000".to_string()).unwrap();
     });
 
-    let error = run_sync(&mut catalog, &options, None, Some(tx))
-        .await
-        .unwrap_err();
+    let error = run_sync(
+        &mut catalog,
+        &options,
+        &Prompts {
+            two_factor: Some(tx),
+            ..Default::default()
+        },
+    )
+    .await
+    .unwrap_err();
 
     assert!(
         matches!(&error, SyncError::Sidecar { kind, .. } if kind == "auth"),
@@ -151,7 +168,7 @@ async fn missing_two_factor_channel_aborts() {
     let mut options = options(&python, 2);
     options.fake_two_factor = true;
 
-    let error = run_sync(&mut catalog, &options, None, None)
+    let error = run_sync(&mut catalog, &options, &Prompts::default())
         .await
         .unwrap_err();
     assert!(
@@ -165,10 +182,10 @@ async fn resync_is_idempotent() {
     let python = python_or_skip!();
     let mut catalog = Catalog::open_in_memory().unwrap();
 
-    run_sync(&mut catalog, &options(&python, 10), None, None)
+    run_sync(&mut catalog, &options(&python, 10), &Prompts::default())
         .await
         .unwrap();
-    run_sync(&mut catalog, &options(&python, 10), None, None)
+    run_sync(&mut catalog, &options(&python, 10), &Prompts::default())
         .await
         .unwrap();
 
@@ -185,8 +202,7 @@ async fn missing_interpreter_is_a_spawn_error() {
     let error = run_sync(
         &mut catalog,
         &options("definitiv-kein-python", 1),
-        None,
-        None,
+        &Prompts::default(),
     )
     .await
     .unwrap_err();
@@ -205,7 +221,9 @@ async fn sync_downloads_thumbnails() {
     let mut options = options(&python, 5);
     options.thumbnail_dir = Some(dir.path().to_path_buf());
 
-    let summary = run_sync(&mut catalog, &options, None, None).await.unwrap();
+    let summary = run_sync(&mut catalog, &options, &Prompts::default())
+        .await
+        .unwrap();
 
     assert_eq!(summary.stored, 5);
     assert_eq!(summary.thumbnails, 5);
@@ -229,7 +247,9 @@ async fn thumbnails_survive_a_resync() {
     let mut options = options(&python, 3);
     options.thumbnail_dir = Some(dir.path().to_path_buf());
 
-    run_sync(&mut catalog, &options, None, None).await.unwrap();
+    run_sync(&mut catalog, &options, &Prompts::default())
+        .await
+        .unwrap();
     let before: Vec<_> = catalog
         .page(0, 10)
         .unwrap()
@@ -237,7 +257,9 @@ async fn thumbnails_survive_a_resync() {
         .map(|p| p.thumb_path)
         .collect();
 
-    run_sync(&mut catalog, &options, None, None).await.unwrap();
+    run_sync(&mut catalog, &options, &Prompts::default())
+        .await
+        .unwrap();
     let after: Vec<_> = catalog
         .page(0, 10)
         .unwrap()
@@ -259,7 +281,7 @@ async fn thumbnail_events_reach_the_ui() {
     options.thumbnail_dir = Some(dir.path().to_path_buf());
 
     let (tx, mut rx) = mpsc::unbounded_channel();
-    run_sync(&mut catalog, &options, Some(tx), None)
+    run_sync(&mut catalog, &options, &Prompts::events_only(tx))
         .await
         .unwrap();
 
@@ -283,7 +305,7 @@ async fn backfill_sends_ids_only_after_authentication() {
     let dir = tempfile::tempdir().unwrap();
 
     // Erst einen Sync ohne Vorschauen, damit Katalogzeilen ohne thumb_path da sind.
-    run_sync(&mut catalog, &options(&python, 3), None, None)
+    run_sync(&mut catalog, &options(&python, 3), &Prompts::default())
         .await
         .unwrap();
     let missing = catalog.ids_without_thumbnail(10).unwrap();
@@ -296,15 +318,151 @@ async fn backfill_sends_ids_only_after_authentication() {
     options.fetch_thumbnails_for = missing;
     options.fake_two_factor = true;
 
-    let (tx, mut rx) = mpsc::unbounded_channel::<TwoFactorRequest>();
+    let (tx, mut rx) = mpsc::unbounded_channel::<SecretRequest>();
     tokio::spawn(async move {
         let request = rx.recv().await.expect("2FA wurde nicht angefragt");
         request.send("123456".to_string()).unwrap();
     });
 
-    let summary = run_sync(&mut catalog, &options, None, Some(tx))
-        .await
-        .unwrap();
+    let summary = run_sync(
+        &mut catalog,
+        &options,
+        &Prompts {
+            two_factor: Some(tx),
+            ..Default::default()
+        },
+    )
+    .await
+    .unwrap();
     assert_eq!(summary.thumbnails, 3);
     assert!(catalog.ids_without_thumbnail(10).unwrap().is_empty());
+}
+
+#[tokio::test]
+async fn password_is_forwarded_to_stdin() {
+    let python = python_or_skip!();
+    let mut catalog = Catalog::open_in_memory().unwrap();
+
+    let mut options = options(&python, 3);
+    options.fake_password = true;
+
+    let (tx, mut rx) = mpsc::unbounded_channel::<SecretRequest>();
+    let responder = tokio::spawn(async move {
+        let request = rx.recv().await.expect("Passwort wurde nicht angefragt");
+        request.send("geheim".to_string()).unwrap();
+    });
+
+    let summary = run_sync(
+        &mut catalog,
+        &options,
+        &Prompts {
+            password: Some(tx),
+            ..Default::default()
+        },
+    )
+    .await
+    .unwrap();
+    responder.await.unwrap();
+
+    assert_eq!(summary.stored, 3);
+}
+
+#[tokio::test]
+async fn wrong_password_is_reported_as_credentials_error() {
+    let python = python_or_skip!();
+    let mut catalog = Catalog::open_in_memory().unwrap();
+
+    let mut options = options(&python, 3);
+    options.fake_password = true;
+
+    let (tx, mut rx) = mpsc::unbounded_channel::<SecretRequest>();
+    tokio::spawn(async move {
+        let request = rx.recv().await.unwrap();
+        request.send("falsch".to_string()).unwrap();
+    });
+
+    let error = run_sync(
+        &mut catalog,
+        &options,
+        &Prompts {
+            password: Some(tx),
+            ..Default::default()
+        },
+    )
+    .await
+    .unwrap_err();
+
+    // Eigene Fehlerart, damit die UI gezielt erneut fragen kann.
+    assert!(
+        matches!(error, SyncError::Credentials { .. }),
+        "unerwartet: {error:?}"
+    );
+}
+
+#[tokio::test]
+async fn password_and_two_factor_are_asked_in_order() {
+    let python = python_or_skip!();
+    let mut catalog = Catalog::open_in_memory().unwrap();
+
+    let mut options = options(&python, 2);
+    options.fake_password = true;
+    options.fake_two_factor = true;
+
+    let (password_tx, mut password_rx) = mpsc::unbounded_channel::<SecretRequest>();
+    let (tfa_tx, mut tfa_rx) = mpsc::unbounded_channel::<SecretRequest>();
+    let (event_tx, mut event_rx) = mpsc::unbounded_channel();
+
+    tokio::spawn(async move {
+        password_rx
+            .recv()
+            .await
+            .unwrap()
+            .send("geheim".into())
+            .unwrap();
+    });
+    tokio::spawn(async move {
+        tfa_rx.recv().await.unwrap().send("123456".into()).unwrap();
+    });
+
+    let summary = run_sync(
+        &mut catalog,
+        &options,
+        &Prompts {
+            events: Some(event_tx),
+            password: Some(password_tx),
+            two_factor: Some(tfa_tx),
+        },
+    )
+    .await
+    .unwrap();
+
+    assert_eq!(summary.stored, 2);
+
+    let mut order = Vec::new();
+    while let Ok(event) = event_rx.try_recv() {
+        match event {
+            SyncEvent::PasswordRequired => order.push("password"),
+            SyncEvent::TwoFactorRequired => order.push("2fa"),
+            SyncEvent::Authenticated { .. } => order.push("ok"),
+            _ => {}
+        }
+    }
+    assert_eq!(order, ["password", "2fa", "ok"]);
+}
+
+#[tokio::test]
+async fn missing_password_channel_aborts() {
+    let python = python_or_skip!();
+    let mut catalog = Catalog::open_in_memory().unwrap();
+
+    let mut options = options(&python, 2);
+    options.fake_password = true;
+
+    let error = run_sync(&mut catalog, &options, &Prompts::default())
+        .await
+        .unwrap_err();
+    assert!(
+        matches!(error, SyncError::PasswordAborted),
+        "unerwartet: {error:?}"
+    );
 }

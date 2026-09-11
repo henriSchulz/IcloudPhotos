@@ -7,6 +7,7 @@ use adw::prelude::*;
 use gtk::{gdk, gio, glib};
 use icloud_photos_cache::Catalog;
 use icloud_photos_core::Config;
+use std::path::PathBuf;
 
 use crate::photo_object::PhotoObject;
 use crate::sync_task::{self, SyncMessage};
@@ -22,25 +23,43 @@ const THUMB_SIZE: i32 = 180;
 
 /// Geteilter UI-Zustand.
 pub struct AppState {
-    pub config: Config,
+    /// Veränderbar, weil die Anmeldemaske die Apple-ID setzt.
+    pub config: RefCell<Config>,
+    pub config_path: PathBuf,
     /// Eigene Verbindung des UI-Threads. Der Sync schreibt über eine zweite.
     pub catalog: RefCell<Catalog>,
     pub model: gio::ListStore,
+    /// Passwort aus der Anmeldemaske, bis der Sidecar danach fragt.
+    ///
+    /// Bleibt nur im Speicher und nur bis zur ersten Verwendung — gespeichert
+    /// wird es ausschliesslich im Keyring, und das erledigt der Sidecar.
+    pending_password: RefCell<Option<String>>,
     loaded: Cell<u64>,
     exhausted: Cell<bool>,
     syncing: Cell<bool>,
 }
 
 impl AppState {
-    pub fn new(config: Config, catalog: Catalog) -> Rc<Self> {
+    pub fn new(config: Config, config_path: PathBuf, catalog: Catalog) -> Rc<Self> {
         Rc::new(Self {
-            config,
+            config: RefCell::new(config),
+            config_path,
             catalog: RefCell::new(catalog),
             model: gio::ListStore::new::<PhotoObject>(),
+            pending_password: RefCell::new(None),
             loaded: Cell::new(0),
             exhausted: Cell::new(false),
             syncing: Cell::new(false),
         })
+    }
+
+    /// Übernimmt die Apple-ID aus der Anmeldemaske und schreibt sie weg.
+    fn set_username(&self, username: &str) -> Result<(), String> {
+        self.config.borrow_mut().icloud.username = username.to_string();
+        self.config
+            .borrow()
+            .save(&self.config_path)
+            .map_err(|error| error.to_string())
     }
 
     /// Lädt die nächste Seite in das Modell. Gibt zurück, ob etwas dazukam.
@@ -70,8 +89,21 @@ impl AppState {
     }
 
     /// Ob ein Sync ueberhaupt losgeschickt werden kann.
+    ///
+    /// Auch der Fake-Modus verlangt eine Apple-ID, damit die Anmeldemaske im
+    /// Test denselben Weg nimmt wie im Echtbetrieb.
     pub fn sync_configured(&self) -> bool {
-        !self.config.icloud.username.trim().is_empty() || crate::sync_task::fake_count().is_some()
+        !self.config.borrow().icloud.username.trim().is_empty()
+    }
+
+    /// Gibt das gemerkte Passwort heraus und vergisst es dabei.
+    fn take_password(&self) -> Option<String> {
+        self.pending_password.borrow_mut().take()
+    }
+
+    /// Nach einer abgelehnten Anmeldung: nichts Falsches weiterverwenden.
+    fn reset_credentials(&self) {
+        self.pending_password.borrow_mut().take();
     }
 
     /// Verwirft das Modell und lädt von vorn — nach einem Sync.
@@ -142,15 +174,19 @@ pub fn build(app: &adw::Application, state: Rc<AppState>) {
     window.set_content(Some(&content));
 
     state.load_next_page();
-    update_status(&state, &status, &stack);
 
-    let trigger = {
+    let trigger: Rc<dyn Fn()> = {
         let state = state.clone();
         let status = status.clone();
         let stack = stack.clone();
         let window = window.clone();
         let sync_button = sync_button.clone();
-        move || {
+        Rc::new(move || {
+            // Ohne Apple-ID gibt es nichts zu synchronisieren.
+            if !state.sync_configured() {
+                stack.set_visible_child_name("login");
+                return;
+            }
             // Laeuft schon einer, wird nicht nachgelegt. Zwei Sidecars auf
             // demselben Katalog waeren nur Doppelarbeit.
             if state.syncing.replace(true) {
@@ -166,14 +202,18 @@ pub fn build(app: &adw::Application, state: Rc<AppState>) {
                 window.clone(),
                 sync_button.clone(),
             );
-        }
+        })
     };
+
+    let login = build_login_page(&state, &stack, trigger.clone());
+    stack.add_named(&login, Some("login"));
 
     sync_button.connect_clicked({
         let trigger = trigger.clone();
         move |_| trigger()
     });
 
+    update_status(&state, &status, &stack);
     window.present();
 
     if state.sync_configured() {
@@ -181,17 +221,146 @@ pub fn build(app: &adw::Application, state: Rc<AppState>) {
         trigger();
 
         let interval =
-            std::time::Duration::from_secs(state.config.icloud.sync_interval_minutes * 60);
+            std::time::Duration::from_secs(state.config.borrow().icloud.sync_interval_minutes * 60);
         glib::timeout_add_local(interval, move || {
             trigger();
             glib::ControlFlow::Continue
         });
-    } else {
-        status.set_label("Keine Apple-ID konfiguriert");
-        tracing::warn!(
-            "icloud.username ist leer — kein automatischer Sync. Siehe config.example.toml"
-        );
     }
+}
+
+/// Anmeldemaske für den ersten Start: Apple-ID und Passwort.
+///
+/// Das Passwort geht nie in die Konfiguration — es wird nur bis zur ersten
+/// Verwendung im Speicher gehalten und danach vom Sidecar im Keyring abgelegt.
+fn build_login_page(
+    state: &Rc<AppState>,
+    stack: &gtk::Stack,
+    trigger: Rc<dyn Fn()>,
+) -> gtk::Widget {
+    let username = adw::EntryRow::builder().title("Apple-ID").build();
+    username.set_text(&state.config.borrow().icloud.username);
+
+    let password = adw::PasswordEntryRow::builder().title("Passwort").build();
+
+    let fields = gtk::ListBox::builder()
+        .selection_mode(gtk::SelectionMode::None)
+        .css_classes(["boxed-list"])
+        .build();
+    fields.append(&username);
+    fields.append(&password);
+
+    // Kein Zeilenumbruch mit `\` im Literal: rustfmt zieht den String wieder
+    // auf eine Zeile und die Einrueckung bleibt als Leerzeichenkette im Text.
+    let hint = gtk::Label::builder()
+        .label(concat!(
+            "Das Passwort wird im System-Schlüsselbund gespeichert, nicht in einer Datei. ",
+            "Bei aktivierter Zwei-Faktor-Authentifizierung fragt die App gleich danach ",
+            "nach dem Code."
+        ))
+        .wrap(true)
+        .max_width_chars(46)
+        .justify(gtk::Justification::Center)
+        .css_classes(["dim-label", "caption"])
+        .build();
+
+    let error = gtk::Label::builder()
+        .wrap(true)
+        .max_width_chars(46)
+        .visible(false)
+        .css_classes(["error", "caption"])
+        .build();
+
+    let submit = gtk::Button::builder()
+        .label("Anmelden")
+        .css_classes(["suggested-action", "pill"])
+        .halign(gtk::Align::Center)
+        .build();
+
+    let form = gtk::Box::new(gtk::Orientation::Vertical, 18);
+    form.set_margin_top(12);
+    form.append(&fields);
+    form.append(&error);
+    form.append(&submit);
+    form.append(&hint);
+
+    // Begrenzt die Formularbreite auf breiten Bildschirmen.
+    let clamp = adw::Clamp::builder()
+        .maximum_size(420)
+        .tightening_threshold(360)
+        .child(&form)
+        .build();
+
+    let page = adw::StatusPage::builder()
+        .icon_name("avatar-default-symbolic")
+        .title("Bei iCloud anmelden")
+        .description("Nur Lesezugriff — die App lädt keine Fotos hoch und löscht nichts.")
+        .child(&clamp)
+        .build();
+
+    let submit_action = {
+        let state = state.clone();
+        let stack = stack.clone();
+        let username = username.clone();
+        let password = password.clone();
+        let error = error.clone();
+        move || {
+            let id = username.text().trim().to_string();
+            if id.is_empty() {
+                error.set_label("Bitte eine Apple-ID eingeben.");
+                error.set_visible(true);
+                return;
+            }
+            let secret = password.text().to_string();
+            if secret.is_empty() {
+                error.set_label("Bitte das Passwort eingeben.");
+                error.set_visible(true);
+                return;
+            }
+
+            if let Err(message) = state.set_username(&id) {
+                error.set_label(&format!("Konfiguration nicht speicherbar: {message}"));
+                error.set_visible(true);
+                return;
+            }
+            *state.pending_password.borrow_mut() = Some(secret);
+            // Das Feld sofort leeren — der Klartext soll nicht in einem
+            // Widget stehen bleiben.
+            password.set_text("");
+            error.set_visible(false);
+
+            stack.set_visible_child_name("empty");
+            trigger();
+        }
+    };
+
+    submit.connect_clicked({
+        let action = submit_action.clone();
+        move |_| action()
+    });
+    // Enter im Passwortfeld meldet ebenfalls an.
+    password.connect_entry_activated({
+        let action = submit_action.clone();
+        move |_| action()
+    });
+    // Enter in der Apple-ID springt weiter statt abzuschicken.
+    username.connect_entry_activated({
+        let password = password.clone();
+        move |_| {
+            password.grab_focus();
+        }
+    });
+
+    // Ohne gesetzten Fokus landet die erste Eingabe irgendwo — bei Tab sogar
+    // die Apple-ID im Passwortfeld.
+    page.connect_map({
+        let username = username.clone();
+        move |_| {
+            username.grab_focus();
+        }
+    });
+
+    page.upcast()
 }
 
 fn build_grid(state: &Rc<AppState>, window: &adw::ApplicationWindow) -> gtk::GridView {
@@ -350,9 +519,14 @@ fn chrono_now() -> chrono::DateTime<chrono::Utc> {
 fn update_status(state: &Rc<AppState>, status: &gtk::Label, stack: &gtk::Stack) {
     let total = state.catalog.borrow().count().unwrap_or(0);
     let cached = state.catalog.borrow().cached_bytes().unwrap_or(0);
-    let limit = state.config.cache.limit_bytes();
+    let limit = state.config.borrow().cache.limit_bytes();
 
-    stack.set_visible_child_name(if total == 0 { "empty" } else { "grid" });
+    // Solange keine Apple-ID da ist, bleibt die Anmeldemaske stehen.
+    if !state.sync_configured() {
+        stack.set_visible_child_name("login");
+    } else {
+        stack.set_visible_child_name(if total == 0 { "empty" } else { "grid" });
+    }
     status.set_label(&format!(
         "{total} Fotos · Cache {} / {}",
         human_bytes(cached),
@@ -383,7 +557,7 @@ fn start_sync(
     window: adw::ApplicationWindow,
     sync_button: gtk::Button,
 ) {
-    let mut messages = sync_task::spawn(&state.config);
+    let mut messages = sync_task::spawn(&state.config.borrow(), state.take_password());
 
     glib::spawn_future_local(async move {
         while let Some(message) = messages.recv().await {
@@ -394,8 +568,40 @@ fn start_sync(
                 SyncMessage::Thumbnails { stored } => {
                     status.set_label(&format!("Lade Vorschauen … {stored}"));
                 }
+                SyncMessage::PasswordRequired { responder } => {
+                    match ask_secret(
+                        &window,
+                        "Passwort für iCloud",
+                        "Im Schlüsselbund liegt kein Passwort für diese Apple-ID.",
+                        SecretKind::Password,
+                    )
+                    .await
+                    {
+                        Some(password) => {
+                            let _ = responder.send(password);
+                        }
+                        None => drop(responder),
+                    }
+                }
+                SyncMessage::CredentialsRejected { message } => {
+                    tracing::warn!(%message, "Anmeldung abgelehnt");
+                    state.reset_credentials();
+                    stack.set_visible_child_name("login");
+                    status.set_label("Anmeldung fehlgeschlagen");
+                    show_error(
+                        &window,
+                        "Anmeldung fehlgeschlagen",
+                        &format!("Apple hat die Anmeldung abgelehnt: {message}"),
+                    );
+                }
                 SyncMessage::TwoFactorRequired { responder } => {
-                    let code = ask_two_factor_code(&window).await;
+                    let code = ask_secret(
+                        &window,
+                        "Zwei-Faktor-Authentifizierung",
+                        "Apple hat einen Bestätigungscode an deine Geräte geschickt.",
+                        SecretKind::TwoFactor,
+                    )
+                    .await;
                     match code {
                         Some(code) => {
                             let _ = responder.send(code);
@@ -419,7 +625,7 @@ fn start_sync(
                 }
                 SyncMessage::Finished(Err(error)) => {
                     tracing::error!(%error, "Sync fehlgeschlagen");
-                    show_error(&window, &error);
+                    show_error(&window, "Sync fehlgeschlagen", &error);
                     update_status(&state, &status, &stack);
                 }
             }
@@ -429,18 +635,37 @@ fn start_sync(
     });
 }
 
-/// Blockierender Dialog für den 2FA-Code.
-async fn ask_two_factor_code(parent: &adw::ApplicationWindow) -> Option<String> {
-    let entry = gtk::Entry::builder()
-        .placeholder_text("6-stelliger Code")
-        .input_purpose(gtk::InputPurpose::Digits)
-        .max_length(6)
-        .activates_default(true)
-        .build();
+/// Welche Art Geheimnis abgefragt wird.
+enum SecretKind {
+    Password,
+    TwoFactor,
+}
+
+/// Blockierender Dialog für Passwort oder 2FA-Code.
+async fn ask_secret(
+    parent: &adw::ApplicationWindow,
+    heading: &str,
+    body: &str,
+    kind: SecretKind,
+) -> Option<String> {
+    let entry: gtk::Widget = match kind {
+        SecretKind::Password => gtk::PasswordEntry::builder()
+            .show_peek_icon(true)
+            .activates_default(true)
+            .build()
+            .upcast(),
+        SecretKind::TwoFactor => gtk::Entry::builder()
+            .placeholder_text("6-stelliger Code")
+            .input_purpose(gtk::InputPurpose::Digits)
+            .max_length(6)
+            .activates_default(true)
+            .build()
+            .upcast(),
+    };
 
     let dialog = adw::AlertDialog::builder()
-        .heading("Zwei-Faktor-Authentifizierung")
-        .body("Apple hat einen Bestätigungscode an deine Geräte geschickt.")
+        .heading(heading)
+        .body(body)
         .extra_child(&entry)
         .default_response("ok")
         .close_response("cancel")
@@ -453,14 +678,24 @@ async fn ask_two_factor_code(parent: &adw::ApplicationWindow) -> Option<String> 
     if response != "ok" {
         return None;
     }
-    let code = entry.text().trim().to_string();
-    if code.is_empty() { None } else { Some(code) }
+
+    let text = match entry.downcast::<gtk::PasswordEntry>() {
+        // Passwoerter werden nicht getrimmt: Leerzeichen koennen dazugehoeren.
+        Ok(password) => password.text().to_string(),
+        Err(widget) => widget
+            .downcast::<gtk::Entry>()
+            .expect("Entry oder PasswordEntry")
+            .text()
+            .trim()
+            .to_string(),
+    };
+    if text.is_empty() { None } else { Some(text) }
 }
 
-fn show_error(parent: &adw::ApplicationWindow, error: &str) {
+fn show_error(parent: &adw::ApplicationWindow, heading: &str, body: &str) {
     let dialog = adw::AlertDialog::builder()
-        .heading("Sync fehlgeschlagen")
-        .body(error)
+        .heading(heading)
+        .body(body)
         .build();
     dialog.add_response("ok", "OK");
     dialog.present(Some(parent));

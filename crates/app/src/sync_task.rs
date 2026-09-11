@@ -8,19 +8,40 @@ use std::path::PathBuf;
 
 use icloud_photos_cache::Catalog;
 use icloud_photos_core::Config;
-use icloud_photos_sync::{SidecarOptions, SyncEvent, SyncSummary, run_sync};
-use tokio::sync::{mpsc, oneshot};
+use icloud_photos_sync::{
+    Prompts, SecretRequest, SidecarOptions, SyncEvent, SyncSummary, run_sync,
+};
+use tokio::sync::mpsc;
 
 /// Was der Sync-Thread der UI meldet.
 pub enum SyncMessage {
-    Progress { stored: u64 },
-    Thumbnails { stored: u64 },
-    TwoFactorRequired { responder: oneshot::Sender<String> },
+    Progress {
+        stored: u64,
+    },
+    Thumbnails {
+        stored: u64,
+    },
+    /// Der Keyring hat kein Passwort und die Anmeldemaske hat keins geliefert.
+    PasswordRequired {
+        responder: SecretRequest,
+    },
+    TwoFactorRequired {
+        responder: SecretRequest,
+    },
     Finished(Result<SyncSummary, String>),
+    /// Die Anmeldung wurde abgelehnt — die UI soll erneut fragen.
+    CredentialsRejected {
+        message: String,
+    },
 }
 
 /// Startet einen Sync und liefert den Meldungskanal.
-pub fn spawn(config: &Config) -> mpsc::UnboundedReceiver<SyncMessage> {
+/// `pending_password` stammt aus der Anmeldemaske und beantwortet die erste
+/// Passwortabfrage, ohne den Nutzer noch einmal zu behelligen.
+pub fn spawn(
+    config: &Config,
+    pending_password: Option<String>,
+) -> mpsc::UnboundedReceiver<SyncMessage> {
     let (tx, rx) = mpsc::unbounded_channel();
 
     let db_path = config.paths.db_path.clone();
@@ -58,12 +79,16 @@ pub fn spawn(config: &Config) -> mpsc::UnboundedReceiver<SyncMessage> {
             options.since = catalog.sync_cursor().ok().flatten();
             options.thumbnail_dir = Some(thumbnail_dir);
             options.fake = fake_count();
+            // Erlaubt, den kompletten Anmeldeweg ohne Apple-Konto durchzuspielen.
+            options.fake_password = std::env::var_os("ICLOUD_PHOTOS_FAKE_PASSWORD").is_some();
 
             let (event_tx, mut event_rx) = mpsc::unbounded_channel::<SyncEvent>();
-            let (tfa_tx, mut tfa_rx) = mpsc::unbounded_channel::<oneshot::Sender<String>>();
+            let (tfa_tx, mut tfa_rx) = mpsc::unbounded_channel::<SecretRequest>();
+            let (password_tx, mut password_rx) = mpsc::unbounded_channel::<SecretRequest>();
 
             let forwarder = {
                 let tx = tx.clone();
+                let mut pending = pending_password;
                 tokio::spawn(async move {
                     loop {
                         tokio::select! {
@@ -77,6 +102,21 @@ pub fn spawn(config: &Config) -> mpsc::UnboundedReceiver<SyncMessage> {
                                 Some(_) => {}
                                 None => break,
                             },
+                            request = password_rx.recv() => match request {
+                                Some(responder) => match pending.take() {
+                                    // Aus der Anmeldemaske: direkt beantworten.
+                                    Some(password) => {
+                                        let _ = responder.send(password);
+                                    }
+                                    // Sonst muss die UI fragen.
+                                    None => {
+                                        let _ = tx.send(
+                                            SyncMessage::PasswordRequired { responder },
+                                        );
+                                    }
+                                },
+                                None => break,
+                            },
                             request = tfa_rx.recv() => match request {
                                 Some(responder) => {
                                     let _ = tx.send(SyncMessage::TwoFactorRequired { responder });
@@ -88,19 +128,19 @@ pub fn spawn(config: &Config) -> mpsc::UnboundedReceiver<SyncMessage> {
                 })
             };
 
-            let mut result = run_sync(
-                &mut catalog,
-                &options,
-                Some(event_tx.clone()),
-                Some(tfa_tx.clone()),
-            )
-            .await;
+            let prompts = Prompts {
+                events: Some(event_tx),
+                password: Some(password_tx),
+                two_factor: Some(tfa_tx),
+            };
+
+            let mut result = run_sync(&mut catalog, &options, &prompts).await;
 
             // Der Delta-Sync sieht aeltere Assets nicht erneut. Fehlt dort eine
             // Vorschau — erster Lauf, Netzfehler, abgebrochener Sync — wird sie
             // in einem zweiten Durchgang gezielt nachgeholt.
             if let Ok(summary) = &mut result {
-                match backfill_thumbnails(&mut catalog, &options, event_tx, tfa_tx).await {
+                match backfill_thumbnails(&mut catalog, &options, &prompts).await {
                     Ok(extra) => {
                         summary.thumbnails += extra.thumbnails;
                         summary.thumbnails_failed += extra.thumbnails_failed;
@@ -115,6 +155,14 @@ pub fn spawn(config: &Config) -> mpsc::UnboundedReceiver<SyncMessage> {
 
             forwarder.abort();
 
+            // Abgelehnte Zugangsdaten sind kein technischer Fehler, sondern ein
+            // Fall fuer die Anmeldemaske.
+            if let Err(icloud_photos_sync::SyncError::Credentials { message }) = &result {
+                let _ = tx.send(SyncMessage::CredentialsRejected {
+                    message: message.clone(),
+                });
+                return;
+            }
             let _ = tx.send(SyncMessage::Finished(result.map_err(|e| e.to_string())));
         });
     });
@@ -130,8 +178,7 @@ const BACKFILL_LIMIT: u64 = 500;
 async fn backfill_thumbnails(
     catalog: &mut Catalog,
     base: &SidecarOptions,
-    events: mpsc::UnboundedSender<SyncEvent>,
-    two_factor: mpsc::UnboundedSender<oneshot::Sender<String>>,
+    prompts: &Prompts,
 ) -> Result<SyncSummary, icloud_photos_sync::SyncError> {
     let missing = catalog.ids_without_thumbnail(BACKFILL_LIMIT)?;
     if missing.is_empty() {
@@ -141,7 +188,7 @@ async fn backfill_thumbnails(
 
     let mut options = base.clone();
     options.fetch_thumbnails_for = missing;
-    run_sync(catalog, &options, Some(events), Some(two_factor)).await
+    run_sync(catalog, &options, prompts).await
 }
 
 /// Testmodus: `ICLOUD_PHOTOS_FAKE=500` synchronisiert synthetische Daten.

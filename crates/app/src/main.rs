@@ -50,7 +50,7 @@ fn main() -> anyhow::Result<()> {
         demo::seed(&catalog, &config)?;
     }
 
-    let state = window::AppState::new(config, catalog);
+    let state = window::AppState::new(config, config_path, catalog);
 
     let app = adw::Application::builder().application_id(APP_ID).build();
     app.connect_activate({
@@ -69,7 +69,8 @@ fn main() -> anyhow::Result<()> {
 fn schedule_housekeeping(state: Rc<window::AppState>) {
     gtk::glib::timeout_add_local(HOUSEKEEPING_INTERVAL, move || {
         let catalog = state.catalog.borrow();
-        match housekeeping::sweep(&catalog, &state.config.paths.full_res_dir) {
+        let full_res_dir = state.config.borrow().paths.full_res_dir.clone();
+        match housekeeping::sweep(&catalog, &full_res_dir) {
             Ok(report) if !report.is_clean() => tracing::warn!(
                 orphans = report.orphan_files_removed,
                 stale = report.stale_rows_cleared,
@@ -82,7 +83,8 @@ fn schedule_housekeeping(state: Rc<window::AppState>) {
         // Das Limit auch ohne frischen Download durchsetzen: eine gesenkte
         // Konfiguration oder ein Absturz mitten in der Eviction soll nicht bis
         // zum naechsten Full-Res-Download unbemerkt bleiben.
-        match enforce_limit(&catalog, &state.config.cache) {
+        let cache_config = state.config.borrow().cache.clone();
+        match enforce_limit(&catalog, &cache_config) {
             Ok(report) if !report.is_noop() => tracing::info!(
                 evicted = report.evicted,
                 freed_bytes = report.freed_bytes,

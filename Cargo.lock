@@ -616,6 +616,7 @@ dependencies = [
  "directories",
  "serde",
  "serde_json",
+ "tempfile",
  "thiserror",
  "toml",
 ]

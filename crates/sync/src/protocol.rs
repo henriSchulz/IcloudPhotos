@@ -8,6 +8,11 @@ use serde::Deserialize;
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum SidecarMessage {
+    /// Der Sidecar hat kein Passwort im Keyring und wartet auf eines auf stdin.
+    PasswordRequired {
+        #[serde(default)]
+        username: String,
+    },
     /// Der Sidecar wartet auf einen 2FA-Code auf stdin.
     AuthRequired {
         method: String,
@@ -46,6 +51,8 @@ fn unknown_kind() -> String {
 /// Fortschrittsmeldung an die UI.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum SyncEvent {
+    /// Die UI muss jetzt das Apple-ID-Passwort abfragen.
+    PasswordRequired,
     /// Die UI muss jetzt einen 2FA-Code abfragen.
     TwoFactorRequired,
     Authenticated {
@@ -103,6 +110,18 @@ mod tests {
                 expected
             );
         }
+    }
+
+    #[test]
+    fn parses_password_required() {
+        let line = r#"{"type":"password_required","username":"a@b.c"}"#;
+        let msg: SidecarMessage = serde_json::from_str(line).unwrap();
+        assert_eq!(
+            msg,
+            SidecarMessage::PasswordRequired {
+                username: "a@b.c".into()
+            }
+        );
     }
 
     #[test]

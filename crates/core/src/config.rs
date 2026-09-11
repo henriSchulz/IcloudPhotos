@@ -141,6 +141,37 @@ impl Config {
         Ok(config)
     }
 
+    /// Schreibt die Konfiguration zurück.
+    ///
+    /// Enthält die Apple-ID, aber nie das Passwort — das liegt im Keyring.
+    /// Die Datei bekommt trotzdem 0600, weil sie eine Kontokennung preisgibt.
+    pub fn save(&self, path: &Path) -> Result<(), ConfigError> {
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent).map_err(|source| ConfigError::Read {
+                path: parent.to_path_buf(),
+                source,
+            })?;
+        }
+        let text = toml::to_string_pretty(self).map_err(|error| {
+            ConfigError::Invalid(format!("Konfiguration nicht serialisierbar: {error}"))
+        })?;
+        std::fs::write(path, text).map_err(|source| ConfigError::Read {
+            path: path.to_path_buf(),
+            source,
+        })?;
+
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let permissions = std::fs::Permissions::from_mode(0o600);
+            std::fs::set_permissions(path, permissions).map_err(|source| ConfigError::Read {
+                path: path.to_path_buf(),
+                source,
+            })?;
+        }
+        Ok(())
+    }
+
     fn validate(&self) -> Result<(), ConfigError> {
         let limit = self.cache.full_res_cache_limit_gb;
         if !limit.is_finite() || limit <= 0.0 {
@@ -236,6 +267,42 @@ mod tests {
         "#;
         let config: Config = toml::from_str(toml).unwrap();
         assert!(config.validate().is_err());
+    }
+
+    #[test]
+    fn save_then_load_roundtrips() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+
+        let mut config = Config::default();
+        config.icloud.username = "a@b.c".into();
+        config.cache.full_res_cache_limit_gb = 3.5;
+        config.save(&path).unwrap();
+
+        let loaded = Config::load(&path).unwrap();
+        assert_eq!(loaded.icloud.username, "a@b.c");
+        assert_eq!(loaded.cache.full_res_cache_limit_gb, 3.5);
+
+        // Die Datei nennt das Konto, also nicht fuer andere lesbar.
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mode = std::fs::metadata(&path).unwrap().permissions().mode();
+            assert_eq!(mode & 0o077, 0, "Gruppe/Andere duerfen nicht lesen");
+        }
+    }
+
+    #[test]
+    fn saved_config_never_contains_a_password() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+        let mut config = Config::default();
+        config.icloud.username = "a@b.c".into();
+        config.save(&path).unwrap();
+
+        let text = std::fs::read_to_string(&path).unwrap();
+        assert!(!text.to_lowercase().contains("password"));
+        assert!(!text.to_lowercase().contains("passwort"));
     }
 
     #[test]

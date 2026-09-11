@@ -5,7 +5,7 @@ pub mod protocol;
 pub mod sidecar;
 
 pub use protocol::{SidecarMessage, SyncEvent};
-pub use sidecar::{SidecarOptions, SyncSummary, run_sync};
+pub use sidecar::{Prompts, SecretRequest, SidecarOptions, SyncSummary, run_sync};
 
 /// Fehler eines Sync-Laufs.
 #[derive(Debug, thiserror::Error)]
@@ -26,10 +26,14 @@ pub enum SyncError {
     },
     #[error("Sidecar meldet Fehler ({kind}): {message}")]
     Sidecar { kind: String, message: String },
+    #[error("Anmeldung abgelehnt: {message}")]
+    Credentials { message: String },
     #[error("Sidecar endete mit Status {0}, ohne 'done' zu melden")]
     UnexpectedExit(String),
     #[error("2FA-Code wurde nicht bereitgestellt")]
     TwoFactorAborted,
+    #[error("Passwort wurde nicht bereitgestellt")]
+    PasswordAborted,
     #[error("Katalog konnte nicht geschrieben werden")]
     Catalog(#[from] icloud_photos_cache::CacheError),
 }

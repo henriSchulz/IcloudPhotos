@@ -34,6 +34,8 @@ pub struct SidecarOptions {
     pub fake: Option<u64>,
     /// Testmodus: den 2FA-Dialog durchspielen.
     pub fake_two_factor: bool,
+    /// Testmodus: die Passwortabfrage durchspielen.
+    pub fake_password: bool,
 }
 
 impl SidecarOptions {
@@ -52,6 +54,7 @@ impl SidecarOptions {
             fetch_thumbnails_for: Vec::new(),
             fake: None,
             fake_two_factor: false,
+            fake_password: false,
         }
     }
 
@@ -66,6 +69,9 @@ impl SidecarOptions {
             args.push(count.to_string());
             if self.fake_two_factor {
                 args.push("--fake-2fa".into());
+            }
+            if self.fake_password {
+                args.push("--fake-password".into());
             }
             return args;
         }
@@ -107,20 +113,54 @@ pub struct SyncSummary {
     pub cursor: Option<DateTime<Utc>>,
 }
 
-/// Kanal, über den die UI nach einem 2FA-Code gefragt wird.
-pub type TwoFactorRequest = oneshot::Sender<String>;
+/// Kanal, über den die UI nach einem Geheimnis gefragt wird — Passwort oder
+/// 2FA-Code. Die Antwort geht über den enthaltenen `oneshot`-Sender zurück.
+pub type SecretRequest = oneshot::Sender<String>;
+
+/// Rückkanäle zur UI. Fehlt einer, bricht der Sync ab, sobald der Sidecar
+/// danach fragt.
+#[derive(Default)]
+pub struct Prompts {
+    /// Fortschrittsmeldungen.
+    pub events: Option<mpsc::UnboundedSender<SyncEvent>>,
+    /// Abfrage des Apple-ID-Passworts.
+    pub password: Option<mpsc::UnboundedSender<SecretRequest>>,
+    /// Abfrage des 2FA-Codes.
+    pub two_factor: Option<mpsc::UnboundedSender<SecretRequest>>,
+}
+
+impl Prompts {
+    /// Nur Fortschritt, keine interaktiven Abfragen — für Tests und
+    /// Hintergrundläufe mit gültiger Sitzung.
+    pub fn events_only(events: mpsc::UnboundedSender<SyncEvent>) -> Self {
+        Self {
+            events: Some(events),
+            ..Default::default()
+        }
+    }
+
+    /// Fragt über `channel` nach einem Geheimnis und wartet auf die Antwort.
+    async fn ask(channel: &Option<mpsc::UnboundedSender<SecretRequest>>) -> Option<String> {
+        let channel = channel.as_ref()?;
+        let (tx, rx) = oneshot::channel();
+        if channel.send(tx).is_err() {
+            return None;
+        }
+        rx.await.ok()
+    }
+}
 
 /// Führt einen Sync aus: startet den Sidecar, schreibt alle Metadaten in den
 /// Katalog und gibt Fortschritt über `events` aus.
 ///
-/// Meldet der Sidecar `auth_required`, geht eine [`TwoFactorRequest`] an
-/// `two_factor`; der Sync wartet dann auf den Code aus der UI.
+/// Fragt der Sidecar nach Passwort oder 2FA-Code, geht eine [`SecretRequest`]
+/// über den passenden Kanal in `prompts`; der Sync wartet auf die Antwort.
 pub async fn run_sync(
     catalog: &mut Catalog,
     options: &SidecarOptions,
-    events: Option<mpsc::UnboundedSender<SyncEvent>>,
-    two_factor: Option<mpsc::UnboundedSender<TwoFactorRequest>>,
+    prompts: &Prompts,
 ) -> Result<SyncSummary, SyncError> {
+    let events = &prompts.events;
     let args = options.argv();
     let command_line = format!("{} {}", options.python.display(), args.join(" "));
     tracing::info!(command = %command_line, "starte Sidecar");
@@ -168,7 +208,7 @@ pub async fn run_sync(
                 if batch.len() >= BATCH_SIZE {
                     summary.stored += flush(catalog, &mut batch)?;
                     emit(
-                        &events,
+                        events,
                         SyncEvent::Progress {
                             stored: summary.stored,
                         },
@@ -182,7 +222,7 @@ pub async fn run_sync(
                 catalog.set_thumbnail(&id, &path, bytes)?;
                 summary.thumbnails += 1;
                 emit(
-                    &events,
+                    events,
                     SyncEvent::Thumbnails {
                         stored: summary.thumbnails,
                     },
@@ -192,20 +232,22 @@ pub async fn run_sync(
                 tracing::warn!(%id, %message, "Vorschau konnte nicht geladen werden");
                 summary.thumbnails_failed += 1;
             }
-            SidecarMessage::AuthRequired { method } => {
-                tracing::info!(%method, "Sidecar fordert 2FA-Code an");
-                emit(&events, SyncEvent::TwoFactorRequired);
+            SidecarMessage::PasswordRequired { username } => {
+                tracing::info!(%username, "Sidecar fordert Passwort an");
+                emit(events, SyncEvent::PasswordRequired);
 
-                let Some(channel) = &two_factor else {
-                    failure = Some(SyncError::TwoFactorAborted);
+                let Some(password) = Prompts::ask(&prompts.password).await else {
+                    failure = Some(SyncError::PasswordAborted);
                     break;
                 };
-                let (tx, rx) = oneshot::channel();
-                if channel.send(tx).is_err() {
-                    failure = Some(SyncError::TwoFactorAborted);
-                    break;
-                }
-                let Ok(code) = rx.await else {
+                stdin.write_all(format!("{password}\n").as_bytes()).await?;
+                stdin.flush().await?;
+            }
+            SidecarMessage::AuthRequired { method } => {
+                tracing::info!(%method, "Sidecar fordert 2FA-Code an");
+                emit(events, SyncEvent::TwoFactorRequired);
+
+                let Some(code) = Prompts::ask(&prompts.two_factor).await else {
                     failure = Some(SyncError::TwoFactorAborted);
                     break;
                 };
@@ -218,7 +260,7 @@ pub async fn run_sync(
                         "Sitzung ist nicht vertrauenswürdig — der nächste Sync fragt erneut nach 2FA"
                     );
                 }
-                emit(&events, SyncEvent::Authenticated { trusted });
+                emit(events, SyncEvent::Authenticated { trusted });
 
                 // Erst jetzt die IDs schicken. Vorher waere die erste Zeile als
                 // 2FA-Code verschluckt worden, denn der Sidecar liest beides
@@ -238,7 +280,11 @@ pub async fn run_sync(
                 saw_done = true;
             }
             SidecarMessage::Error { kind, message } => {
-                failure = Some(SyncError::Sidecar { kind, message });
+                failure = Some(if kind == "credentials" {
+                    SyncError::Credentials { message }
+                } else {
+                    SyncError::Sidecar { kind, message }
+                });
                 break;
             }
         }
@@ -248,7 +294,7 @@ pub async fn run_sync(
     // als ein verworfener, der Cursor kommt dann eben erst beim nächsten Lauf.
     summary.stored += flush(catalog, &mut batch)?;
     emit(
-        &events,
+        events,
         SyncEvent::Progress {
             stored: summary.stored,
         },
