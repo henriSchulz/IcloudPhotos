@@ -20,8 +20,9 @@ from __future__ import annotations
 import argparse
 import json
 import sys
-from datetime import datetime, timezone
-from typing import Any, Iterator
+from collections.abc import Iterator
+from datetime import UTC, datetime
+from typing import Any
 
 EXIT_OK = 0
 EXIT_ERROR = 1
@@ -47,8 +48,8 @@ def iso(value: datetime | None) -> str | None:
     if value is None:
         return None
     if value.tzinfo is None:
-        value = value.replace(tzinfo=timezone.utc)
-    return value.astimezone(timezone.utc).isoformat()
+        value = value.replace(tzinfo=UTC)
+    return value.astimezone(UTC).isoformat()
 
 
 def parse_since(raw: str | None) -> datetime | None:
@@ -56,7 +57,7 @@ def parse_since(raw: str | None) -> datetime | None:
         return None
     parsed = datetime.fromisoformat(raw.replace("Z", "+00:00"))
     if parsed.tzinfo is None:
-        parsed = parsed.replace(tzinfo=timezone.utc)
+        parsed = parsed.replace(tzinfo=UTC)
     return parsed
 
 
@@ -151,19 +152,19 @@ def iter_assets(api: Any, since: datetime | None, limit: int | None) -> Iterator
     aelter als der Cursor ist, sind alle folgenden es auch — dann kann der
     Durchlauf abbrechen, statt die ganze Bibliothek zu paginieren.
     """
-    seen = 0
-    for asset in api.photos.all:
+    for seen, asset in enumerate(api.photos.all):
         if since is not None and asset.added_date <= since:
             log(f"Cursor erreicht nach {seen} Assets")
             return
         yield asset
-        seen += 1
-        if limit is not None and seen >= limit:
+        if limit is not None and seen + 1 >= limit:
             log(f"Limit {limit} erreicht")
             return
 
 
-def run_sync(username: str, cookie_dir: str | None, since: datetime | None, limit: int | None) -> int:
+def run_sync(
+    username: str, cookie_dir: str | None, since: datetime | None, limit: int | None
+) -> int:
     api = authenticate(username, cookie_dir)
 
     count = 0
@@ -200,9 +201,7 @@ def run_fake(count: int, needs_2fa: bool) -> int:
 
     newest = None
     for index in range(count):
-        added = datetime(2026, 1, 1, tzinfo=timezone.utc).replace(
-            minute=index % 60, hour=(index // 60) % 24
-        )
+        added = datetime(2026, 1, 1, tzinfo=UTC).replace(minute=index % 60, hour=(index // 60) % 24)
         newest = added if newest is None or added > newest else newest
         emit(
             {

@@ -1,0 +1,6 @@
+# Der Sidecar ist ein Skript an einer fremden API-Grenze, nicht Bibliothekscode.
+target-version = "py311"
+line-length = 100
+
+[lint]
+select = ["E", "F", "W", "I", "UP", "B", "SIM"]
