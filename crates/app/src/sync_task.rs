@@ -21,6 +21,11 @@ pub enum SyncMessage {
     Thumbnails {
         stored: u64,
     },
+    /// Die Anmeldung ist vollstaendig durch — inklusive 2FA. Erst ab hier darf
+    /// die UI die Anmeldemaske verlassen.
+    Authenticated {
+        trusted: bool,
+    },
     /// Der Keyring hat kein Passwort und die Anmeldemaske hat keins geliefert.
     PasswordRequired {
         responder: SecretRequest,
@@ -98,6 +103,9 @@ pub fn spawn(
                                 }
                                 Some(SyncEvent::Thumbnails { stored }) => {
                                     let _ = tx.send(SyncMessage::Thumbnails { stored });
+                                }
+                                Some(SyncEvent::Authenticated { trusted }) => {
+                                    let _ = tx.send(SyncMessage::Authenticated { trusted });
                                 }
                                 Some(_) => {}
                                 None => break,

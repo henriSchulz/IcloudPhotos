@@ -34,9 +34,26 @@ pub struct AppState {
     /// Bleibt nur im Speicher und nur bis zur ersten Verwendung — gespeichert
     /// wird es ausschliesslich im Keyring, und das erledigt der Sidecar.
     pending_password: RefCell<Option<String>>,
+    /// Erst wahr, wenn der Sidecar `auth_ok` gemeldet hat — also Passwort und
+    /// 2FA durch sind. Vorher bleibt die Anmeldemaske stehen.
+    authenticated: Cell<bool>,
+    /// Ein Sync laeuft, hat aber noch kein `auth_ok` geliefert.
+    authenticating: Cell<bool>,
+    /// Bedienelemente der Anmeldemaske, um sie waehrend der Anmeldung zu
+    /// sperren und Fehler dort anzuzeigen.
+    login: RefCell<Option<LoginWidgets>>,
     loaded: Cell<u64>,
     exhausted: Cell<bool>,
     syncing: Cell<bool>,
+}
+
+/// Die Teile der Anmeldemaske, die von aussen gesteuert werden.
+#[derive(Clone)]
+struct LoginWidgets {
+    form: gtk::Box,
+    error: gtk::Label,
+    busy: gtk::Box,
+    username: adw::EntryRow,
 }
 
 impl AppState {
@@ -47,6 +64,9 @@ impl AppState {
             catalog: RefCell::new(catalog),
             model: gio::ListStore::new::<PhotoObject>(),
             pending_password: RefCell::new(None),
+            authenticated: Cell::new(false),
+            authenticating: Cell::new(false),
+            login: RefCell::new(None),
             loaded: Cell::new(0),
             exhausted: Cell::new(false),
             syncing: Cell::new(false),
@@ -96,6 +116,40 @@ impl AppState {
         !self.config.borrow().icloud.username.trim().is_empty()
     }
 
+    /// Welche Stack-Seite zum aktuellen Zustand passt.
+    ///
+    /// Vor der ersten erfolgreichen Anmeldung bleibt die Maske stehen. Wer
+    /// bereits Fotos im Katalog hat, sieht sie trotzdem sofort — ein
+    /// Hintergrund-Sync soll den Blick auf vorhandene Daten nicht verstellen.
+    fn current_page(&self, total: u64) -> &'static str {
+        if !self.authenticated.get() && total == 0 {
+            return "login";
+        }
+        if total == 0 { "empty" } else { "grid" }
+    }
+
+    /// Sperrt die Maske und zeigt den Fortschritt, oder gibt sie wieder frei.
+    fn login_busy(&self, busy: bool) {
+        if let Some(widgets) = self.login.borrow().as_ref() {
+            widgets.form.set_sensitive(!busy);
+            widgets.busy.set_visible(busy);
+            if busy {
+                widgets.error.set_visible(false);
+            }
+        }
+    }
+
+    /// Zeigt einen Fehler in der Maske und gibt sie wieder frei.
+    fn login_error(&self, message: &str) {
+        self.authenticating.set(false);
+        self.login_busy(false);
+        if let Some(widgets) = self.login.borrow().as_ref() {
+            widgets.error.set_label(message);
+            widgets.error.set_visible(true);
+            widgets.username.grab_focus();
+        }
+    }
+
     /// Gibt das gemerkte Passwort heraus und vergisst es dabei.
     fn take_password(&self) -> Option<String> {
         self.pending_password.borrow_mut().take()
@@ -104,6 +158,7 @@ impl AppState {
     /// Nach einer abgelehnten Anmeldung: nichts Falsches weiterverwenden.
     fn reset_credentials(&self) {
         self.pending_password.borrow_mut().take();
+        self.authenticated.set(false);
     }
 
     /// Verwirft das Modell und lädt von vorn — nach einem Sync.
@@ -194,7 +249,16 @@ pub fn build(app: &adw::Application, state: Rc<AppState>) {
                 return;
             }
             sync_button.set_sensitive(false);
-            status.set_label("Sync läuft …");
+
+            if state.authenticated.get() {
+                status.set_label("Sync läuft …");
+            } else {
+                // Auch beim Start mit hinterlegtem Passwort: erst nach
+                // `auth_ok` gilt die Anmeldung als durch.
+                state.authenticating.set(true);
+                state.login_busy(true);
+                status.set_label("Anmeldung läuft …");
+            }
             start_sync(
                 state.clone(),
                 status.clone(),
@@ -205,7 +269,7 @@ pub fn build(app: &adw::Application, state: Rc<AppState>) {
         })
     };
 
-    let login = build_login_page(&state, &stack, trigger.clone());
+    let login = build_login_page(&state, trigger.clone());
     stack.add_named(&login, Some("login"));
 
     sync_button.connect_clicked({
@@ -233,11 +297,7 @@ pub fn build(app: &adw::Application, state: Rc<AppState>) {
 ///
 /// Das Passwort geht nie in die Konfiguration — es wird nur bis zur ersten
 /// Verwendung im Speicher gehalten und danach vom Sidecar im Keyring abgelegt.
-fn build_login_page(
-    state: &Rc<AppState>,
-    stack: &gtk::Stack,
-    trigger: Rc<dyn Fn()>,
-) -> gtk::Widget {
+fn build_login_page(state: &Rc<AppState>, trigger: Rc<dyn Fn()>) -> gtk::Widget {
     let username = adw::EntryRow::builder().title("Apple-ID").build();
     username.set_text(&state.config.borrow().icloud.username);
 
@@ -284,11 +344,35 @@ fn build_login_page(
     form.append(&submit);
     form.append(&hint);
 
+    // Eigene Zeile ausserhalb von `form`, damit sie sichtbar bleibt, waehrend
+    // das Formular gesperrt ist.
+    let spinner = gtk::Spinner::builder().spinning(true).build();
+    let busy_label = gtk::Label::builder()
+        .label("Anmeldung läuft …")
+        .css_classes(["dim-label"])
+        .build();
+    let busy = gtk::Box::new(gtk::Orientation::Horizontal, 10);
+    busy.set_halign(gtk::Align::Center);
+    busy.set_visible(false);
+    busy.append(&spinner);
+    busy.append(&busy_label);
+
+    let column = gtk::Box::new(gtk::Orientation::Vertical, 18);
+    column.append(&form);
+    column.append(&busy);
+
+    *state.login.borrow_mut() = Some(LoginWidgets {
+        form: form.clone(),
+        error: error.clone(),
+        busy: busy.clone(),
+        username: username.clone(),
+    });
+
     // Begrenzt die Formularbreite auf breiten Bildschirmen.
     let clamp = adw::Clamp::builder()
         .maximum_size(420)
         .tightening_threshold(360)
-        .child(&form)
+        .child(&column)
         .build();
 
     let page = adw::StatusPage::builder()
@@ -300,7 +384,6 @@ fn build_login_page(
 
     let submit_action = {
         let state = state.clone();
-        let stack = stack.clone();
         let username = username.clone();
         let password = password.clone();
         let error = error.clone();
@@ -329,7 +412,10 @@ fn build_login_page(
             password.set_text("");
             error.set_visible(false);
 
-            stack.set_visible_child_name("empty");
+            // Bewusst kein Seitenwechsel: die Maske bleibt stehen, bis der
+            // Sidecar `auth_ok` meldet. Sonst landet man im Katalog, obwohl
+            // Passwort oder 2FA noch gar nicht bestaetigt sind.
+            state.login_busy(true);
             trigger();
         }
     };
@@ -521,12 +607,8 @@ fn update_status(state: &Rc<AppState>, status: &gtk::Label, stack: &gtk::Stack) 
     let cached = state.catalog.borrow().cached_bytes().unwrap_or(0);
     let limit = state.config.borrow().cache.limit_bytes();
 
-    // Solange keine Apple-ID da ist, bleibt die Anmeldemaske stehen.
-    if !state.sync_configured() {
-        stack.set_visible_child_name("login");
-    } else {
-        stack.set_visible_child_name(if total == 0 { "empty" } else { "grid" });
-    }
+    // Bis zur abgeschlossenen Anmeldung bleibt die Maske stehen.
+    stack.set_visible_child_name(state.current_page(total));
     status.set_label(&format!(
         "{total} Fotos · Cache {} / {}",
         human_bytes(cached),
@@ -568,6 +650,16 @@ fn start_sync(
                 SyncMessage::Thumbnails { stored } => {
                     status.set_label(&format!("Lade Vorschauen … {stored}"));
                 }
+                SyncMessage::Authenticated { trusted } => {
+                    // Erst hier ist die Anmeldung wirklich durch — Passwort und
+                    // 2FA sind bestaetigt. Jetzt darf die Maske weichen.
+                    tracing::info!(trusted, "Anmeldung abgeschlossen");
+                    state.authenticated.set(true);
+                    state.authenticating.set(false);
+                    state.login_busy(false);
+                    update_status(&state, &status, &stack);
+                    status.set_label("Sync läuft …");
+                }
                 SyncMessage::PasswordRequired { responder } => {
                     match ask_secret(
                         &window,
@@ -586,7 +678,8 @@ fn start_sync(
                 SyncMessage::CredentialsRejected { message } => {
                     tracing::warn!(%message, "Anmeldung abgelehnt");
                     state.reset_credentials();
-                    stack.set_visible_child_name("login");
+                    state.login_error("Apple hat diese Zugangsdaten abgelehnt.");
+                    update_status(&state, &status, &stack);
                     status.set_label("Anmeldung fehlgeschlagen");
                     show_error(
                         &window,
@@ -625,10 +718,22 @@ fn start_sync(
                 }
                 SyncMessage::Finished(Err(error)) => {
                     tracing::error!(%error, "Sync fehlgeschlagen");
+                    // Scheitert es vor `auth_ok` — abgebrochene 2FA, Netzfehler —
+                    // muss die Maske wieder bedienbar sein, sonst haengt der
+                    // Nutzer in einem gesperrten Formular fest.
+                    if !state.authenticated.get() {
+                        state.login_error("Anmeldung nicht abgeschlossen. Bitte erneut versuchen.");
+                    }
                     show_error(&window, "Sync fehlgeschlagen", &error);
                     update_status(&state, &status, &stack);
                 }
             }
+        }
+        // Der Kanal ist zu; falls der Sync ohne Meldung endete, nicht in einem
+        // gesperrten Formular zurueckbleiben.
+        if !state.authenticated.get() {
+            state.authenticating.set(false);
+            state.login_busy(false);
         }
         state.syncing.set(false);
         sync_button.set_sensitive(true);
@@ -703,7 +808,54 @@ fn show_error(parent: &adw::ApplicationWindow, heading: &str, body: &str) {
 
 #[cfg(test)]
 mod tests {
-    use super::human_bytes;
+    use super::*;
+
+    fn state() -> Rc<AppState> {
+        AppState::new(
+            Config::default(),
+            PathBuf::from("/nonexistent/config.toml"),
+            Catalog::open_in_memory().unwrap(),
+        )
+    }
+
+    #[test]
+    fn stays_on_login_until_authentication_completed() {
+        let state = state();
+
+        // Frischer Start: noch keine Anmeldung, kein Foto.
+        assert_eq!(state.current_page(0), "login");
+
+        // Apple-ID eingetragen reicht nicht — sie ist nur behauptet, nicht geprüft.
+        state.config.borrow_mut().icloud.username = "a@b.c".into();
+        assert_eq!(state.current_page(0), "login");
+
+        // Auch waehrend der Anmeldung bleibt die Maske stehen.
+        state.authenticating.set(true);
+        assert_eq!(state.current_page(0), "login");
+
+        // Erst `auth_ok` gibt den Weg frei.
+        state.authenticated.set(true);
+        assert_eq!(state.current_page(0), "empty");
+        assert_eq!(state.current_page(7), "grid");
+    }
+
+    #[test]
+    fn existing_photos_are_shown_before_reauthentication() {
+        // Wer beim letzten Mal schon synchronisiert hat, soll seine Fotos
+        // sehen, waehrend der Hintergrund-Sync sich neu anmeldet.
+        let state = state();
+        assert_eq!(state.current_page(120), "grid");
+    }
+
+    #[test]
+    fn rejected_credentials_send_the_user_back() {
+        let state = state();
+        state.authenticated.set(true);
+        assert_eq!(state.current_page(0), "empty");
+
+        state.reset_credentials();
+        assert_eq!(state.current_page(0), "login");
+    }
 
     #[test]
     fn formats_each_unit_step() {
