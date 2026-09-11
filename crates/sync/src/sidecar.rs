@@ -47,6 +47,8 @@ pub struct SidecarOptions {
     pub fake_two_factor: bool,
     /// Testmodus: die Passwortabfrage durchspielen.
     pub fake_password: bool,
+    /// Testmodus: je Asset so lange warten, damit das Einlaufen sichtbar wird.
+    pub fake_delay_ms: u64,
 }
 
 impl SidecarOptions {
@@ -70,6 +72,7 @@ impl SidecarOptions {
             fake: None,
             fake_two_factor: false,
             fake_password: false,
+            fake_delay_ms: 0,
         }
     }
 
@@ -108,6 +111,10 @@ impl SidecarOptions {
             }
             if self.fake_password {
                 args.push("--fake-password".into());
+            }
+            if self.fake_delay_ms > 0 {
+                args.push("--fake-delay-ms".into());
+                args.push(self.fake_delay_ms.to_string());
             }
             return args;
         }
@@ -319,6 +326,7 @@ pub async fn run_sync(
             }
             SidecarMessage::LibraryCount { value } => {
                 summary.library_count = Some(value);
+                emit(events, SyncEvent::LibraryCount { total: value });
             }
             SidecarMessage::BaselineComplete { count } => {
                 tracing::info!(count, "vollstaendiger Durchlauf beendet");

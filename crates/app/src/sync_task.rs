@@ -24,6 +24,9 @@ pub enum SyncMessage {
     },
     /// Die Bibliothek ist unveraendert — dieser Lauf kostete einen Request.
     Unchanged,
+    LibraryCount {
+        total: u64,
+    },
     Deleted {
         removed: u64,
     },
@@ -105,6 +108,10 @@ pub fn spawn(
             options.fake = fake_count();
             // Erlaubt, den kompletten Anmeldeweg ohne Apple-Konto durchzuspielen.
             options.fake_password = std::env::var_os("ICLOUD_PHOTOS_FAKE_PASSWORD").is_some();
+            options.fake_delay_ms = std::env::var("ICLOUD_PHOTOS_FAKE_DELAY_MS")
+                .ok()
+                .and_then(|value| value.parse().ok())
+                .unwrap_or(0);
 
             let (event_tx, mut event_rx) = mpsc::unbounded_channel::<SyncEvent>();
             let (tfa_tx, mut tfa_rx) = mpsc::unbounded_channel::<SecretRequest>();
@@ -128,6 +135,9 @@ pub fn spawn(
                                 }
                                 Some(SyncEvent::Unchanged) => {
                                     let _ = tx.send(SyncMessage::Unchanged);
+                                }
+                                Some(SyncEvent::LibraryCount { total }) => {
+                                    let _ = tx.send(SyncMessage::LibraryCount { total });
                                 }
                                 Some(SyncEvent::Deleted { removed }) => {
                                     let _ = tx.send(SyncMessage::Deleted { removed });

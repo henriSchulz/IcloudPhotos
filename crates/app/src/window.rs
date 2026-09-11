@@ -21,6 +21,30 @@ const PREFETCH_MARGIN: f64 = 600.0;
 
 const THUMB_SIZE: i32 = 180;
 
+/// So oft zieht die Ansicht waehrend eines Syncs nach.
+const LIVE_REFRESH: std::time::Duration = std::time::Duration::from_secs(2);
+
+/// So viele Skelett-Kacheln zeigt die Ansicht hoechstens fuer noch nicht
+/// synchronisierte Fotos. Mehr als ein paar Bildschirme bringen nichts.
+const MAX_PLACEHOLDERS: u64 = 120;
+
+/// Skelett-Optik fuer Kacheln, deren Vorschau noch fehlt.
+const SKELETON_CSS: &str = "
+.photo-skeleton {
+    background-image: linear-gradient(120deg,
+        alpha(@theme_fg_color, 0.07),
+        alpha(@theme_fg_color, 0.16),
+        alpha(@theme_fg_color, 0.07));
+    border-radius: 8px;
+    animation: photo-skeleton-pulse 1.8s ease-in-out infinite;
+}
+@keyframes photo-skeleton-pulse {
+    0%   { opacity: 0.55; }
+    50%  { opacity: 1.0; }
+    100% { opacity: 0.55; }
+}
+";
+
 /// Geteilter UI-Zustand.
 pub struct AppState {
     /// Veränderbar, weil die Anmeldemaske die Apple-ID setzt.
@@ -45,6 +69,11 @@ pub struct AppState {
     loaded: Cell<u64>,
     exhausted: Cell<bool>,
     syncing: Cell<bool>,
+    /// Bestand laut iCloud, sobald der Sidecar ihn gemeldet hat. Bezugsgroesse
+    /// fuer Skelette und Fortschrittsanzeige.
+    expected_total: Cell<u64>,
+    /// Katalogstand beim letzten Nachziehen, um unnoetige Arbeit zu sparen.
+    last_seen_count: Cell<u64>,
 }
 
 /// Die Teile der Anmeldemaske, die von aussen gesteuert werden.
@@ -70,6 +99,8 @@ impl AppState {
             loaded: Cell::new(0),
             exhausted: Cell::new(false),
             syncing: Cell::new(false),
+            expected_total: Cell::new(0),
+            last_seen_count: Cell::new(0),
         })
     }
 
@@ -125,7 +156,12 @@ impl AppState {
         if !self.authenticated.get() && total == 0 {
             return "login";
         }
-        if total == 0 { "empty" } else { "grid" }
+        // Waehrend eines laufenden Syncs zeigt das Grid Skelette — "Noch keine
+        // Fotos" waere dann schlicht falsch.
+        if total == 0 && !self.syncing.get() {
+            return "empty";
+        }
+        "grid"
     }
 
     /// Sperrt die Maske und zeigt den Fortschritt, oder gibt sie wieder frei.
@@ -166,7 +202,57 @@ impl AppState {
         self.model.remove_all();
         self.loaded.set(0);
         self.exhausted.set(false);
+        self.last_seen_count.set(0);
         self.load_next_page();
+    }
+
+    /// Zieht die sichtbaren Kacheln auf den aktuellen Katalogstand nach.
+    ///
+    /// Wird waehrend eines Syncs regelmaessig aufgerufen, damit Fotos einlaufen,
+    /// statt erst am Ende auf einen Schlag zu erscheinen. Gibt zurueck, ob sich
+    /// etwas geaendert hat.
+    fn refresh_in_place(&self) -> bool {
+        let total = self.catalog.borrow().count().unwrap_or(0);
+        if total == self.last_seen_count.get() {
+            return false;
+        }
+        self.last_seen_count.set(total);
+
+        // So viele Zeilen wie bisher geladen, mindestens eine Seite. Der
+        // Katalog ist nach `added_date` sortiert, neue Fotos koennen also
+        // mitten hinein fallen — anhaengen reicht nicht.
+        let want = self.loaded.get().max(PAGE_SIZE);
+        let photos = match self.catalog.borrow().page(0, want) {
+            Ok(photos) => photos,
+            Err(error) => {
+                tracing::error!(%error, "Katalog waehrend des Syncs nicht lesbar");
+                return false;
+            }
+        };
+
+        let mut objects: Vec<PhotoObject> = photos.iter().map(PhotoObject::new).collect();
+        self.loaded.set(objects.len() as u64);
+        self.exhausted.set((objects.len() as u64) < want);
+
+        objects.extend(self.placeholders(total, objects.len() as u64));
+        self.model.splice(0, self.model.n_items(), &objects);
+        true
+    }
+
+    /// Skelette fuer Fotos, die der Sync noch nicht geliefert hat.
+    fn placeholders(&self, have: u64, shown: u64) -> Vec<PhotoObject> {
+        if !self.syncing.get() {
+            return Vec::new();
+        }
+        let expected = self.expected_total.get();
+        let missing = expected.saturating_sub(have);
+        // Nur auffuellen, solange die geladene Seite nicht ohnehin schon voll
+        // ist — sonst schoeben Skelette die echten Fotos aus dem Blick.
+        if missing == 0 || shown >= PAGE_SIZE {
+            return Vec::new();
+        }
+        let count = missing.min(MAX_PLACEHOLDERS).min(PAGE_SIZE - shown);
+        (0..count).map(|_| PhotoObject::placeholder()).collect()
     }
 }
 
@@ -271,6 +357,21 @@ pub fn build(app: &adw::Application, state: Rc<AppState>) {
 
     let login = build_login_page(&state, trigger.clone());
     stack.add_named(&login, Some("login"));
+
+    install_skeleton_css();
+
+    // Waehrend eines Syncs laufend nachziehen, statt erst am Ende umzuschalten.
+    glib::timeout_add_local(LIVE_REFRESH, {
+        let state = state.clone();
+        let status = status.clone();
+        let stack = stack.clone();
+        move || {
+            if state.syncing.get() && state.refresh_in_place() {
+                update_status(&state, &status, &stack);
+            }
+            glib::ControlFlow::Continue
+        }
+    });
 
     sync_button.connect_clicked({
         let trigger = trigger.clone();
@@ -449,6 +550,19 @@ fn build_login_page(state: &Rc<AppState>, trigger: Rc<dyn Fn()>) -> gtk::Widget 
     page.upcast()
 }
 
+/// Haengt die Skelett-Optik in den Stil des Bildschirms.
+fn install_skeleton_css() {
+    let provider = gtk::CssProvider::new();
+    provider.load_from_string(SKELETON_CSS);
+    if let Some(display) = gdk::Display::default() {
+        gtk::style_context_add_provider_for_display(
+            &display,
+            &provider,
+            gtk::STYLE_PROVIDER_PRIORITY_APPLICATION,
+        );
+    }
+}
+
 fn build_grid(state: &Rc<AppState>, window: &adw::ApplicationWindow) -> gtk::GridView {
     let factory = gtk::SignalListItemFactory::new();
 
@@ -493,6 +607,16 @@ fn build_grid(state: &Rc<AppState>, window: &adw::ApplicationWindow) -> gtk::Gri
             .downcast::<gtk::Label>()
             .unwrap();
 
+        if photo.needs_skeleton() {
+            // Noch kein Bild da: Platzhalter statt leerer Flaeche, damit die
+            // Ansicht von Anfang an ihre spaetere Form hat.
+            picture.add_css_class("photo-skeleton");
+            picture.set_paintable(gdk::Paintable::NONE);
+            label.set_label(if photo.is_placeholder() { "" } else { "…" });
+            return;
+        }
+
+        picture.remove_css_class("photo-skeleton");
         label.set_label(&photo.filename());
         set_image(&picture, photo.thumb_path().as_deref());
     });
@@ -504,6 +628,7 @@ fn build_grid(state: &Rc<AppState>, window: &adw::ApplicationWindow) -> gtk::Gri
             && let Some(picture) = boxed.first_child().and_downcast::<gtk::Picture>()
         {
             picture.set_paintable(gdk::Paintable::NONE);
+            picture.remove_css_class("photo-skeleton");
         }
     });
 
@@ -530,6 +655,10 @@ fn build_grid(state: &Rc<AppState>, window: &adw::ApplicationWindow) -> gtk::Gri
             else {
                 return;
             };
+            // Ein Skelett hat noch kein Foto dahinter.
+            if photo.is_placeholder() {
+                return;
+            }
             open_viewer(&state, &window, &photo);
         }
     });
@@ -609,11 +738,28 @@ fn update_status(state: &Rc<AppState>, status: &gtk::Label, stack: &gtk::Stack) 
 
     // Bis zur abgeschlossenen Anmeldung bleibt die Maske stehen.
     stack.set_visible_child_name(state.current_page(total));
+
+    let expected = state.expected_total.get();
+    let counts = if state.syncing.get() && expected > total {
+        format!("{total} / {expected} Fotos")
+    } else {
+        format!("{total} Fotos")
+    };
     status.set_label(&format!(
-        "{total} Fotos · Cache {} / {}",
+        "{counts} · Cache {} / {}",
         human_bytes(cached),
         human_bytes(limit)
     ));
+}
+
+/// Fortschritt immer gegen den Gesamtbestand, sofern er bekannt ist.
+fn progress_label(state: &Rc<AppState>, what: &str, done: u64) -> String {
+    let expected = state.expected_total.get();
+    if expected > 0 {
+        format!("{what} … {done} / {expected}")
+    } else {
+        format!("{what} … {done}")
+    }
 }
 
 fn human_bytes(bytes: u64) -> String {
@@ -645,13 +791,20 @@ fn start_sync(
         while let Some(message) = messages.recv().await {
             match message {
                 SyncMessage::Progress { stored } => {
-                    status.set_label(&format!("Sync läuft … {stored} Fotos"));
+                    status.set_label(&progress_label(&state, "Sync läuft", stored));
                 }
                 SyncMessage::Thumbnails { stored } => {
-                    status.set_label(&format!("Lade Vorschauen … {stored}"));
+                    status.set_label(&progress_label(&state, "Lade Vorschauen", stored));
                 }
                 SyncMessage::Unchanged => {
                     tracing::debug!("Bibliothek unveraendert");
+                }
+                SyncMessage::LibraryCount { total } => {
+                    // Ab jetzt kennt die Ansicht ihre spaetere Groesse und kann
+                    // die Luecke mit Skeletten fuellen.
+                    state.expected_total.set(total);
+                    state.refresh_in_place();
+                    update_status(&state, &status, &stack);
                 }
                 SyncMessage::Deleted { removed } => {
                     status.set_label(&format!("Entferne gelöschte Fotos … {removed}"));
@@ -843,6 +996,62 @@ mod tests {
         state.authenticated.set(true);
         assert_eq!(state.current_page(0), "empty");
         assert_eq!(state.current_page(7), "grid");
+    }
+
+    #[test]
+    fn syncing_shows_the_grid_instead_of_an_empty_page() {
+        let state = state();
+        state.authenticated.set(true);
+
+        // Ohne Sync ist "noch keine Fotos" richtig.
+        assert_eq!(state.current_page(0), "empty");
+
+        // Waehrend eines Syncs stehen dort Skelette.
+        state.syncing.set(true);
+        assert_eq!(state.current_page(0), "grid");
+    }
+
+    #[test]
+    fn placeholders_fill_the_gap_to_the_expected_total() {
+        let state = state();
+        state.syncing.set(true);
+        state.expected_total.set(19_624);
+
+        // 12 Fotos da, der Rest wird als Skelett angedeutet — aber gedeckelt.
+        // Mehr als ein paar Bildschirme Skelette helfen niemandem.
+        let placeholders = state.placeholders(12, 12);
+        assert_eq!(placeholders.len() as u64, MAX_PLACEHOLDERS);
+        assert!(placeholders.iter().all(|p| p.is_placeholder()));
+        assert!(placeholders.iter().all(|p| p.needs_skeleton()));
+
+        // Nah am Seitenende begrenzt stattdessen die Seitengroesse.
+        let near_end = state.placeholders(PAGE_SIZE - 20, PAGE_SIZE - 20);
+        assert_eq!(near_end.len() as u64, 20);
+    }
+
+    #[test]
+    fn placeholders_stop_once_a_page_is_full() {
+        let state = state();
+        state.syncing.set(true);
+        state.expected_total.set(19_624);
+
+        // Eine volle Seite echter Fotos: Skelette wuerden sie nur verdraengen.
+        assert!(state.placeholders(PAGE_SIZE, PAGE_SIZE).is_empty());
+    }
+
+    #[test]
+    fn no_placeholders_outside_a_sync() {
+        let state = state();
+        state.expected_total.set(19_624);
+        assert!(state.placeholders(12, 12).is_empty());
+    }
+
+    #[test]
+    fn no_placeholders_once_everything_arrived() {
+        let state = state();
+        state.syncing.set(true);
+        state.expected_total.set(10);
+        assert!(state.placeholders(10, 10).is_empty());
     }
 
     #[test]

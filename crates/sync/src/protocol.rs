@@ -107,6 +107,10 @@ pub enum SyncEvent {
     },
     /// Die Bibliothek ist unveraendert; dieser Lauf kostete einen Request.
     Unchanged,
+    /// Gesamtbestand laut iCloud — Bezugsgroesse fuer Skelette und Fortschritt.
+    LibraryCount {
+        total: u64,
+    },
     /// So viele in iCloud geloeschte Fotos wurden ausgetragen.
     Deleted {
         removed: u64,

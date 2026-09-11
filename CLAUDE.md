@@ -255,8 +255,12 @@ Ein abgebrochener Sync wird vom nächsten Lauf vervollständigt:
 - [ ] **Full-Res-Download fehlt** — der Viewer zeigt nur, was schon im Cache
       liegt. Dafür braucht der Sidecar einen dauerhaften `--serve`-Modus, weil
       Prozessstart plus Auth pro geöffnetem Foto zu teuer sind.
-- [ ] Vorschauen erscheinen erst, wenn der Sync durch ist — das Modell wird am
-      Ende neu geladen statt einzelne Kacheln zu aktualisieren.
+- [x] **Fotos laufen live ein.** Die Ansicht zieht alle 2 Sekunden nach,
+      solange ein Sync läuft (`LIVE_REFRESH`), statt erst am Ende umzuschalten.
+      Fotos ohne Vorschau und noch nicht synchronisierte Plätze erscheinen als
+      Skelett-Kacheln, sodass das Raster von Anfang an seine spätere Form hat.
+      Der Sidecar meldet dafür den Gesamtbestand (`library_count`) gleich zu
+      Beginn eines Erstaufbaus — daher auch die Anzeige „1.234 / 19.624".
 - [x] **Inkrementeller Sync über den CloudKit-Zone-Token** (siehe eigener
       Abschnitt). Löst auch Löschungen, die über `added_date` prinzipiell
       unsichtbar sind.
@@ -296,6 +300,12 @@ ICLOUD_PHOTOS_FAKE=40 ICLOUD_PHOTOS_FAKE_PASSWORD=1 cargo run -p icloud-photos-a
 
 Umgebungsvariablen: `ICLOUD_PHOTOS_PYTHON` und `ICLOUD_PHOTOS_SIDECAR`
 überschreiben Interpreter und Skriptpfad, `RUST_LOG` steuert das Logging.
+`ICLOUD_PHOTOS_FAKE_DELAY_MS` bremst den Fake-Sidecar, damit das Einlaufen der
+Kacheln überhaupt beobachtbar ist.
+
+Der Testmodus läuft unter eigener Application-ID (`…​.Fake`, `NON_UNIQUE`).
+Ohne das reicht GApplication die Aktivierung per D-Bus an eine bereits
+laufende Produktivinstanz weiter und der Testlauf beendet sich wortlos.
 
 ## Konventionen für Claude Code
 

@@ -16,6 +16,8 @@ mod imp {
         pub thumb_path: RefCell<Option<String>>,
         pub orig_path: RefCell<Option<String>>,
         pub is_orig_cached: RefCell<bool>,
+        /// Platzhalter fuer ein noch nicht synchronisiertes Foto.
+        pub is_placeholder: RefCell<bool>,
     }
 
     #[glib::object_subclass]
@@ -47,6 +49,23 @@ impl PhotoObject {
             .map(|p| p.to_string_lossy().into_owned());
         *imp.is_orig_cached.borrow_mut() = photo.is_orig_cached;
         object
+    }
+
+    /// Ein Skelett fuer ein Foto, das der Sync noch nicht geliefert hat.
+    pub fn placeholder() -> Self {
+        let object: Self = glib::Object::builder().build();
+        *object.imp().is_placeholder.borrow_mut() = true;
+        object
+    }
+
+    pub fn is_placeholder(&self) -> bool {
+        *self.imp().is_placeholder.borrow()
+    }
+
+    /// Ob die Kachel als Skelett dargestellt werden muss — Platzhalter oder
+    /// ein Foto, dessen Vorschau noch fehlt.
+    pub fn needs_skeleton(&self) -> bool {
+        self.is_placeholder() || self.thumb_path().is_none()
     }
 
     pub fn id(&self) -> String {

@@ -33,6 +33,7 @@ import itertools
 import json
 import struct
 import sys
+import time
 import zlib
 from collections.abc import Iterator
 from datetime import UTC, datetime, timedelta
@@ -312,6 +313,13 @@ def run_baseline(
     Nur fuer den Erstaufbau, einen abgelehnten Token oder den periodischen
     Abgleich. Der laufende Betrieb geht ueber ``run_changes``.
     """
+    # Gesamtzahl vorweg: die UI kann damit von Anfang an Platzhalter fuer die
+    # noch fehlenden Fotos zeigen, statt eine leere Flaeche.
+    try:
+        emit({"type": "library_count", "value": len(api.photos.all)})
+    except Exception as exc:  # noqa: BLE001 - nur fuer die Anzeige
+        log(f"Bestand nicht zaehlbar: {exc}")
+
     count = 0
     for index, asset in enumerate(iter_assets(api, None, limit, offset=offset), start=offset):
         emit(record_for(asset))
@@ -569,6 +577,7 @@ def run_fake(
     since_token: str | None,
     offset: int,
     limit: int | None,
+    delay_ms: int,
 ) -> int:
     """Erzeugt synthetische Datensaetze ohne iCloud-Zugriff.
 
@@ -615,6 +624,7 @@ def run_fake(
         return EXIT_OK
 
     # Schicht 3: vollstaendiger Durchlauf ab offset.
+    emit({"type": "library_count", "value": count})
     newest = None
     emitted = 0
     truncated = False
@@ -637,6 +647,10 @@ def run_fake(
             emit(fake_thumb(index, thumbs))
         if emitted % OFFSET_REPORT_EVERY == 0:
             emit({"type": "offset", "value": index + 1})
+        if delay_ms:
+            # Macht das Einlaufen in der UI ueberhaupt beobachtbar; ein echter
+            # Sync ist ohnehin langsamer als der Fake.
+            time.sleep(delay_ms / 1000.0)
 
     if truncated:
         emit({"type": "offset", "value": offset + emitted})
@@ -674,6 +688,12 @@ def main(argv: list[str] | None = None) -> int:
         help="Vorschaubilder in dieses Verzeichnis laden",
     )
     parser.add_argument(
+        "--fake-delay-ms",
+        type=int,
+        default=0,
+        help="Im Fake-Modus je Asset so lange warten (macht das Einlaufen sichtbar)",
+    )
+    parser.add_argument(
         "--since-token",
         metavar="TOKEN",
         help="CloudKit-syncToken des letzten Laufs; gleich = nichts zu tun",
@@ -708,6 +728,7 @@ def main(argv: list[str] | None = None) -> int:
             args.since_token,
             args.offset,
             args.limit,
+            args.fake_delay_ms,
         )
 
     if not args.username:
