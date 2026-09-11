@@ -1,5 +1,8 @@
 /target
 /.venv
+__pycache__/
+*.pyc
+.ruff_cache/
 
 # Enthaelt die Apple-ID und lokale Pfade — gehoert nicht ins Repo.
 config.toml
