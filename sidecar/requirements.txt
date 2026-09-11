@@ -1,0 +1,7 @@
+# Der Sidecar braucht genau diesen Fork — Begruendung siehe CLAUDE.md.
+pyicloud==2.7.0
+# Optionale Abhaengigkeit des Notes-Service; ohne sie schlaegt schon der
+# Import von `pyicloud` fehl.
+rich>=13
+# Passwortspeicher; auf dem Desktop ueber den Secret Service.
+keyring>=25

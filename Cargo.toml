@@ -1,0 +1,13 @@
+[workspace]
+resolver = "3"
+members = ["crates/core", "crates/cache", "crates/sync", "crates/app"]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+license = "MIT"
+
+[workspace.dependencies]
+icloud-photos-core = { path = "crates/core" }
+icloud-photos-cache = { path = "crates/cache" }
+icloud-photos-sync = { path = "crates/sync" }

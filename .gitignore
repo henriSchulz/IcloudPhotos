@@ -1,0 +1,15 @@
+/target
+/.venv
+
+# Enthaelt die Apple-ID und lokale Pfade — gehoert nicht ins Repo.
+config.toml
+
+# Session-Cookies der iCloud-Anmeldung.
+cookies/
+*.cookiejar
+*.session
+
+# Lokaler Katalog und Cache, falls jemand sie ins Projekt legt.
+*.sqlite
+*.sqlite-wal
+*.sqlite-shm

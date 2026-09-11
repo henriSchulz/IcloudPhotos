@@ -1,0 +1,17 @@
+# Nach ~/.config/icloud-photos/config.toml kopieren und anpassen.
+# Das Passwort steht hier NICHT — es liegt im System-Keyring.
+
+[icloud]
+username = "deine-apple-id@example.com"
+sync_interval_minutes = 15
+
+[cache]
+# Obergrenze des Full-Res-Caches in Gigabyte.
+full_res_cache_limit_gb = 5
+# Nach einer Eviction wird auf diesen Anteil des Limits heruntergeraeumt.
+eviction_target_ratio = 0.9
+
+[paths]
+thumbnail_dir = "~/.cache/icloud-photos/thumbnails"
+full_res_dir = "~/.cache/icloud-photos/fullres"
+db_path = "~/.local/share/icloud-photos/catalog.sqlite"
