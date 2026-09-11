@@ -15,3 +15,4 @@ eviction_target_ratio = 0.9
 thumbnail_dir = "~/.cache/icloud-photos/thumbnails"
 full_res_dir = "~/.cache/icloud-photos/fullres"
 db_path = "~/.local/share/icloud-photos/catalog.sqlite"
+cookie_dir = "~/.local/share/icloud-photos/cookies"

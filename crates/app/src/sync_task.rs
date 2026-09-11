@@ -59,7 +59,7 @@ pub fn spawn(
     let (tx, rx) = mpsc::unbounded_channel();
 
     let db_path = config.paths.db_path.clone();
-    let cookie_dir = config.paths.db_path.parent().map(|p| p.join("cookies"));
+    let cookie_dir = Some(config.paths.cookie_dir.clone());
     let username = config.icloud.username.clone();
     let thumbnail_dir = config.paths.thumbnail_dir.clone();
 

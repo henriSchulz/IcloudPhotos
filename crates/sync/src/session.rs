@@ -142,10 +142,18 @@ impl SidecarSession {
     }
 
     /// Fordert ein Original an und wartet auf die Antwort.
-    pub async fn fetch_original(&mut self, id: &str, dest: &Path) -> Result<Original, SyncError> {
+    /// `master` ist der CPLMaster-Record aus dem Katalog. Ist er bekannt,
+    /// braucht der Sidecar nur einen einzigen CloudKit-Lookup statt zwei.
+    pub async fn fetch_original(
+        &mut self,
+        id: &str,
+        master: Option<&str>,
+        dest: &Path,
+    ) -> Result<Original, SyncError> {
         let command = serde_json::json!({
             "cmd": "original",
             "id": id,
+            "master": master,
             "dest": dest.to_string_lossy(),
         });
         write_line(&mut self.stdin, &command.to_string()).await?;

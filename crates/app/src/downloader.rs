@@ -56,7 +56,7 @@ pub fn spawn(
     let db_path = config.paths.db_path.clone();
     let full_res_dir = config.paths.full_res_dir.clone();
     let cache_config = config.cache.clone();
-    let cookie_dir = config.paths.db_path.parent().map(|p| p.join("cookies"));
+    let cookie_dir = Some(config.paths.cookie_dir.clone());
     let username = config.icloud.username.clone();
 
     std::thread::spawn(move || {
@@ -142,8 +142,14 @@ pub fn spawn(
                     continue;
                 };
                 let dest = destination(&catalog, &full_res_dir, &id);
+                // Der Master-Record aus dem Katalog spart einen CloudKit-Lookup.
+                let master = catalog
+                    .get(&id)
+                    .ok()
+                    .flatten()
+                    .and_then(|photo| photo.record.master_id);
 
-                match active.fetch_original(&id, &dest).await {
+                match active.fetch_original(&id, master.as_deref(), &dest).await {
                     Ok(original) => {
                         if let Err(error) = catalog.set_original_cached(
                             &id,
@@ -256,6 +262,7 @@ mod tests {
         catalog
             .upsert_record(&PhotoRecord {
                 id: id.to_string(),
+                master_id: None,
                 filename: format!("{id}.HEIC"),
                 added_date: Utc::now(),
                 asset_date: None,

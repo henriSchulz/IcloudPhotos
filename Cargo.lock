@@ -627,6 +627,7 @@ name = "icloud-photos-sync"
 version = "0.1.0"
 dependencies = [
  "chrono",
+ "directories",
  "icloud-photos-cache",
  "icloud-photos-core",
  "serde",
@@ -635,6 +636,7 @@ dependencies = [
  "thiserror",
  "tokio",
  "tracing",
+ "tracing-subscriber",
 ]
 
 [[package]]

@@ -121,6 +121,7 @@ mod tests {
             self.catalog
                 .upsert_record(&PhotoRecord {
                     id: id.to_string(),
+                    master_id: None,
                     filename: format!("{id}.heic"),
                     added_date: self.clock,
                     asset_date: None,

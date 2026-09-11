@@ -222,6 +222,30 @@ Alle 24 Stunden läuft trotzdem ein vollständiger Abgleich (`RECONCILE_AFTER`)
 — Sicherheitsnetz gegen langsames Abdriften durch Records, die sich keinem
 Asset zuordnen lassen.
 
+## Full-Res-Download: warum nicht `PhotoAlbum.get`
+
+`PhotoAlbum.get(id)` sieht nach einer gezielten Abfrage aus, fällt intern aber
+auf `for photo in self.photos` zurück, wenn seine Query nichts findet — ein
+vollständiger Durchlauf der Bibliothek. An ~19.600 Fotos gemessen:
+
+| Schritt | über `PhotoAlbum` | über `records/lookup` |
+|---|---|---|
+| Sitzungsaufbau | 8,6 s (`photos.all`) | 1,0 s (`_root_library`) |
+| Asset auflösen | **15,2 s** | **0,3–0,8 s** |
+| Download (~1–2 MB) | 0,6 s | 0,6 s |
+| **Gesamt, erstes Foto** | **~25 s** | **~4 s** |
+
+Der Download war nie das Problem — das Auflösen der ID war es. `AssetResolver`
+im Sidecar geht deshalb direkt über `records/lookup` und baut den `PhotoAsset`
+aus Asset- und Master-Record selbst zusammen.
+
+Dafür werden **nicht-öffentliche** Teile von pyicloud benutzt
+(`_root_library`, `private_client`). Jeder Fehlschlag fällt deshalb auf den
+Album-Weg zurück — langsam, aber funktionierend.
+
+Ist `master_id` im Katalog bekannt (seit Schema 3 mitgeführt), genügt ein
+einziger Lookup statt zwei.
+
 ## Wiederaufnahme
 
 Ein abgebrochener Sync wird vom nächsten Lauf vervollständigt:

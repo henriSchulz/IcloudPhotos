@@ -8,7 +8,7 @@ use rusqlite::{Connection, OptionalExtension, Row, params};
 
 use crate::CacheError;
 
-const SCHEMA_VERSION: i32 = 2;
+const SCHEMA_VERSION: i32 = 3;
 
 /// Der lokale Foto-Katalog.
 pub struct Catalog {
@@ -52,6 +52,7 @@ impl Catalog {
             r#"
             CREATE TABLE IF NOT EXISTS photos (
                 id               TEXT PRIMARY KEY,
+                master_id        TEXT,
                 filename         TEXT NOT NULL,
                 added_date       TEXT NOT NULL,
                 asset_date       TEXT,
@@ -87,6 +88,16 @@ impl Catalog {
             INSERT OR IGNORE INTO sync_state (id) VALUES (1);
             "#,
         )?;
+        // Bestandskataloge nachziehen: die Spalte kam erst mit Schema 3 dazu.
+        if version >= 1
+            && let Err(error) = self
+                .conn
+                .execute("ALTER TABLE photos ADD COLUMN master_id TEXT", [])
+            && !error.to_string().contains("duplicate column")
+        {
+            return Err(error.into());
+        }
+
         self.conn
             .pragma_update(None, "user_version", SCHEMA_VERSION)?;
         Ok(())
@@ -97,9 +108,10 @@ impl Catalog {
     pub fn upsert_record(&self, record: &PhotoRecord) -> Result<(), CacheError> {
         self.conn.execute(
             r#"
-            INSERT INTO photos (id, filename, added_date, asset_date, checksum, width, height)
-            VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)
+            INSERT INTO photos (id, master_id, filename, added_date, asset_date, checksum, width, height)
+            VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)
             ON CONFLICT(id) DO UPDATE SET
+                master_id  = COALESCE(excluded.master_id, photos.master_id),
                 filename   = excluded.filename,
                 added_date = excluded.added_date,
                 asset_date = excluded.asset_date,
@@ -109,6 +121,7 @@ impl Catalog {
             "#,
             params![
                 record.id,
+                record.master_id,
                 record.filename,
                 encode_ts(record.added_date),
                 record.asset_date.map(encode_ts),
@@ -126,9 +139,10 @@ impl Catalog {
         {
             let mut stmt = tx.prepare(
                 r#"
-                INSERT INTO photos (id, filename, added_date, asset_date, checksum, width, height)
-                VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)
+                INSERT INTO photos (id, master_id, filename, added_date, asset_date, checksum, width, height)
+                VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)
                 ON CONFLICT(id) DO UPDATE SET
+                    master_id  = COALESCE(excluded.master_id, photos.master_id),
                     filename   = excluded.filename,
                     added_date = excluded.added_date,
                     asset_date = excluded.asset_date,
@@ -140,6 +154,7 @@ impl Catalog {
             for record in records {
                 stmt.execute(params![
                     record.id,
+                    record.master_id,
                     record.filename,
                     encode_ts(record.added_date),
                     record.asset_date.map(encode_ts),
@@ -447,6 +462,7 @@ fn build_photo(row: &Row<'_>) -> Result<Photo, CacheError> {
     Ok(Photo {
         record: PhotoRecord {
             id: row.get("id")?,
+            master_id: row.get("master_id")?,
             filename: row.get("filename")?,
             added_date: decode_ts(&added_raw)?,
             asset_date: asset_raw.as_deref().map(decode_ts).transpose()?,
@@ -476,6 +492,7 @@ mod tests {
     fn record(id: &str, added: &str) -> PhotoRecord {
         PhotoRecord {
             id: id.to_string(),
+            master_id: Some(format!("master-{id}")),
             filename: format!("{id}.HEIC"),
             added_date: DateTime::parse_from_rfc3339(added)
                 .unwrap()

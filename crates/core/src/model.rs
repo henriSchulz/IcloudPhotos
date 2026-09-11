@@ -12,6 +12,9 @@ use serde::{Deserialize, Serialize};
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PhotoRecord {
     pub id: String,
+    /// Name des CPLMaster-Records. Spart beim Full-Res-Download einen Lookup.
+    #[serde(default)]
+    pub master_id: Option<String>,
     pub filename: String,
     /// Zeitpunkt, zu dem das Asset der iCloud-Bibliothek hinzugefügt wurde.
     /// Dient als Sync-Cursor.
@@ -64,9 +67,10 @@ mod tests {
 
     #[test]
     fn parses_sidecar_line() {
-        let line = r#"{"id":"abc","filename":"IMG_1234.HEIC","added_date":"2026-01-02T03:04:05Z","asset_date":"2025-12-24T18:00:00Z","checksum":"deadbeef","width":4032,"height":3024}"#;
+        let line = r#"{"id":"abc","master_id":"AdRJ","filename":"IMG_1234.HEIC","added_date":"2026-01-02T03:04:05Z","asset_date":"2025-12-24T18:00:00Z","checksum":"deadbeef","width":4032,"height":3024}"#;
         let record: PhotoRecord = serde_json::from_str(line).unwrap();
         assert_eq!(record.id, "abc");
+        assert_eq!(record.master_id.as_deref(), Some("AdRJ"));
         assert_eq!(record.width, Some(4032));
         assert!(record.asset_date.is_some());
     }

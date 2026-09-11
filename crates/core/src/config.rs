@@ -49,6 +49,9 @@ pub struct Paths {
     pub full_res_dir: PathBuf,
     #[serde(default = "default_db_path")]
     pub db_path: PathBuf,
+    /// Sitzungs-Cookies der iCloud-Anmeldung.
+    #[serde(default = "default_cookie_dir")]
+    pub cookie_dir: PathBuf,
 }
 
 fn default_sync_interval() -> u64 {
@@ -68,6 +71,9 @@ fn default_full_res_dir() -> PathBuf {
 }
 fn default_db_path() -> PathBuf {
     PathBuf::from("~/.local/share/icloud-photos/catalog.sqlite")
+}
+fn default_cookie_dir() -> PathBuf {
+    PathBuf::from("~/.local/share/icloud-photos/cookies")
 }
 
 impl Default for ICloud {
@@ -94,6 +100,7 @@ impl Default for Paths {
             thumbnail_dir: default_thumbnail_dir(),
             full_res_dir: default_full_res_dir(),
             db_path: default_db_path(),
+            cookie_dir: default_cookie_dir(),
         }
     }
 }
@@ -201,6 +208,7 @@ impl Config {
             &mut self.paths.thumbnail_dir,
             &mut self.paths.full_res_dir,
             &mut self.paths.db_path,
+            &mut self.paths.cookie_dir,
         ] {
             *path = expand_tilde(path, home);
         }

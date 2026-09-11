@@ -16,4 +16,7 @@ tracing = "0.1.44"
 
 [dev-dependencies]
 chrono = { version = "0.4.45", default-features = false, features = ["clock", "std"] }
+directories = "6.0.0"
 tempfile = "3.27.0"
+tokio = { version = "1.53.1", features = ["rt", "macros"] }
+tracing-subscriber = "0.3.23"

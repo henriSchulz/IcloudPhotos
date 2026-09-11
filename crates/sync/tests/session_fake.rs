@@ -57,7 +57,7 @@ async fn serves_several_originals_from_one_process() {
     for index in 0..3 {
         let id = format!("fake-{index:05}");
         let dest = dir.path().join(format!("{id}.png"));
-        let original = session.fetch_original(&id, &dest).await.unwrap();
+        let original = session.fetch_original(&id, None, &dest).await.unwrap();
 
         assert_eq!(original.path, dest);
         assert!(original.bytes > 0);
@@ -77,7 +77,7 @@ async fn unknown_asset_is_an_error_not_a_hang() {
         .unwrap();
 
     let error = session
-        .fetch_original("fake-99999", &dir.path().join("x.png"))
+        .fetch_original("fake-99999", None, &dir.path().join("x.png"))
         .await
         .unwrap_err();
     assert!(
@@ -87,7 +87,7 @@ async fn unknown_asset_is_an_error_not_a_hang() {
 
     // Die Sitzung muss danach weiter benutzbar sein.
     let ok = session
-        .fetch_original("fake-00001", &dir.path().join("y.png"))
+        .fetch_original("fake-00001", None, &dir.path().join("y.png"))
         .await
         .unwrap();
     assert!(ok.bytes > 0);
@@ -122,11 +122,11 @@ async fn session_asks_for_the_password_once() {
     .unwrap();
 
     session
-        .fetch_original("fake-00000", &dir.path().join("a.png"))
+        .fetch_original("fake-00000", None, &dir.path().join("a.png"))
         .await
         .unwrap();
     session
-        .fetch_original("fake-00001", &dir.path().join("b.png"))
+        .fetch_original("fake-00001", None, &dir.path().join("b.png"))
         .await
         .unwrap();
     session.shutdown().await;
@@ -157,7 +157,7 @@ async fn downloads_fill_the_cache_until_eviction_kicks_in() {
     for index in 0..6 {
         let id = format!("fake-{index:05}");
         let dest = dir.path().join("fullres").join(format!("{id}.png"));
-        let original = session.fetch_original(&id, &dest).await.unwrap();
+        let original = session.fetch_original(&id, None, &dest).await.unwrap();
         let now = chrono::Utc::now();
         catalog
             .set_original_cached(&id, &original.path, original.bytes, now)

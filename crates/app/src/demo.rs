@@ -32,6 +32,7 @@ pub fn seed(catalog: &Catalog, config: &Config) -> anyhow::Result<()> {
 
         catalog.upsert_record(&PhotoRecord {
             id: id.clone(),
+            master_id: None,
             filename: format!("IMG_{index:04}.png"),
             added_date: added,
             asset_date: Some(added),

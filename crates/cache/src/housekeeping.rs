@@ -100,6 +100,7 @@ mod tests {
         catalog
             .upsert_record(&PhotoRecord {
                 id: id.to_string(),
+                master_id: None,
                 filename: format!("{id}.heic"),
                 added_date: Utc::now(),
                 asset_date: None,

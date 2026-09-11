@@ -56,7 +56,10 @@ fn main() -> anyhow::Result<()> {
     // GApplication ist per D-Bus Single-Instance. Ein Testlauf mit derselben
     // ID reicht seine Aktivierung an eine bereits laufende Instanz weiter und
     // beendet sich sofort — deshalb bekommt der Testmodus eine eigene ID.
-    let app = if sync_task::fake_count().is_some() {
+    // Erlaubt eine zweite Instanz neben einer laufenden — zum Nachstellen von
+    // Problemen mit echten Daten, ohne die produktive App zu beenden.
+    let dev_instance = std::env::var_os("ICLOUD_PHOTOS_DEV_INSTANCE").is_some();
+    let app = if sync_task::fake_count().is_some() || dev_instance {
         adw::Application::builder()
             .application_id(format!("{APP_ID}.Fake"))
             .flags(gtk::gio::ApplicationFlags::NON_UNIQUE)

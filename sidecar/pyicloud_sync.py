@@ -191,9 +191,17 @@ def record_for(asset: Any) -> dict[str, Any]:
     except Exception:  # pragma: no cover - defensiv, Feld ist optional
         checksum = None
 
+    # Der Master-Record wird beim Full-Res-Download gebraucht; ihn hier
+    # mitzunehmen spart dort einen Lookup.
+    try:
+        master_id = asset.master_id
+    except Exception:  # noqa: BLE001 - optionales Feld
+        master_id = None
+
     return {
         "type": "photo",
         "id": asset.id,
+        "master_id": master_id,
         "filename": asset.filename,
         "added_date": iso(asset.added_date),
         "asset_date": iso(asset.asset_date),
@@ -498,6 +506,80 @@ def download_original(asset: Any, dest: Path) -> dict[str, Any]:
     return {"type": "original", "id": asset.id, "path": str(dest), "bytes": len(data)}
 
 
+def master_record_name(record: Any) -> str | None:
+    """Name des CPLMaster-Records, auf den ein CPLAsset zeigt."""
+    field = (getattr(record, "fields", None) or {}).get("masterRef")
+    value = getattr(field, "value", field)
+    if isinstance(value, dict):
+        return value.get("recordName")
+    return getattr(value, "recordName", None)
+
+
+class AssetResolver:
+    """Loest Asset-IDs auf — direkt ueber CloudKit statt ueber das Album.
+
+    ``PhotoAlbum.get`` faellt intern auf einen vollstaendigen Durchlauf der
+    Bibliothek zurueck, wenn seine gezielte Abfrage nichts findet. Gemessen an
+    einer Bibliothek mit ~19.600 Fotos kostet das rund 15 Sekunden pro Foto,
+    waehrend der eigentliche Download unter einer Sekunde braucht.
+
+    Ein direkter ``records/lookup`` liegt bei ~0,3 s. Dafuer werden allerdings
+    nicht-oeffentliche Teile von pyicloud benutzt, deshalb gibt es den
+    Album-Weg weiterhin als Rueckfall.
+    """
+
+    def __init__(self, api: Any) -> None:
+        self._api = api
+        self._album: Any = None
+        self._fast: Any = None
+        try:
+            from pyicloud.common.cloudkit.models import CKZoneIDReq
+
+            library = api.photos._root_library
+            self._fast = (
+                library,
+                api.photos.private_client,
+                CKZoneIDReq(**library.zone_id),
+            )
+        except Exception as exc:  # noqa: BLE001 - private API, Rueckfall ist vorgesehen
+            log(f"Direkter Record-Zugriff nicht verfuegbar, nutze Album: {exc}")
+
+    def _album_lookup(self, asset_id: str) -> Any:
+        if self._album is None:
+            self._album = self._api.photos.all
+        return self._album.get(asset_id)
+
+    def get(self, asset_id: str, master_id: str | None = None) -> Any:
+        if self._fast is None:
+            return self._album_lookup(asset_id)
+
+        from pyicloud.services.photos import PhotoAsset
+
+        library, client, zone = self._fast
+        try:
+            if master_id:
+                # Master schon bekannt: ein einziger Lookup genuegt.
+                records = client.lookup(record_names=[asset_id, master_id], zone_id=zone).records
+            else:
+                first = client.lookup(record_names=[asset_id], zone_id=zone).records
+                if not first:
+                    return None
+                name = master_record_name(first[0])
+                if not name:
+                    return self._album_lookup(asset_id)
+                records = client.lookup(record_names=[asset_id, name], zone_id=zone).records
+
+            by_type = {record.recordType: record for record in records}
+            asset_record = by_type.get("CPLAsset")
+            master_record = by_type.get("CPLMaster")
+            if asset_record is None or master_record is None:
+                return self._album_lookup(asset_id)
+            return PhotoAsset(self._api.photos, master_record, asset_record, library)
+        except Exception as exc:  # noqa: BLE001 - jeder Fehler heisst: Album-Weg
+            log(f"Direkter Lookup fuer {asset_id} fehlgeschlagen ({exc}), nutze Album")
+            return self._album_lookup(asset_id)
+
+
 def run_serve(username: str, cookie_dir: str | None) -> int:
     """Bleibt laufen und beantwortet Befehle von stdin.
 
@@ -508,7 +590,7 @@ def run_serve(username: str, cookie_dir: str | None) -> int:
     und ``{"cmd": "quit"}``.
     """
     api = authenticate(username, cookie_dir)
-    album = api.photos.all
+    resolver = AssetResolver(api)
     emit({"type": "ready"})
 
     for line in sys.stdin:
@@ -535,7 +617,7 @@ def run_serve(username: str, cookie_dir: str | None) -> int:
             continue
 
         try:
-            asset = album.get(asset_id)
+            asset = resolver.get(asset_id, command.get("master"))
         except Exception as exc:  # noqa: BLE001 - fremde API
             emit(
                 {
