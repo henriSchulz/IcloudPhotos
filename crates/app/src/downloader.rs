@@ -32,15 +32,43 @@ pub enum DownloadMessage {
     CacheChanged,
 }
 
+/// Wozu ein Original geholt wird.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Purpose {
+    /// Jemand sieht es sich an — zählt als Zugriff.
+    View,
+    /// Vorausschauend für einen Nachbarn im Viewer geholt. Zählt nicht als
+    /// Zugriff, sonst stünde ein nie betrachtetes Foto in der LRU-Reihe vor
+    /// einem betrachteten.
+    Prefetch,
+}
+
+struct Request {
+    id: String,
+    purpose: Purpose,
+}
+
 /// Griff auf den Download-Thread.
 pub struct Downloader {
-    requests: mpsc::UnboundedSender<String>,
+    requests: mpsc::UnboundedSender<Request>,
 }
 
 impl Downloader {
     /// Fordert das Original eines Fotos an.
     pub fn request(&self, id: &str) {
-        let _ = self.requests.send(id.to_string());
+        self.send(id, Purpose::View);
+    }
+
+    /// Holt ein Original im Voraus, ohne es als benutzt zu zählen.
+    pub fn prefetch(&self, id: &str) {
+        self.send(id, Purpose::Prefetch);
+    }
+
+    fn send(&self, id: &str, purpose: Purpose) {
+        let _ = self.requests.send(Request {
+            id: id.to_string(),
+            purpose,
+        });
     }
 }
 
@@ -50,7 +78,7 @@ pub fn spawn(
     config: &Config,
     fake: Option<u64>,
 ) -> (Downloader, mpsc::UnboundedReceiver<DownloadMessage>) {
-    let (request_tx, mut request_rx) = mpsc::unbounded_channel::<String>();
+    let (request_tx, mut request_rx) = mpsc::unbounded_channel::<Request>();
     let (message_tx, message_rx) = mpsc::unbounded_channel::<DownloadMessage>();
 
     let db_path = config.paths.db_path.clone();
@@ -123,7 +151,7 @@ pub fn spawn(
 
             let mut session: Option<SidecarSession> = None;
 
-            while let Some(id) = request_rx.recv().await {
+            while let Some(Request { id, purpose }) = request_rx.recv().await {
                 // Erst beim ersten Auftrag anmelden.
                 if session.is_none() {
                     match SidecarSession::start(&options, &prompts).await {
@@ -151,12 +179,18 @@ pub fn spawn(
 
                 match active.fetch_original(&id, master.as_deref(), &dest).await {
                     Ok(original) => {
-                        if let Err(error) = catalog.set_original_cached(
-                            &id,
-                            &original.path,
-                            original.bytes,
-                            Utc::now(),
-                        ) {
+                        let stored = match purpose {
+                            Purpose::View => catalog.set_original_cached(
+                                &id,
+                                &original.path,
+                                original.bytes,
+                                Utc::now(),
+                            ),
+                            Purpose::Prefetch => {
+                                catalog.set_original_prefetched(&id, &original.path, original.bytes)
+                            }
+                        };
+                        if let Err(error) = stored {
                             tracing::error!(%error, "Original nicht im Katalog vermerkt");
                         }
                         let _ = message_tx.send(DownloadMessage::Ready {
@@ -269,6 +303,7 @@ mod tests {
                 checksum: None,
                 width: None,
                 height: None,
+                item_type: None,
             })
             .unwrap();
     }

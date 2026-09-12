@@ -128,6 +128,7 @@ mod tests {
                     checksum: None,
                     width: None,
                     height: None,
+                    item_type: None,
                 })
                 .unwrap();
             self.catalog

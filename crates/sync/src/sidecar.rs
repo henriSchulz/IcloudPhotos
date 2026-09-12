@@ -475,6 +475,10 @@ pub async fn run_sync(
         return Ok(summary);
     }
 
+    // Ab hier gilt der Lauf als durchgelaufen — auch ein "unveraendert" ist
+    // ein Abgleich. Die Anzeige "zuletzt aktualisiert" haengt daran.
+    catalog.set_last_sync(Utc::now())?;
+
     if summary.baseline_complete {
         catalog.set_baseline_progress(0, true, Utc::now())?;
     }

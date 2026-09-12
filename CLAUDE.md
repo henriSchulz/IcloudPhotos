@@ -79,12 +79,14 @@ iCloud (pyicloud) → Sync-Daemon (Python-Sidecar) → Katalog (SQLite)
 ```sql
 CREATE TABLE photos (
     id              TEXT PRIMARY KEY,
+    master_id       TEXT,               -- Schema 3
     filename        TEXT NOT NULL,
     added_date      TEXT NOT NULL,
     asset_date      TEXT,
     checksum        TEXT,
     width           INTEGER,
     height          INTEGER,
+    item_type       TEXT,               -- Schema 4: "image" | "movie"
     thumb_path      TEXT,
     thumb_bytes     INTEGER,
     orig_path       TEXT,
@@ -95,7 +97,29 @@ CREATE TABLE photos (
 
 CREATE INDEX idx_photos_last_accessed ON photos(last_accessed_at);
 CREATE INDEX idx_photos_added_date ON photos(added_date);
+CREATE INDEX idx_photos_capture
+    ON photos(COALESCE(asset_date, added_date) DESC, id DESC);
 ```
+
+Migrationen laufen über `Catalog::add_column`; SQLite kennt kein
+`ADD COLUMN IF NOT EXISTS`, ein "duplicate column" ist deshalb der Normalfall
+und kein Fehler. `crates/cache/tests/migration.rs` baut eine Schema-3-Datei
+nach und prüft den Aufstieg.
+
+### Reihenfolge der Bibliothek
+
+Sortiert wird nach **`COALESCE(asset_date, added_date)`**, dem Aufnahme- statt
+dem Hinzufügedatum — so wie macOS Photos es hält. An der echten Bibliothek
+gemessen weichen die beiden bei 427 von 6.098 Fotos um mehr als 30 Tage ab;
+das erste Foto im Raster war vorher eine Aufnahme von 2019, die 2026 aus einem
+Backup dazukam. Der Ausdruck muss wörtlich dem Index `idx_photos_capture`
+entsprechen, sonst sortiert SQLite die ganze Tabelle statt den Index zu lesen
+(`EXPLAIN QUERY PLAN` zeigt sonst ein `USE TEMP B-TREE`).
+
+`item_type` kommt vom Sidecar. Bestandszeilen haben es nicht, und ein
+Vollabgleich nur deshalb wäre teuer — `PhotoRecord::kind` fällt darum auf die
+Dateiendung zurück. Die 407 Videos im Katalog sind so auch ohne Re-Sync als
+Videos erkennbar.
 
 ### Cache-Strategie
 
@@ -114,6 +138,11 @@ CREATE INDEX idx_photos_added_date ON photos(added_date);
 - **Wichtig:** `last_accessed_at` muss auch beim reinen Ansehen eines
   bereits gecachten Fotos aktualisiert werden, nicht nur beim Download —
   sonst verhält sich der Cache wie FIFO statt echtem LRU
+- Umgekehrt gilt: ein **Prefetch ist kein Zugriff**. Der Viewer lädt die
+  Nachbarn des offenen Fotos im Voraus; die bekommen über
+  `set_original_prefetched` keinen Zeitstempel und fliegen damit als erste
+  wieder raus (`lru_candidates` sortiert `NULL` nach vorn). Ohne diese
+  Trennung stünde ein nie angesehenes Foto vor einem betrachteten
 - Zusätzlicher periodischer Housekeeping-Check (z.B. alle 10 Min) als
   Sicherheitsnetz gegen verwaiste Dateien nach Abstürzen
 
@@ -204,7 +233,8 @@ CloudKit-**syncToken** der Foto-Zone:
 | 3. Vollständiger Durchlauf | Erstaufbau, abgelehnter Token, 24-h-Abgleich | ~170 Seitenabrufe, einmalig |
 
 Zustand liegt in `sync_state` (einzeilig): `zone_sync_token`, `baseline_done`,
-`baseline_offset`, `last_baseline_at`.
+`baseline_offset`, `last_baseline_at` und `last_sync_at` — letzteres für die
+Anzeige „zuletzt aktualisiert", die jeden Lauf zählt, nicht nur vollständige.
 
 **Zwei Regeln, an denen die Korrektheit hängt:**
 

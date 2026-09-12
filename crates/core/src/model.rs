@@ -28,6 +28,60 @@ pub struct PhotoRecord {
     pub width: Option<u32>,
     #[serde(default)]
     pub height: Option<u32>,
+    /// Was iCloud als Medientyp meldet — `"image"` oder `"movie"`.
+    ///
+    /// Fehlt bei Katalogzeilen aus der Zeit vor Schema 4; für die springt
+    /// [`PhotoRecord::kind`] auf die Dateiendung zurück.
+    #[serde(default)]
+    pub item_type: Option<String>,
+}
+
+/// Medientyp eines Assets. Entscheidet, ob der Viewer ein Bild zeigt oder
+/// einen Abspieler aufbaut.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MediaKind {
+    Image,
+    Video,
+}
+
+/// Endungen, an denen ein Video auch ohne `item_type` erkennbar ist.
+const VIDEO_EXTENSIONS: [&str; 5] = ["mov", "mp4", "m4v", "avi", "3gp"];
+
+impl PhotoRecord {
+    /// Bild oder Video.
+    ///
+    /// `item_type` ist die verlässliche Quelle, aber Bestandskataloge haben
+    /// das Feld noch nicht — und ein erneuter Vollabgleich nur deshalb wäre
+    /// teuer. Die Endung reicht für die Unterscheidung völlig aus.
+    pub fn kind(&self) -> MediaKind {
+        match self.item_type.as_deref() {
+            Some("movie") => MediaKind::Video,
+            Some(_) => MediaKind::Image,
+            None => match extension(&self.filename) {
+                Some(ext) if VIDEO_EXTENSIONS.contains(&ext.as_str()) => MediaKind::Video,
+                _ => MediaKind::Image,
+            },
+        }
+    }
+
+    pub fn is_video(&self) -> bool {
+        self.kind() == MediaKind::Video
+    }
+
+    /// Der Zeitpunkt, nach dem die Bibliothek geordnet wird.
+    ///
+    /// Der Aufnahmezeitpunkt, so wie es auch macOS Photos hält — wann ein Foto
+    /// in die Bibliothek geraten ist, sagt über seinen Platz darin nichts.
+    /// Fehlt er, bleibt nur `added_date`.
+    pub fn capture_date(&self) -> DateTime<Utc> {
+        self.asset_date.unwrap_or(self.added_date)
+    }
+}
+
+fn extension(filename: &str) -> Option<String> {
+    std::path::Path::new(filename)
+        .extension()
+        .map(|ext| ext.to_string_lossy().to_lowercase())
 }
 
 /// Eine vollständige Zeile der Tabelle `photos`.
@@ -81,6 +135,54 @@ mod tests {
         let record: PhotoRecord = serde_json::from_str(line).unwrap();
         assert_eq!(record.asset_date, None);
         assert_eq!(record.checksum, None);
+    }
+
+    fn record(filename: &str, item_type: Option<&str>) -> PhotoRecord {
+        PhotoRecord {
+            id: "a".into(),
+            master_id: None,
+            filename: filename.into(),
+            added_date: DateTime::parse_from_rfc3339("2026-01-01T00:00:00Z")
+                .unwrap()
+                .with_timezone(&Utc),
+            asset_date: None,
+            checksum: None,
+            width: None,
+            height: None,
+            item_type: item_type.map(str::to_string),
+        }
+    }
+
+    #[test]
+    fn item_type_decides_the_media_kind() {
+        assert_eq!(record("x.HEIC", Some("image")).kind(), MediaKind::Image);
+        assert_eq!(record("x.MOV", Some("movie")).kind(), MediaKind::Video);
+        // Fremde Werte sind jedenfalls kein Video.
+        assert_eq!(record("x.HEIC", Some("bursts")).kind(), MediaKind::Image);
+    }
+
+    #[test]
+    fn without_item_type_the_extension_decides() {
+        // Bestandszeilen aus der Zeit vor Schema 4 haben kein item_type. Ohne
+        // diesen Rueckfall waeren alle Videos im Katalog stumme Bilder.
+        assert!(record("IMG_0001.MOV", None).is_video());
+        assert!(record("IMG_0002.mp4", None).is_video());
+        assert!(!record("IMG_0003.HEIC", None).is_video());
+        assert!(!record("ohne-endung", None).is_video());
+        // Kommt in echten Bibliotheken vor: doppelte Endung.
+        assert!(record("IMG_0004.MP4.MOV", None).is_video());
+    }
+
+    #[test]
+    fn capture_date_prefers_the_asset_date() {
+        let mut rec = record("x.HEIC", None);
+        assert_eq!(rec.capture_date(), rec.added_date);
+
+        let shot = DateTime::parse_from_rfc3339("2019-10-17T09:00:00Z")
+            .unwrap()
+            .with_timezone(&Utc);
+        rec.asset_date = Some(shot);
+        assert_eq!(rec.capture_date(), shot);
     }
 
     #[test]

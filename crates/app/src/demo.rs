@@ -39,6 +39,7 @@ pub fn seed(catalog: &Catalog, config: &Config) -> anyhow::Result<()> {
             checksum: None,
             width: Some(ORIGINAL_PX as u32),
             height: Some(ORIGINAL_PX as u32),
+            item_type: Some("image".into()),
         })?;
 
         let thumb = config.paths.thumbnail_dir.join(format!("{id}.png"));

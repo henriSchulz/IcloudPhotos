@@ -4,11 +4,20 @@ use std::path::{Path, PathBuf};
 
 use chrono::{DateTime, SecondsFormat, Utc};
 use icloud_photos_core::model::{Photo, PhotoRecord};
-use rusqlite::{Connection, OptionalExtension, Row, params};
+use rusqlite::{Connection, OptionalExtension, Row, params, params_from_iter};
 
 use crate::CacheError;
 
-const SCHEMA_VERSION: i32 = 3;
+const SCHEMA_VERSION: i32 = 5;
+
+/// Sortierschlüssel der Bibliothek: der Aufnahmezeitpunkt, ersatzweise das
+/// Hinzufügedatum.
+///
+/// `added_date` allein taugt nicht — ein 2019 aufgenommenes Foto, das gestern
+/// aus einem Backup in die Bibliothek kam, stünde sonst ganz vorn. Muss
+/// wörtlich mit dem Ausdruck im Index `idx_photos_capture` übereinstimmen,
+/// sonst sortiert SQLite die ganze Tabelle.
+const SORT_KEY: &str = "COALESCE(asset_date, added_date)";
 
 /// Der lokale Foto-Katalog.
 pub struct Catalog {
@@ -59,6 +68,7 @@ impl Catalog {
                 checksum         TEXT,
                 width            INTEGER,
                 height           INTEGER,
+                item_type        TEXT,
                 thumb_path       TEXT,
                 thumb_bytes      INTEGER,
                 orig_path        TEXT,
@@ -70,6 +80,10 @@ impl Catalog {
                 ON photos(last_accessed_at);
             CREATE INDEX IF NOT EXISTS idx_photos_added_date
                 ON photos(added_date);
+            -- Die Reihenfolge des Rasters. Ohne diesen Index sortiert jede
+            -- Seitenabfrage die gesamte Tabelle.
+            CREATE INDEX IF NOT EXISTS idx_photos_capture
+                ON photos(COALESCE(asset_date, added_date) DESC, id DESC);
             -- Beschleunigt Summenbildung und Eviction-Auswahl, die beide nur
             -- gecachte Originale betrachten.
             CREATE INDEX IF NOT EXISTS idx_photos_cached_lru
@@ -83,19 +97,19 @@ impl Catalog {
                 zone_sync_token  TEXT,
                 baseline_done    INTEGER NOT NULL DEFAULT 0,
                 baseline_offset  INTEGER NOT NULL DEFAULT 0,
-                last_baseline_at TEXT
+                last_baseline_at TEXT,
+                last_sync_at     TEXT
             );
             INSERT OR IGNORE INTO sync_state (id) VALUES (1);
             "#,
         )?;
-        // Bestandskataloge nachziehen: die Spalte kam erst mit Schema 3 dazu.
-        if version >= 1
-            && let Err(error) = self
-                .conn
-                .execute("ALTER TABLE photos ADD COLUMN master_id TEXT", [])
-            && !error.to_string().contains("duplicate column")
-        {
-            return Err(error.into());
+        // Bestandskataloge nachziehen. `CREATE TABLE IF NOT EXISTS` oben legt
+        // nur neue Kataloge vollständig an; eine bestehende Tabelle behält ihre
+        // Spalten und braucht jede Erweiterung einzeln.
+        if version >= 1 {
+            self.add_column("photos", "master_id TEXT")?; // Schema 3
+            self.add_column("photos", "item_type TEXT")?; // Schema 4
+            self.add_column("sync_state", "last_sync_at TEXT")?; // Schema 5
         }
 
         self.conn
@@ -103,33 +117,26 @@ impl Catalog {
         Ok(())
     }
 
+    /// Hängt eine Spalte an eine Tabelle, sofern sie noch fehlt.
+    ///
+    /// SQLite kennt kein `ADD COLUMN IF NOT EXISTS`; ein zweiter Lauf meldet
+    /// deshalb "duplicate column", und genau das ist hier der Normalfall.
+    fn add_column(&self, table: &str, definition: &str) -> Result<(), CacheError> {
+        match self
+            .conn
+            .execute(&format!("ALTER TABLE {table} ADD COLUMN {definition}"), [])
+        {
+            Ok(_) => Ok(()),
+            Err(error) if error.to_string().contains("duplicate column") => Ok(()),
+            Err(error) => Err(error.into()),
+        }
+    }
+
     /// Schreibt Metadaten aus einem Sync. Cache-Spalten bleiben unangetastet,
     /// damit ein Re-Sync keine bereits geladenen Dateien vergisst.
     pub fn upsert_record(&self, record: &PhotoRecord) -> Result<(), CacheError> {
-        self.conn.execute(
-            r#"
-            INSERT INTO photos (id, master_id, filename, added_date, asset_date, checksum, width, height)
-            VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)
-            ON CONFLICT(id) DO UPDATE SET
-                master_id  = COALESCE(excluded.master_id, photos.master_id),
-                filename   = excluded.filename,
-                added_date = excluded.added_date,
-                asset_date = excluded.asset_date,
-                checksum   = excluded.checksum,
-                width      = excluded.width,
-                height     = excluded.height
-            "#,
-            params![
-                record.id,
-                record.master_id,
-                record.filename,
-                encode_ts(record.added_date),
-                record.asset_date.map(encode_ts),
-                record.checksum,
-                record.width,
-                record.height,
-            ],
-        )?;
+        self.conn
+            .execute(UPSERT_SQL, params_from_iter(upsert_params(record)))?;
         Ok(())
     }
 
@@ -137,31 +144,9 @@ impl Catalog {
     pub fn upsert_batch(&mut self, records: &[PhotoRecord]) -> Result<(), CacheError> {
         let tx = self.conn.transaction()?;
         {
-            let mut stmt = tx.prepare(
-                r#"
-                INSERT INTO photos (id, master_id, filename, added_date, asset_date, checksum, width, height)
-                VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)
-                ON CONFLICT(id) DO UPDATE SET
-                    master_id  = COALESCE(excluded.master_id, photos.master_id),
-                    filename   = excluded.filename,
-                    added_date = excluded.added_date,
-                    asset_date = excluded.asset_date,
-                    checksum   = excluded.checksum,
-                    width      = excluded.width,
-                    height     = excluded.height
-                "#,
-            )?;
+            let mut stmt = tx.prepare(UPSERT_SQL)?;
             for record in records {
-                stmt.execute(params![
-                    record.id,
-                    record.master_id,
-                    record.filename,
-                    encode_ts(record.added_date),
-                    record.asset_date.map(encode_ts),
-                    record.checksum,
-                    record.width,
-                    record.height,
-                ])?;
+                stmt.execute(params_from_iter(upsert_params(record)))?;
             }
         }
         tx.commit()?;
@@ -185,11 +170,12 @@ impl Catalog {
         Ok(from_sql_bytes(count))
     }
 
-    /// Eine Seite des Katalogs, neueste zuerst — für die virtualisierte Grid-View.
+    /// Eine Seite des Katalogs, zuletzt aufgenommene zuerst — für die
+    /// virtualisierte Grid-View.
     pub fn page(&self, offset: u64, limit: u64) -> Result<Vec<Photo>, CacheError> {
-        let mut stmt = self
-            .conn
-            .prepare("SELECT * FROM photos ORDER BY added_date DESC, id DESC LIMIT ?1 OFFSET ?2")?;
+        let mut stmt = self.conn.prepare(&format!(
+            "SELECT * FROM photos ORDER BY {SORT_KEY} DESC, id DESC LIMIT ?1 OFFSET ?2"
+        ))?;
         let rows = stmt.query_map(
             params![to_sql_bytes(limit), to_sql_bytes(offset)],
             row_to_photo,
@@ -197,6 +183,42 @@ impl Catalog {
         rows.collect::<Result<Vec<_>, _>>()?
             .into_iter()
             .collect::<Result<Vec<_>, _>>()
+    }
+
+    /// Die Monate der Bibliothek, neueste zuerst, mit Anzahl und Position im
+    /// Raster.
+    ///
+    /// `offset` ist der Index des ersten Fotos dieses Monats in derselben
+    /// Reihenfolge, die [`Catalog::page`] liefert — damit kann die Ansicht
+    /// direkt dorthin springen.
+    pub fn month_groups(&self) -> Result<Vec<DateGroup>, CacheError> {
+        let mut stmt = self.conn.prepare(&format!(
+            r#"
+            SELECT substr({SORT_KEY}, 1, 7) AS month, COUNT(*)
+              FROM photos
+             GROUP BY month
+             ORDER BY month DESC
+            "#
+        ))?;
+        let rows = stmt.query_map([], |row| {
+            Ok((row.get::<_, String>(0)?, from_sql_bytes(row.get(1)?)))
+        })?;
+
+        // Die Position ergibt sich aus der Summe aller neueren Monate. Das in
+        // SQL zu rechnen wäre eine Fensterfunktion für nichts — die Liste ist
+        // ein paar Dutzend Zeilen lang.
+        let mut offset = 0;
+        let mut groups = Vec::new();
+        for row in rows {
+            let (month, count) = row?;
+            groups.push(DateGroup {
+                month,
+                count,
+                offset,
+            });
+            offset += count;
+        }
+        Ok(groups)
     }
 
     pub fn get(&self, id: &str) -> Result<Option<Photo>, CacheError> {
@@ -255,6 +277,31 @@ impl Catalog {
         Ok(())
     }
 
+    /// Vermerkt ein vorausschauend geholtes Original, ohne es als benutzt zu
+    /// zählen.
+    ///
+    /// Der Viewer laedt die Nachbarn des offenen Fotos im Voraus. Wuerden die
+    /// dabei `last_accessed_at` bekommen, stuende ein nie angesehenes Foto in
+    /// der LRU-Reihe vor einem tatsaechlich betrachteten — die Eviction wuerde
+    /// das Falsche wegwerfen. Ohne Zeitstempel fliegen sie zuerst raus, und
+    /// genau das ist richtig.
+    pub fn set_original_prefetched(
+        &self,
+        id: &str,
+        path: &Path,
+        bytes: u64,
+    ) -> Result<(), CacheError> {
+        self.conn.execute(
+            r#"
+            UPDATE photos
+               SET orig_path = ?2, orig_bytes = ?3, is_orig_cached = 1
+             WHERE id = ?1
+            "#,
+            params![id, path.to_string_lossy(), to_sql_bytes(bytes)],
+        )?;
+        Ok(())
+    }
+
     /// Nimmt ein Original aus dem Cache-Bestand. `last_accessed_at` bleibt
     /// erhalten, damit die Zugriffshistorie eines Fotos nicht verloren geht.
     pub fn clear_original(&self, id: &str) -> Result<(), CacheError> {
@@ -281,19 +328,46 @@ impl Catalog {
 
     /// Der gespeicherte Sync-Zustand.
     pub fn sync_state(&self) -> Result<SyncState, CacheError> {
-        let (token, done, offset, baseline_at): (Option<String>, i64, i64, Option<String>) =
-            self.conn.query_row(
-                "SELECT zone_sync_token, baseline_done, baseline_offset, last_baseline_at
-                   FROM sync_state WHERE id = 1",
-                [],
-                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
-            )?;
+        let (token, done, offset, baseline_at, sync_at): (
+            Option<String>,
+            i64,
+            i64,
+            Option<String>,
+            Option<String>,
+        ) = self.conn.query_row(
+            "SELECT zone_sync_token, baseline_done, baseline_offset, last_baseline_at, last_sync_at
+               FROM sync_state WHERE id = 1",
+            [],
+            |row| {
+                Ok((
+                    row.get(0)?,
+                    row.get(1)?,
+                    row.get(2)?,
+                    row.get(3)?,
+                    row.get(4)?,
+                ))
+            },
+        )?;
         Ok(SyncState {
             zone_token: token,
             baseline_done: done != 0,
             baseline_offset: from_sql_bytes(offset),
             last_baseline_at: baseline_at.as_deref().map(decode_ts).transpose()?,
+            last_sync_at: sync_at.as_deref().map(decode_ts).transpose()?,
         })
+    }
+
+    /// Hält fest, wann zuletzt ein Abgleich durchlief — egal welcher Art.
+    ///
+    /// `last_baseline_at` taugt dafür nicht: es steht nur nach einem
+    /// vollständigen Durchlauf, und die gibt es im Betrieb alle 24 Stunden
+    /// einmal. Für die Anzeige "zuletzt aktualisiert" ist das zu grob.
+    pub fn set_last_sync(&self, now: DateTime<Utc>) -> Result<(), CacheError> {
+        self.conn.execute(
+            "UPDATE sync_state SET last_sync_at = ?1 WHERE id = 1",
+            params![encode_ts(now)],
+        )?;
+        Ok(())
     }
 
     /// Vermerkt den Token, mit dem der naechste Sync vergleicht.
@@ -358,15 +432,15 @@ impl Catalog {
     /// Der Delta-Sync sieht ältere Assets nicht erneut; fehlt dort eine
     /// Vorschau, muss sie gezielt nachgeholt werden.
     pub fn ids_without_thumbnail(&self, limit: u64) -> Result<Vec<String>, CacheError> {
-        let mut stmt = self.conn.prepare(
+        let mut stmt = self.conn.prepare(&format!(
             r#"
             SELECT id
               FROM photos
              WHERE thumb_path IS NULL
-             ORDER BY added_date DESC
+             ORDER BY {SORT_KEY} DESC
              LIMIT ?1
-            "#,
-        )?;
+            "#
+        ))?;
         let rows = stmt.query_map(params![to_sql_bytes(limit)], |row| row.get(0))?;
         Ok(rows.collect::<Result<Vec<_>, _>>()?)
     }
@@ -416,7 +490,20 @@ pub struct SyncState {
     pub baseline_done: bool,
     /// Position, an der ein abgebrochener Erstaufbau weitermacht.
     pub baseline_offset: u64,
+    /// Wann zuletzt ein vollständiger Durchlauf fertig wurde.
     pub last_baseline_at: Option<DateTime<Utc>>,
+    /// Wann zuletzt überhaupt ein Abgleich durchlief.
+    pub last_sync_at: Option<DateTime<Utc>>,
+}
+
+/// Ein Monat der Bibliothek und wo er im Raster beginnt.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DateGroup {
+    /// `YYYY-MM`, direkt aus dem Zeitstempel geschnitten.
+    pub month: String,
+    pub count: u64,
+    /// Index des ersten Fotos dieses Monats in der Rasterreihenfolge.
+    pub offset: u64,
 }
 
 /// Ein im Full-Res-Cache liegendes Original.
@@ -425,6 +512,40 @@ pub struct CachedOriginal {
     pub id: String,
     pub path: PathBuf,
     pub bytes: u64,
+}
+
+/// Der Upsert eines Metadatensatzes — einmal formuliert, von Einzel- und
+/// Stapelschreibung benutzt.
+///
+/// `master_id` und `item_type` werden nur überschrieben, wenn der neue
+/// Datensatz sie wirklich mitbringt: ein älterer Sidecar liefert sie nicht,
+/// und ein bereits bekannter Wert ist besser als keiner.
+const UPSERT_SQL: &str = r#"
+    INSERT INTO photos (id, master_id, filename, added_date, asset_date, checksum, width, height, item_type)
+    VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)
+    ON CONFLICT(id) DO UPDATE SET
+        master_id  = COALESCE(excluded.master_id, photos.master_id),
+        filename   = excluded.filename,
+        added_date = excluded.added_date,
+        asset_date = excluded.asset_date,
+        checksum   = excluded.checksum,
+        width      = excluded.width,
+        height     = excluded.height,
+        item_type  = COALESCE(excluded.item_type, photos.item_type)
+"#;
+
+fn upsert_params(record: &PhotoRecord) -> Vec<Box<dyn rusqlite::ToSql>> {
+    vec![
+        Box::new(record.id.clone()),
+        Box::new(record.master_id.clone()),
+        Box::new(record.filename.clone()),
+        Box::new(encode_ts(record.added_date)),
+        Box::new(record.asset_date.map(encode_ts)),
+        Box::new(record.checksum.clone()),
+        Box::new(record.width),
+        Box::new(record.height),
+        Box::new(record.item_type.clone()),
+    ]
 }
 
 /// SQLite kennt nur vorzeichenbehaftete 64-Bit-Integer. Dateigrößen jenseits
@@ -469,6 +590,7 @@ fn build_photo(row: &Row<'_>) -> Result<Photo, CacheError> {
             checksum: row.get("checksum")?,
             width: row.get("width")?,
             height: row.get("height")?,
+            item_type: row.get("item_type")?,
         },
         thumb_path: row
             .get::<_, Option<String>>("thumb_path")?
@@ -501,6 +623,7 @@ mod tests {
             checksum: None,
             width: Some(4032),
             height: Some(3024),
+            item_type: None,
         }
     }
 
@@ -595,6 +718,84 @@ mod tests {
     }
 
     #[test]
+    fn page_orders_by_capture_date_not_by_added_date() {
+        let mut catalog = Catalog::open_in_memory().unwrap();
+        let mut old_shot = record("alt", "2026-06-01T00:00:00Z");
+        // Gestern aus einem Backup hinzugefuegt, aber 2019 aufgenommen: im
+        // Raster gehoert es zu 2019, nicht an den Anfang.
+        old_shot.asset_date = Some(
+            DateTime::parse_from_rfc3339("2019-10-17T09:00:00Z")
+                .unwrap()
+                .with_timezone(&Utc),
+        );
+        let mut recent = record("neu", "2026-01-01T00:00:00Z");
+        recent.asset_date = Some(
+            DateTime::parse_from_rfc3339("2025-12-24T18:00:00Z")
+                .unwrap()
+                .with_timezone(&Utc),
+        );
+        // Ohne Aufnahmedatum zaehlt das Hinzufuegedatum.
+        let undated = record("ohne", "2022-05-05T00:00:00Z");
+        catalog.upsert_batch(&[old_shot, recent, undated]).unwrap();
+
+        let ids: Vec<_> = catalog
+            .page(0, 10)
+            .unwrap()
+            .iter()
+            .map(|p| p.id().to_string())
+            .collect();
+        assert_eq!(ids, ["neu", "ohne", "alt"]);
+    }
+
+    #[test]
+    fn month_groups_count_and_locate_each_month() {
+        let mut catalog = Catalog::open_in_memory().unwrap();
+        catalog
+            .upsert_batch(&[
+                record("a", "2026-03-02T00:00:00Z"),
+                record("b", "2026-03-01T00:00:00Z"),
+                record("c", "2026-01-15T00:00:00Z"),
+                record("d", "2025-12-31T00:00:00Z"),
+            ])
+            .unwrap();
+
+        let groups = catalog.month_groups().unwrap();
+        assert_eq!(
+            groups,
+            vec![
+                DateGroup {
+                    month: "2026-03".into(),
+                    count: 2,
+                    offset: 0
+                },
+                DateGroup {
+                    month: "2026-01".into(),
+                    count: 1,
+                    offset: 2
+                },
+                DateGroup {
+                    month: "2025-12".into(),
+                    count: 1,
+                    offset: 3
+                },
+            ]
+        );
+
+        // Der gemeldete Offset muss wirklich auf das erste Foto des Monats
+        // zeigen — sonst springt die Ansicht daneben.
+        for group in groups {
+            let page = catalog.page(group.offset, 1).unwrap();
+            assert!(
+                page[0]
+                    .record
+                    .capture_date()
+                    .to_rfc3339()
+                    .starts_with(&group.month)
+            );
+        }
+    }
+
+    #[test]
     fn cached_bytes_counts_only_cached_rows() {
         let mut catalog = Catalog::open_in_memory().unwrap();
         catalog
@@ -616,6 +817,41 @@ mod tests {
 
         catalog.clear_original("a").unwrap();
         assert_eq!(catalog.cached_bytes().unwrap(), 200);
+    }
+
+    #[test]
+    fn prefetched_originals_stay_first_in_line_for_eviction() {
+        let mut catalog = Catalog::open_in_memory().unwrap();
+        catalog
+            .upsert_batch(&[
+                record("angesehen", "2026-01-01T00:00:00Z"),
+                record("vorgeladen", "2026-01-01T00:00:00Z"),
+            ])
+            .unwrap();
+
+        let now = Utc::now();
+        catalog
+            .set_original_cached("angesehen", Path::new("/a"), 10, now)
+            .unwrap();
+        catalog
+            .set_original_prefetched("vorgeladen", Path::new("/b"), 10)
+            .unwrap();
+
+        assert!(catalog.get("vorgeladen").unwrap().unwrap().is_orig_cached);
+        assert_eq!(
+            catalog.get("vorgeladen").unwrap().unwrap().last_accessed_at,
+            None,
+            "ein Prefetch ist kein Zugriff"
+        );
+        assert_eq!(catalog.cached_bytes().unwrap(), 20);
+
+        let ids: Vec<_> = catalog
+            .lru_candidates()
+            .unwrap()
+            .into_iter()
+            .map(|c| c.id)
+            .collect();
+        assert_eq!(ids, ["vorgeladen", "angesehen"]);
     }
 
     #[test]
@@ -654,6 +890,10 @@ mod tests {
         assert!(!state.baseline_done);
         // Der Zeitstempel zaehlt erst, wenn der Durchlauf wirklich durch ist.
         assert_eq!(state.last_baseline_at, None);
+        // Und "zuletzt aktualisiert" ist davon unabhaengig.
+        assert_eq!(state.last_sync_at, None);
+        catalog.set_last_sync(now).unwrap();
+        assert!(catalog.sync_state().unwrap().last_sync_at.is_some());
 
         catalog.set_baseline_progress(1700, true, now).unwrap();
         let state = catalog.sync_state().unwrap();
