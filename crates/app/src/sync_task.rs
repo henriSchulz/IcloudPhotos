@@ -16,6 +16,20 @@ use tokio::sync::mpsc;
 
 /// Was der Sync-Thread der UI meldet.
 pub enum SyncMessage {
+    /// Der Lauf beginnt. `resuming` steht, wenn ein abgebrochener Erstaufbau
+    /// fortgesetzt wird — das gehoert in die Anzeige, sonst sieht es aus, als
+    /// finge der Sync wieder bei null an. `full_pass` sagt, ob die ganze
+    /// Bibliothek durchlaufen wird; nur dann ist ein Balkenstand ueberhaupt
+    /// sinnvoll, sonst zaehlt der Lauf Aenderungen gegen nichts.
+    Started {
+        resuming: Option<u64>,
+        full_pass: bool,
+    },
+    /// Nach dem Abgleich werden fehlende Vorschauen nachgeholt. Eigene Phase,
+    /// weil ihre Zaehlung nichts mit dem Bibliotheksbestand zu tun hat.
+    BackfillStarted {
+        missing: u64,
+    },
     Progress {
         stored: u64,
     },
@@ -104,6 +118,12 @@ pub fn spawn(
                 }
             };
             apply_sync_state(&mut options, &state);
+            let _ = tx.send(SyncMessage::Started {
+                resuming: (!state.baseline_done && state.baseline_offset > 0)
+                    .then_some(state.baseline_offset),
+                // Ohne Token geht der Lauf durch die ganze Bibliothek.
+                full_pass: options.since_token.is_none(),
+            });
             options.thumbnail_dir = Some(thumbnail_dir);
             options.fake = fake_count();
             // Erlaubt, den kompletten Anmeldeweg ohne Apple-Konto durchzuspielen.
@@ -183,7 +203,7 @@ pub fn spawn(
             // Vorschau — erster Lauf, Netzfehler, abgebrochener Sync — wird sie
             // in einem zweiten Durchgang gezielt nachgeholt.
             if let Ok(summary) = &mut result {
-                match backfill_thumbnails(&mut catalog, &options, &prompts).await {
+                match backfill_thumbnails(&mut catalog, &options, &prompts, &tx).await {
                     Ok(extra) => {
                         summary.thumbnails += extra.thumbnails;
                         summary.thumbnails_failed += extra.thumbnails_failed;
@@ -256,12 +276,18 @@ async fn backfill_thumbnails(
     catalog: &mut Catalog,
     base: &SidecarOptions,
     prompts: &Prompts,
+    tx: &mpsc::UnboundedSender<SyncMessage>,
 ) -> Result<SyncSummary, icloud_photos_sync::SyncError> {
     let missing = catalog.ids_without_thumbnail(BACKFILL_LIMIT)?;
     if missing.is_empty() {
         return Ok(SyncSummary::default());
     }
     tracing::info!(count = missing.len(), "lade fehlende Vorschauen nach");
+    // Erst melden, wenn wirklich etwas nachzuholen ist — sonst stuende die
+    // Phase kurz in der Anzeige, ohne dass etwas passiert.
+    let _ = tx.send(SyncMessage::BackfillStarted {
+        missing: missing.len() as u64,
+    });
 
     let mut options = base.clone();
     options.fetch_thumbnails_for = missing;

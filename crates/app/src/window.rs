@@ -12,8 +12,10 @@ use std::path::PathBuf;
 use crate::downloader::{self, DownloadMessage, Downloader};
 use crate::export;
 use crate::photo_object::PhotoObject;
+use crate::progress::{SyncBanner, thousands};
 use crate::sync_task::{self, SyncMessage};
 use crate::viewer::{self, Viewer};
+use icloud_photos_sync::SyncSummary;
 
 /// So viele Katalogzeilen werden pro Nachladeschritt geholt. Der Katalog landet
 /// dadurch nie vollständig im Speicher.
@@ -59,6 +61,15 @@ const SKELETON_CSS: &str = "
     border-radius: 99px;
     padding: 4px 14px;
     font-weight: bold;
+}
+/* Der Fortschrittsstreifen unter der Kopfzeile. */
+.sync-banner {
+    background-color: alpha(@accent_bg_color, 0.13);
+    border-bottom: 1px solid alpha(@theme_fg_color, 0.12);
+}
+.sync-banner progressbar trough,
+.sync-banner progressbar progress {
+    min-height: 6px;
 }
 /* Ausgewaehlte Kacheln sollen als solche erkennbar sein. */
 gridview > child:selected picture {
@@ -497,8 +508,11 @@ pub fn build(app: &adw::Application, state: Rc<AppState>) {
     stack.add_named(&photos, Some("grid"));
     stack.add_named(&empty, Some("empty"));
 
+    let banner = SyncBanner::new();
+
     let library = gtk::Box::new(gtk::Orientation::Vertical, 0);
     library.append(&header);
+    library.append(banner.widget());
     library.append(&stack);
 
     // Die beiden Ebenen des Fensters. Ein geöffnetes Foto ist keine zweite
@@ -544,6 +558,7 @@ pub fn build(app: &adw::Application, state: Rc<AppState>) {
         let stack = stack.clone();
         let window = window.clone();
         let sync_button = sync_button.clone();
+        let banner = banner.clone();
         Rc::new(move || {
             // Ohne Apple-ID gibt es nichts zu synchronisieren.
             if !state.sync_configured() {
@@ -558,14 +573,11 @@ pub fn build(app: &adw::Application, state: Rc<AppState>) {
             }
             sync_button.set_sensitive(false);
 
-            if state.authenticated.get() {
-                status.set_label("Sync läuft …");
-            } else {
+            if !state.authenticated.get() {
                 // Auch beim Start mit hinterlegtem Passwort: erst nach
                 // `auth_ok` gilt die Anmeldung als durch.
                 state.authenticating.set(true);
                 state.login_busy(true);
-                status.set_label("Anmeldung läuft …");
             }
             start_sync(
                 state.clone(),
@@ -573,6 +585,7 @@ pub fn build(app: &adw::Application, state: Rc<AppState>) {
                 stack.clone(),
                 window.clone(),
                 sync_button.clone(),
+                banner.clone(),
             );
         })
     };
@@ -601,6 +614,15 @@ pub fn build(app: &adw::Application, state: Rc<AppState>) {
         move |_| trigger()
     });
 
+    // Aktualisieren gehört auf die gewohnte Taste, nicht nur auf einen Knopf
+    // in der Kopfzeile, den das Raster mit der Tabulatortaste nie erreicht.
+    let refresh = gio::SimpleAction::new("sync", None);
+    refresh.connect_activate({
+        let trigger = trigger.clone();
+        move |_, _| trigger()
+    });
+    group.add_action(&refresh);
+    app.set_accels_for_action("photos.sync", &["<Control>r", "F5"]);
 
     update_status(&state, &status, &stack);
     window.present();
@@ -1045,27 +1067,70 @@ fn update_status(state: &Rc<AppState>, status: &gtk::Label, stack: &gtk::Stack) 
     // Bis zur abgeschlossenen Anmeldung bleibt die Maske stehen.
     stack.set_visible_child_name(state.current_page(total));
 
-    let expected = state.expected_total.get();
-    let counts = if state.syncing.get() && expected > total {
-        format!("{total} / {expected} Fotos")
-    } else {
-        format!("{total} Fotos")
-    };
-    status.set_label(&format!(
-        "{counts} · Cache {} / {}",
+    // Den laufenden Fortschritt zeigt der Streifen; hier stehen die Angaben,
+    // die auch dann stimmen, wenn gerade nichts passiert.
+    let mut line = format!(
+        "{} Fotos · Cache {} / {}",
+        thousands(total),
         human_bytes(cached),
         human_bytes(limit)
-    ));
+    );
+    if let Some(last) = last_sync(state) {
+        line.push_str(&format!(" · {}", since(last, chrono_now())));
+    }
+    status.set_label(&line);
 }
 
-/// Fortschritt immer gegen den Gesamtbestand, sofern er bekannt ist.
-fn progress_label(state: &Rc<AppState>, what: &str, done: u64) -> String {
-    let expected = state.expected_total.get();
-    if expected > 0 {
-        format!("{what} … {done} / {expected}")
-    } else {
-        format!("{what} … {done}")
+fn last_sync(state: &Rc<AppState>) -> Option<chrono::DateTime<chrono::Utc>> {
+    state.catalog.borrow().sync_state().ok()?.last_sync_at
+}
+
+/// „vor 3 Min" statt eines Zeitstempels — die Frage dahinter ist immer, ob der
+/// Stand frisch genug ist, nicht wann genau es war.
+fn since(then: chrono::DateTime<chrono::Utc>, now: chrono::DateTime<chrono::Utc>) -> String {
+    let minutes = (now - then).num_minutes();
+    match minutes {
+        // Auch eine Uhr, die kurz rueckwaerts lief, soll etwas Sinnvolles
+        // ergeben.
+        i64::MIN..=0 => "gerade aktualisiert".to_string(),
+        1 => "vor 1 Minute".to_string(),
+        2..=59 => format!("vor {minutes} Minuten"),
+        60..=119 => "vor 1 Stunde".to_string(),
+        120..=1439 => format!("vor {} Stunden", minutes / 60),
+        1440..=2879 => "vor 1 Tag".to_string(),
+        _ => format!("vor {} Tagen", minutes / 1440),
     }
+}
+
+/// Was bei einem Lauf herauskam, in einem Satz.
+fn outcome(summary: &SyncSummary) -> String {
+    if summary.unchanged {
+        // Unveraendert heisst nur: keine neuen Fotos. Der Nachlauf fuer
+        // fehlende Vorschauen kann trotzdem gearbeitet haben, und das war bei
+        // einer grossen Bibliothek die halbe Minute davor.
+        return match summary.thumbnails {
+            0 => "Bibliothek unverändert".to_string(),
+            count => format!(
+                "Bibliothek unverändert · {} Vorschauen geholt",
+                thousands(count)
+            ),
+        };
+    }
+
+    let mut parts = Vec::new();
+    if summary.stored > 0 {
+        parts.push(format!("{} Fotos", thousands(summary.stored)));
+    }
+    if summary.thumbnails > 0 {
+        parts.push(format!("{} Vorschauen", thousands(summary.thumbnails)));
+    }
+    if summary.deleted > 0 {
+        parts.push(format!("{} entfernt", thousands(summary.deleted)));
+    }
+    if parts.is_empty() {
+        return "Abgleich fertig · nichts Neues".to_string();
+    }
+    format!("Abgleich fertig · {}", parts.join(", "))
 }
 
 fn human_bytes(bytes: u64) -> String {
@@ -1090,17 +1155,39 @@ fn start_sync(
     stack: gtk::Stack,
     window: adw::ApplicationWindow,
     sync_button: gtk::Button,
+    banner: Rc<SyncBanner>,
 ) {
     let mut messages = sync_task::spawn(&state.config.borrow(), state.take_password());
 
     glib::spawn_future_local(async move {
+        // Ab der Nachlauf-Meldung zaehlen Vorschauen gegen ihre eigene Menge,
+        // nicht mehr gegen den Bibliotheksbestand.
+        let mut backfilling = false;
+
         while let Some(message) = messages.recv().await {
             match message {
-                SyncMessage::Progress { stored } => {
-                    status.set_label(&progress_label(&state, "Sync läuft", stored));
+                SyncMessage::Started {
+                    resuming,
+                    full_pass,
+                } => {
+                    if let Some(offset) = resuming {
+                        tracing::info!(offset, "setze abgebrochenen Abgleich fort");
+                    }
+                    banner.start(resuming, full_pass);
                 }
+                SyncMessage::Progress { stored } => banner.progress(stored),
                 SyncMessage::Thumbnails { stored } => {
-                    status.set_label(&progress_label(&state, "Lade Vorschauen", stored));
+                    if backfilling {
+                        banner.backfilled(stored);
+                    } else {
+                        // Waehrend des Abgleichs zaehlen Vorschauen dieselben
+                        // Assets wie die Metadaten, nur feiner.
+                        banner.progress(stored);
+                    }
+                }
+                SyncMessage::BackfillStarted { missing } => {
+                    backfilling = true;
+                    banner.backfill(missing);
                 }
                 SyncMessage::Unchanged => {
                     tracing::debug!("Bibliothek unveraendert");
@@ -1110,12 +1197,11 @@ fn start_sync(
                     // Raster kann die Luecke mit Skeletten fuellen, der Balken
                     // einen Stand statt nur Bewegung zeigen.
                     state.expected_total.set(total);
+                    banner.set_expected(total);
                     state.refresh_in_place();
                     update_status(&state, &status, &stack);
                 }
-                SyncMessage::Deleted { removed } => {
-                    status.set_label(&format!("Entferne gelöschte Fotos … {removed}"));
-                }
+                SyncMessage::Deleted { removed } => banner.deleting(removed),
                 SyncMessage::Authenticated { trusted } => {
                     // Erst hier ist die Anmeldung wirklich durch — Passwort und
                     // 2FA sind bestaetigt. Jetzt darf die Maske weichen.
@@ -1123,8 +1209,8 @@ fn start_sync(
                     state.authenticated.set(true);
                     state.authenticating.set(false);
                     state.login_busy(false);
+                    banner.authenticated();
                     update_status(&state, &status, &stack);
-                    status.set_label("Sync läuft …");
                 }
                 SyncMessage::PasswordRequired { responder } => {
                     match ask_secret(
@@ -1145,8 +1231,8 @@ fn start_sync(
                     tracing::warn!(%message, "Anmeldung abgelehnt");
                     state.reset_credentials();
                     state.login_error("Apple hat diese Zugangsdaten abgelehnt.");
+                    banner.failed("Anmeldung fehlgeschlagen");
                     update_status(&state, &status, &stack);
-                    status.set_label("Anmeldung fehlgeschlagen");
                     show_error(
                         &window,
                         "Anmeldung fehlgeschlagen",
@@ -1179,6 +1265,7 @@ fn start_sync(
                         failed = summary.thumbnails_failed,
                         "Sync fertig"
                     );
+                    banner.finished(&outcome(&summary));
                     state.reload();
                     update_status(&state, &status, &stack);
                 }
@@ -1190,6 +1277,7 @@ fn start_sync(
                     if !state.authenticated.get() {
                         state.login_error("Anmeldung nicht abgeschlossen. Bitte erneut versuchen.");
                     }
+                    banner.failed("Abgleich fehlgeschlagen");
                     show_error(&window, "Sync fehlgeschlagen", &error);
                     update_status(&state, &status, &stack);
                 }
@@ -1745,6 +1833,7 @@ fn finish_job(window: &adw::ApplicationWindow, job: &export::Job) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use chrono::DateTime;
 
     fn state() -> Rc<AppState> {
         AppState::new(
@@ -1847,6 +1936,57 @@ mod tests {
 
         state.reset_credentials();
         assert_eq!(state.current_page(0), "login");
+    }
+
+    #[test]
+    fn describes_how_long_ago_a_sync_was() {
+        let now = DateTime::parse_from_rfc3339("2026-09-12T12:00:00Z")
+            .unwrap()
+            .with_timezone(&chrono::Utc);
+        let ago = |minutes: i64| since(now - chrono::TimeDelta::minutes(minutes), now);
+
+        assert_eq!(ago(0), "gerade aktualisiert");
+        assert_eq!(ago(1), "vor 1 Minute");
+        assert_eq!(ago(3), "vor 3 Minuten");
+        assert_eq!(ago(59), "vor 59 Minuten");
+        assert_eq!(ago(60), "vor 1 Stunde");
+        assert_eq!(ago(150), "vor 2 Stunden");
+        assert_eq!(ago(1_440), "vor 1 Tag");
+        assert_eq!(ago(4_320), "vor 3 Tagen");
+
+        // Eine rueckwaerts gestellte Uhr darf keine negative Angabe ergeben.
+        assert_eq!(
+            since(now + chrono::TimeDelta::minutes(5), now),
+            "gerade aktualisiert"
+        );
+    }
+
+    #[test]
+    fn sums_up_what_a_run_did() {
+        let mut summary = SyncSummary {
+            unchanged: true,
+            ..Default::default()
+        };
+        assert_eq!(outcome(&summary), "Bibliothek unverändert");
+
+        // Nachgeholte Vorschauen sind Arbeit, auch wenn sich sonst nichts tat.
+        summary.thumbnails = 300;
+        assert_eq!(
+            outcome(&summary),
+            "Bibliothek unverändert · 300 Vorschauen geholt"
+        );
+        summary.thumbnails = 0;
+
+        summary.unchanged = false;
+        assert_eq!(outcome(&summary), "Abgleich fertig · nichts Neues");
+
+        summary.stored = 1_234;
+        summary.thumbnails = 12;
+        summary.deleted = 2;
+        assert_eq!(
+            outcome(&summary),
+            "Abgleich fertig · 1.234 Fotos, 12 Vorschauen, 2 entfernt"
+        );
     }
 
     #[test]

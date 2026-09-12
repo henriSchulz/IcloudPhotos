@@ -350,6 +350,34 @@ Widget-Namen trägt; die Virtualisierung bleibt unangetastet. Findet sie nichts
 (direkt nach einem Sprung sind die Kacheln am Ziel noch nicht zugeteilt),
 bleibt die letzte Angabe stehen, statt zu verschwinden.
 
+**Sync-Anzeige** (`crates/app/src/progress.rs`) — ein Streifen, der unter der
+Kopfzeile ausfährt, statt einer grauen Zeile am Rand. Er benennt die Phase,
+zeigt einen Balken und fährt vier Sekunden nach dem Abschluss wieder ein.
+
+Drei Dinge, an denen die Anzeige sonst lügt:
+
+- **Ein fortgesetzter Erstaufbau muss als solcher erkennbar sein.** Der Balken
+  bekommt den `baseline_offset` als Sockel (`SyncMessage::Started.resuming`),
+  sonst fängt er bei null an, obwohl der halbe Katalog schon steht. Der Titel
+  sagt dann „Lade Fotos · Fortsetzung".
+- **Metadaten und Vorschauen zählen dieselben Assets**, nur unterschiedlich
+  fein: `Progress` kommt alle 256 Datensätze (`BATCH_SIZE`), `Thumbnails` pro
+  Bild. Beide speisen denselben Zähler, und der höhere Stand gewinnt — sonst
+  zuckt die Anzeige zwischen grob und fein hin und her.
+- **Ein Delta-Lauf hat keine Bezugsgröße.** `full_pass` unterscheidet das; ohne
+  vollständigen Durchlauf gibt es nur einen wandernden Balken und einen
+  Zähler, kein „x / y" gegen den Gesamtbestand.
+
+Der Nachlauf für fehlende Vorschauen ist eine eigene Phase
+(`SyncMessage::BackfillStarted`) mit eigener Bezugsgröße — seine bis zu 500
+Bilder haben mit dem Bibliotheksbestand nichts zu tun.
+
+Wenn nichts läuft, steht in der Kopfzeile, was auch dann stimmt:
+`940 Fotos · Cache 2,1 / 5,0 GB · vor 3 Minuten`. Dafür gibt es
+`sync_state.last_sync_at` (Schema 5) — `last_baseline_at` taugt nicht, das
+steht nur nach einem vollständigen Durchlauf, und den gibt es alle 24 Stunden
+einmal.
+
 **Aktionen** (`crates/app/src/export.rs`) — Sichern, Kopieren und Öffnen
 brauchen alle dasselbe: die Originale der Auswahl. Die liegen aber nur im
 Cache, wenn sie schon einmal geöffnet wurden. Jede Aktion ist deshalb ein
@@ -364,6 +392,7 @@ deshalb weicht `save_into` auf `IMG_0001-1.HEIC` aus, statt zu überschreiben.
 | Strg+C | Auswahl als Dateiliste in die Zwischenablage |
 | Strg+O | mit der Standardanwendung öffnen (nur bei genau einem Foto) |
 | Strg+J | Monatsliste zum Springen |
+| Strg+R / F5 | jetzt synchronisieren |
 
 Strg+J gibt es, weil `GtkGridView` die Tabulatortaste für seine Kacheln behält
 — die Kopfzeile ist von der Auswahl aus sonst gar nicht erreichbar.

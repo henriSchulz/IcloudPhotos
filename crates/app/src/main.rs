@@ -4,6 +4,7 @@ mod demo;
 mod downloader;
 mod export;
 mod photo_object;
+mod progress;
 mod sync_task;
 mod viewer;
 mod window;
