@@ -31,8 +31,10 @@ nicht — die kommen erst beim Oeffnen eines Fotos.
 from __future__ import annotations
 
 import argparse
+import contextlib
 import itertools
 import json
+import os
 import struct
 import sys
 import time
@@ -45,6 +47,9 @@ from typing import Any
 EXIT_OK = 0
 EXIT_ERROR = 1
 EXIT_AUTH = 2
+# Die App ist weg. Kein Fehler im eigentlichen Sinn — es gibt nur niemanden
+# mehr, der zuhoert.
+EXIT_PIPE = 3
 
 
 def emit(payload: dict[str, Any]) -> None:
@@ -70,12 +75,41 @@ def emit(payload: dict[str, Any]) -> None:
             },
             separators=(",", ":"),
         )
-    sys.stdout.write(line + "\n")
-    sys.stdout.flush()
+    try:
+        sys.stdout.write(line + "\n")
+        sys.stdout.flush()
+    except BrokenPipeError:
+        _exit_without_a_listener()
+
+
+def _exit_without_a_listener() -> None:
+    """Beendet den Lauf, wenn die App die Leitung geschlossen hat.
+
+    Passiert im Normalbetrieb: die App beendet einen Sidecar, sobald sie ihn
+    nicht mehr braucht — beim Schliessen der App, nach einem Fehler, oder wenn
+    ein Sync abgebrochen wird. Ohne diesen Griff endet der Prozess mit einem
+    Traceback im Terminal, und der Fehlerbehandler wuerde dieselbe kaputte
+    Leitung gleich noch einmal beschreiben.
+
+    stdout wird dabei auf /dev/null umgelegt: sonst meldet der Interpreter beim
+    Beenden ein zweites Mal denselben BrokenPipeError, diesmal ohne dass ihn
+    jemand abfangen koennte.
+    """
+    try:
+        devnull = os.open(os.devnull, os.O_WRONLY)
+        os.dup2(devnull, sys.stdout.fileno())
+    except OSError:  # pragma: no cover - dann eben ohne
+        pass
+    log("stdout geschlossen — die App hoert nicht mehr zu, Lauf wird beendet")
+    # SystemExit erbt von BaseException und laeuft deshalb durch die
+    # `except Exception`-Blocke der Aufrufer hindurch.
+    raise SystemExit(EXIT_PIPE)
 
 
 def log(message: str) -> None:
-    print(message, file=sys.stderr, flush=True)
+    # Auch stderr kann weg sein. Dann gibt es nichts mehr zu melden.
+    with contextlib.suppress(BrokenPipeError):
+        print(message, file=sys.stderr, flush=True)
 
 
 def iso(value: datetime | None) -> str | None:
@@ -198,6 +232,13 @@ def record_for(asset: Any) -> dict[str, Any]:
     except Exception:  # noqa: BLE001 - optionales Feld
         master_id = None
 
+    # "image" oder "movie". Ohne dieses Feld muss die App den Medientyp aus
+    # der Dateiendung raten.
+    try:
+        item_type = asset.item_type
+    except Exception:  # noqa: BLE001 - optionales Feld
+        item_type = None
+
     return {
         "type": "photo",
         "id": asset.id,
@@ -208,6 +249,7 @@ def record_for(asset: Any) -> dict[str, Any]:
         "checksum": checksum,
         "width": width,
         "height": height,
+        "item_type": item_type,
     }
 
 
@@ -775,15 +817,23 @@ def fake_record(index: int) -> dict[str, Any]:
     added = datetime(2024, 1, 1, tzinfo=UTC) + timedelta(
         days=(index * 7919) % 365, minutes=index % 60
     )
+    # Aufnahme- und Hinzufuegedatum fallen bewusst auseinander: in einer echten
+    # Bibliothek tun sie das auch, und eine Ansicht, die nach dem falschen der
+    # beiden sortiert, faellt hier auf.
+    shot = added - timedelta(days=(index * 37) % 900)
+    # Jedes neunte Asset ist ein Video — damit Kachel-Badge und Viewer-Zweig
+    # ueberhaupt einen Fall bekommen.
+    movie = index % 9 == 8
     return {
         "type": "photo",
         "id": f"fake-{index:05d}",
-        "filename": f"IMG_{index:04d}.HEIC",
+        "filename": f"IMG_{index:04d}." + ("MOV" if movie else "HEIC"),
         "added_date": iso(added),
-        "asset_date": iso(added),
+        "asset_date": iso(shot),
         "checksum": f"checksum-{index:05d}",
         "width": 4032,
         "height": 3024,
+        "item_type": "movie" if movie else "image",
     }
 
 

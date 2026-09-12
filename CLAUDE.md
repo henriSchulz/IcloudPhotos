@@ -65,7 +65,7 @@ iCloud (pyicloud) → Sync-Daemon (Python-Sidecar) → Katalog (SQLite)
   (nicht dauerhaft laufend — pro Sync-Intervall neu gestartet)
 - Kommunikation: NDJSON über stdout, ein JSON-Objekt pro Foto-Metadatensatz
   ```json
-  {"id": "...", "filename": "IMG_1234.HEIC", "added_date": "...", "asset_date": "...", "checksum": "...", "width": 4032, "height": 3024}
+  {"id": "...", "filename": "IMG_1234.HEIC", "added_date": "...", "asset_date": "...", "checksum": "...", "width": 4032, "height": 3024, "item_type": "image"}
   ```
 - Delta-Sync: nur Assets mit `added_date` > letztem gespeicherten Cursor abfragen
 - 2FA: beim ersten Lauf interaktiv — Rust-UI fragt Code ab, gibt ihn über
@@ -193,7 +193,7 @@ Protokoll, alles Menschenlesbare geht nach stderr.
 {"type": "password_required", "username": "..."}
 {"type": "auth_required", "method": "2fa"}
 {"type": "auth_ok", "trusted": true}
-{"type": "photo", "id": "...", "filename": "IMG_1234.HEIC", "added_date": "...", "asset_date": "...", "checksum": "...", "width": 4032, "height": 3024}
+{"type": "photo", "id": "...", "filename": "IMG_1234.HEIC", "added_date": "...", "asset_date": "...", "checksum": "...", "width": 4032, "height": 3024, "item_type": "image"}
 {"type": "thumb", "id": "...", "path": "...", "bytes": 34567}
 {"type": "thumb_failed", "id": "...", "message": "..."}
 {"type": "done", "count": 1234, "cursor": "2026-01-02T03:04:05+00:00"}
@@ -202,6 +202,14 @@ Protokoll, alles Menschenlesbare geht nach stderr.
 
 Im Serve-Modus (`--serve`) kommen Befehle als JSON-Zeilen über stdin:
 `{"cmd": "original", "id": ..., "dest": ...}` und `{"cmd": "quit"}`.
+
+Bricht die Leitung ab — die App wurde geschlossen, ein Sync abgebrochen, der
+Sidecar nach einem Fehler beendet —, endet der Lauf still mit Exit-Code 3
+(`EXIT_PIPE`) und einer Zeile auf stderr. Ohne das schreibt `emit` in eine
+geschlossene Pipe, der Fehlerbehandler versucht dasselbe gleich noch einmal,
+und im Terminal steht ein doppelter `BrokenPipeError`-Traceback. stdout wird
+dabei auf `/dev/null` umgelegt, sonst meldet der Interpreter beim Beenden
+denselben Fehler ein drittes Mal — dann unabfangbar.
 
 Auf `password_required` bzw. `auth_required` erwartet der Sidecar das Passwort
 bzw. den 2FA-Code als eine Zeile auf stdin — nie über `argv`, denn
@@ -366,6 +374,13 @@ Kacheln überhaupt beobachtbar ist.
 Der Testmodus läuft unter eigener Application-ID (`…​.Fake`, `NON_UNIQUE`).
 Ohne das reicht GApplication die Aktivierung per D-Bus an eine bereits
 laufende Produktivinstanz weiter und der Testlauf beendet sich wortlos.
+
+Jedes neunte Fake-Asset ist ein `.MOV` mit `item_type: "movie"` — damit
+Video-Kennzeichen und Betrachter-Zweig überhaupt einen Fall bekommen. Die Datei
+dahinter ist ein PNG, der Abspieler zeigt für sie also seinen eigenen Fehler;
+das ist gewollt und kein Defekt. Aufnahme- und Hinzufügedatum fallen im Fake
+bewusst auseinander, sonst fiele eine Ansicht, die nach dem falschen der beiden
+sortiert, im Test nicht auf.
 
 ## Konventionen für Claude Code
 
