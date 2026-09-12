@@ -8,7 +8,7 @@ use rusqlite::{Connection, OptionalExtension, Row, params, params_from_iter};
 
 use crate::CacheError;
 
-const SCHEMA_VERSION: i32 = 5;
+const SCHEMA_VERSION: i32 = 7;
 
 /// Sortierschlüssel der Bibliothek: der Aufnahmezeitpunkt, ersatzweise das
 /// Hinzufügedatum.
@@ -69,6 +69,8 @@ impl Catalog {
                 width            INTEGER,
                 height           INTEGER,
                 item_type        TEXT,
+                lat              REAL,
+                lon              REAL,
                 thumb_path       TEXT,
                 thumb_bytes      INTEGER,
                 orig_path        TEXT,
@@ -98,9 +100,21 @@ impl Catalog {
                 baseline_done    INTEGER NOT NULL DEFAULT 0,
                 baseline_offset  INTEGER NOT NULL DEFAULT 0,
                 last_baseline_at TEXT,
-                last_sync_at     TEXT
+                last_sync_at     TEXT,
+                baseline_gap     INTEGER NOT NULL DEFAULT 0
             );
             INSERT OR IGNORE INTO sync_state (id) VALUES (1);
+
+            -- Aufgelöste Ortsnamen. iCloud liefert nur Koordinaten; der Name
+            -- kommt von einem Geocoding-Dienst und wird hier festgehalten,
+            -- damit dieselbe Stelle nie zweimal angefragt wird. Der Schlüssel
+            -- ist die gerundete Koordinate, nicht das Foto: an einem Ort
+            -- entstehen viele Aufnahmen.
+            CREATE TABLE IF NOT EXISTS places (
+                cell         TEXT PRIMARY KEY,
+                name         TEXT,
+                looked_up_at TEXT NOT NULL
+            );
             "#,
         )?;
         // Bestandskataloge nachziehen. `CREATE TABLE IF NOT EXISTS` oben legt
@@ -110,6 +124,9 @@ impl Catalog {
             self.add_column("photos", "master_id TEXT")?; // Schema 3
             self.add_column("photos", "item_type TEXT")?; // Schema 4
             self.add_column("sync_state", "last_sync_at TEXT")?; // Schema 5
+            self.add_column("photos", "lat REAL")?; // Schema 6
+            self.add_column("photos", "lon REAL")?; // Schema 6
+            self.add_column("sync_state", "baseline_gap INTEGER NOT NULL DEFAULT 0")?; // Schema 7
         }
 
         self.conn
@@ -328,14 +345,16 @@ impl Catalog {
 
     /// Der gespeicherte Sync-Zustand.
     pub fn sync_state(&self) -> Result<SyncState, CacheError> {
-        let (token, done, offset, baseline_at, sync_at): (
+        let (token, done, offset, baseline_at, sync_at, gap): (
             Option<String>,
             i64,
             i64,
             Option<String>,
             Option<String>,
+            i64,
         ) = self.conn.query_row(
-            "SELECT zone_sync_token, baseline_done, baseline_offset, last_baseline_at, last_sync_at
+            "SELECT zone_sync_token, baseline_done, baseline_offset, last_baseline_at,
+                    last_sync_at, baseline_gap
                FROM sync_state WHERE id = 1",
             [],
             |row| {
@@ -345,6 +364,7 @@ impl Catalog {
                     row.get(2)?,
                     row.get(3)?,
                     row.get(4)?,
+                    row.get(5)?,
                 ))
             },
         )?;
@@ -354,7 +374,55 @@ impl Catalog {
             baseline_offset: from_sql_bytes(offset),
             last_baseline_at: baseline_at.as_deref().map(decode_ts).transpose()?,
             last_sync_at: sync_at.as_deref().map(decode_ts).transpose()?,
+            baseline_gap: from_sql_bytes(gap),
         })
+    }
+
+    /// Der gemerkte Ortsname für eine Koordinate.
+    ///
+    /// Gibt `Some(None)` zurück, wenn die Stelle schon angefragt wurde und der
+    /// Dienst nichts wusste — dann lohnt keine zweite Anfrage. `None` heisst:
+    /// noch nie nachgesehen.
+    pub fn place(&self, cell: &str) -> Result<Option<Option<String>>, CacheError> {
+        let found: Option<Option<String>> = self
+            .conn
+            .query_row(
+                "SELECT name FROM places WHERE cell = ?1",
+                params![cell],
+                |row| row.get(0),
+            )
+            .optional()?;
+        Ok(found)
+    }
+
+    /// Hält einen aufgelösten Ortsnamen fest. `None` merkt sich, dass der
+    /// Dienst für diese Stelle nichts hergab.
+    pub fn remember_place(
+        &self,
+        cell: &str,
+        name: Option<&str>,
+        now: DateTime<Utc>,
+    ) -> Result<(), CacheError> {
+        self.conn.execute(
+            "INSERT INTO places (cell, name, looked_up_at) VALUES (?1, ?2, ?3)
+             ON CONFLICT(cell) DO UPDATE SET name = excluded.name,
+                                             looked_up_at = excluded.looked_up_at",
+            params![cell, name, encode_ts(now)],
+        )?;
+        Ok(())
+    }
+
+    /// Merkt, wie viele Assets nach einem vollständigen Durchlauf fehlen.
+    ///
+    /// iCloud zählt in `photos.all` Dinge mit, die nie als Asset ankommen.
+    /// Diese Lücke ist strukturell und kein Grund, den Katalog neu aufzubauen —
+    /// wohl aber jede Abweichung *darüber hinaus*.
+    pub fn set_baseline_gap(&self, gap: u64) -> Result<(), CacheError> {
+        self.conn.execute(
+            "UPDATE sync_state SET baseline_gap = ?1 WHERE id = 1",
+            params![to_sql_bytes(gap)],
+        )?;
+        Ok(())
     }
 
     /// Hält fest, wann zuletzt ein Abgleich durchlief — egal welcher Art.
@@ -494,6 +562,17 @@ pub struct SyncState {
     pub last_baseline_at: Option<DateTime<Utc>>,
     /// Wann zuletzt überhaupt ein Abgleich durchlief.
     pub last_sync_at: Option<DateTime<Utc>>,
+    /// Wie viele Assets nach dem letzten vollständigen Durchlauf fehlten.
+    pub baseline_gap: u64,
+}
+
+/// Der Schlüssel, unter dem ein Ortsname gemerkt wird.
+///
+/// Drei Nachkommastellen sind rund 110 Meter — fein genug, dass der Name noch
+/// stimmt, grob genug, dass eine Fotoserie an derselben Stelle nur eine
+/// einzige Anfrage kostet.
+pub fn place_cell(lat: f64, lon: f64) -> String {
+    format!("{lat:.3},{lon:.3}")
 }
 
 /// Ein Monat der Bibliothek und wo er im Raster beginnt.
@@ -521,8 +600,8 @@ pub struct CachedOriginal {
 /// Datensatz sie wirklich mitbringt: ein älterer Sidecar liefert sie nicht,
 /// und ein bereits bekannter Wert ist besser als keiner.
 const UPSERT_SQL: &str = r#"
-    INSERT INTO photos (id, master_id, filename, added_date, asset_date, checksum, width, height, item_type)
-    VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)
+    INSERT INTO photos (id, master_id, filename, added_date, asset_date, checksum, width, height, item_type, lat, lon)
+    VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)
     ON CONFLICT(id) DO UPDATE SET
         master_id  = COALESCE(excluded.master_id, photos.master_id),
         filename   = excluded.filename,
@@ -531,7 +610,9 @@ const UPSERT_SQL: &str = r#"
         checksum   = excluded.checksum,
         width      = excluded.width,
         height     = excluded.height,
-        item_type  = COALESCE(excluded.item_type, photos.item_type)
+        item_type  = COALESCE(excluded.item_type, photos.item_type),
+        lat        = COALESCE(excluded.lat, photos.lat),
+        lon        = COALESCE(excluded.lon, photos.lon)
 "#;
 
 fn upsert_params(record: &PhotoRecord) -> Vec<Box<dyn rusqlite::ToSql>> {
@@ -545,6 +626,8 @@ fn upsert_params(record: &PhotoRecord) -> Vec<Box<dyn rusqlite::ToSql>> {
         Box::new(record.width),
         Box::new(record.height),
         Box::new(record.item_type.clone()),
+        Box::new(record.lat),
+        Box::new(record.lon),
     ]
 }
 
@@ -591,6 +674,8 @@ fn build_photo(row: &Row<'_>) -> Result<Photo, CacheError> {
             width: row.get("width")?,
             height: row.get("height")?,
             item_type: row.get("item_type")?,
+            lat: row.get("lat")?,
+            lon: row.get("lon")?,
         },
         thumb_path: row
             .get::<_, Option<String>>("thumb_path")?
@@ -623,6 +708,8 @@ mod tests {
             checksum: None,
             width: Some(4032),
             height: Some(3024),
+            lat: None,
+            lon: None,
             item_type: None,
         }
     }
@@ -793,6 +880,39 @@ mod tests {
                     .starts_with(&group.month)
             );
         }
+    }
+
+    #[test]
+    fn a_place_is_looked_up_once_even_when_it_has_no_name() {
+        let catalog = Catalog::open_in_memory().unwrap();
+        let cell = place_cell(48.1372, 11.5756);
+        assert_eq!(cell, "48.137,11.576");
+
+        // Noch nie nachgesehen.
+        assert_eq!(catalog.place(&cell).unwrap(), None);
+
+        catalog
+            .remember_place(&cell, Some("Marienplatz, München"), Utc::now())
+            .unwrap();
+        assert_eq!(
+            catalog.place(&cell).unwrap(),
+            Some(Some("Marienplatz, München".to_string()))
+        );
+
+        // Mitten im Meer weiss auch der Dienst nichts. Das gemerkte "nichts"
+        // unterscheidet sich von "noch nicht gefragt" — sonst liefe jede
+        // Anzeige erneut ins Netz.
+        let empty = place_cell(0.5, -30.0);
+        catalog.remember_place(&empty, None, Utc::now()).unwrap();
+        assert_eq!(catalog.place(&empty).unwrap(), Some(None));
+    }
+
+    #[test]
+    fn nearby_photos_share_one_place_lookup() {
+        // 20 Meter auseinander: dieselbe Zelle, also eine Anfrage statt zwei.
+        assert_eq!(place_cell(48.1372, 11.5756), place_cell(48.1374, 11.5757));
+        // Ein Kilometer weiter ist es eine andere.
+        assert_ne!(place_cell(48.1372, 11.5756), place_cell(48.1472, 11.5756));
     }
 
     #[test]

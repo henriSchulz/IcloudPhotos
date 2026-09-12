@@ -6,7 +6,7 @@ Das Protokoll ist zeilenweises JSON; jede Zeile hat ein Feld ``type``:
     {"type": "password_required", "username": "..."}  -> erwartet Passwort auf stdin
     {"type": "auth_required", "method": "2fa"}   -> erwartet Code auf stdin
     {"type": "auth_ok", "trusted": true}
-    {"type": "photo", "id": ..., "filename": ...}
+    {"type": "photo", "id": ..., "filename": ..., "lat": 48.137, "lon": 11.575}
     {"type": "cursor", "token": "..."}          Zone-Token vor dem Durchlauf
     {"type": "unchanged"}                       nichts zu tun (Token unveraendert)
     {"type": "thumb", "id": ..., "path": "...", "bytes": 34567}
@@ -213,6 +213,39 @@ def authenticate(username: str, cookie_dir: str | None):
 # --------------------------------------------------------------------------
 
 
+# pyicloud liest den Aufnahmeort, haengt ihn aber nicht an `PhotoAsset`: er
+# steckt als plist im Feld `locationEnc` des Asset-Records. Der Zugriff geht
+# deshalb ueber eine nicht-oeffentliche Funktion — faellt sie weg, gibt es eben
+# keine Koordinaten. Der Import passiert beim ersten Bedarf, damit `--fake`
+# weiterhin ohne pyicloud auskommt.
+_LOCATION_READER: Any = None
+
+
+def location_reader() -> Any:
+    global _LOCATION_READER
+    if _LOCATION_READER is None:
+        try:
+            from pyicloud.services.photos_cloudkit.materialize import _extract_location
+
+            _LOCATION_READER = _extract_location
+        except Exception as exc:  # noqa: BLE001 - private API, Ausfall ist vorgesehen
+            log(f"Ortsdaten nicht lesbar: {type(exc).__name__}: {exc}")
+            _LOCATION_READER = False
+    return _LOCATION_READER or None
+
+
+def coordinates_of(asset: Any) -> tuple[float | None, float | None]:
+    """Aufnahmeort als Breiten- und Laengengrad, sofern hinterlegt."""
+    reader = location_reader()
+    if reader is None:
+        return None, None
+    try:
+        location = reader(asset.asset_record)
+    except Exception:  # noqa: BLE001 - fremde API
+        return None, None
+    return location.get("latitude"), location.get("longitude")
+
+
 def record_for(asset: Any) -> dict[str, Any]:
     """Baut den NDJSON-Datensatz fuer ein Asset."""
     width, height = asset.dimensions
@@ -240,6 +273,8 @@ def record_for(asset: Any) -> dict[str, Any]:
     except Exception:  # noqa: BLE001 - optionales Feld
         item_type = None
 
+    lat, lon = coordinates_of(asset)
+
     return {
         "type": "photo",
         "id": asset.id,
@@ -251,6 +286,8 @@ def record_for(asset: Any) -> dict[str, Any]:
         "width": width,
         "height": height,
         "item_type": item_type,
+        "lat": lat,
+        "lon": lon,
     }
 
 
@@ -854,6 +891,9 @@ def fake_record(index: int) -> dict[str, Any]:
     # Jedes neunte Asset ist ein Video — damit Kachel-Badge und Viewer-Zweig
     # ueberhaupt einen Fall bekommen.
     movie = index % 9 == 8
+    # Jedes dritte Asset bekommt einen Ort, der Rest keinen — beide Faelle
+    # kommen in einer echten Bibliothek vor.
+    located = index % 3 == 0
     return {
         "type": "photo",
         "id": f"fake-{index:05d}",
@@ -864,6 +904,10 @@ def fake_record(index: int) -> dict[str, Any]:
         "width": 4032,
         "height": 3024,
         "item_type": "movie" if movie else "image",
+        # Streut um den Marienplatz, damit mehrere Fotos dieselbe Zelle teilen
+        # und der Ortscache etwas zu tun bekommt.
+        "lat": round(48.137 + (index % 7) * 0.002, 6) if located else None,
+        "lon": round(11.575 + (index % 5) * 0.002, 6) if located else None,
     }
 
 
@@ -888,6 +932,7 @@ def run_fake(
     offset: int,
     limit: int | None,
     delay_ms: int,
+    missing: int = 0,
 ) -> int:
     """Erzeugt synthetische Datensaetze ohne iCloud-Zugriff.
 
@@ -934,7 +979,10 @@ def run_fake(
         return EXIT_OK
 
     # Schicht 3: vollstaendiger Durchlauf ab offset.
-    emit({"type": "library_count", "value": count})
+    # `missing` meldet mehr Assets, als geliefert werden — so verhaelt sich die
+    # echte Bibliothek, in der ein Teil der gezaehlten Records nie als Asset
+    # ankommt. Die App darf daraus keine Endlosschleife machen.
+    emit({"type": "library_count", "value": count + missing})
     newest = None
     emitted = 0
     truncated = False
@@ -998,6 +1046,13 @@ def main(argv: list[str] | None = None) -> int:
         help="Vorschaubilder in dieses Verzeichnis laden",
     )
     parser.add_argument(
+        "--fake-missing",
+        type=int,
+        default=0,
+        metavar="N",
+        help="Im Fake-Modus N Assets mehr zaehlen als liefern (Bestandsluecke)",
+    )
+    parser.add_argument(
         "--fake-delay-ms",
         type=int,
         default=0,
@@ -1046,6 +1101,7 @@ def main(argv: list[str] | None = None) -> int:
             args.offset,
             args.limit,
             args.fake_delay_ms,
+            args.fake_missing,
         )
 
     if not args.username:

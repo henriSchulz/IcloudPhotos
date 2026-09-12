@@ -11,6 +11,7 @@ use std::path::PathBuf;
 
 use crate::downloader::{self, DownloadMessage, Downloader};
 use crate::export;
+use crate::geocode::{self, Geocoder};
 use crate::photo_object::PhotoObject;
 use crate::progress::{SyncBanner, thousands};
 use crate::sync_task::{self, SyncMessage};
@@ -109,6 +110,8 @@ pub struct AppState {
     last_seen_count: Cell<u64>,
     /// Laeuft im Hintergrund und holt Originale auf Abruf.
     downloader: RefCell<Option<Downloader>>,
+    /// Loest Koordinaten in Ortsnamen auf — erst, wenn ein Foto offen ist.
+    geocoder: RefCell<Option<Geocoder>>,
     /// Der offene Betrachter, damit ein eintreffendes Original dorthin findet.
     viewer: RefCell<Option<Rc<Viewer>>>,
     /// Die beiden Fensterebenen — Bibliothek und Betrachter.
@@ -163,6 +166,7 @@ impl AppState {
             expected_total: Cell::new(0),
             last_seen_count: Cell::new(0),
             downloader: RefCell::new(None),
+            geocoder: RefCell::new(None),
             viewer: RefCell::new(None),
             screens: RefCell::new(None),
             grid: RefCell::new(None),
@@ -266,6 +270,24 @@ impl AppState {
     pub fn prefetch_original(&self, id: &str) {
         if let Some(downloader) = self.downloader.borrow().as_ref() {
             downloader.prefetch(id);
+        }
+    }
+
+    /// Der schon bekannte Ortsname zu einer Koordinate, falls einer im
+    /// Katalog liegt.
+    pub fn known_place(&self, lat: f64, lon: f64) -> Option<String> {
+        self.catalog
+            .borrow()
+            .place(&icloud_photos_cache::place_cell(lat, lon))
+            .ok()
+            .flatten()
+            .flatten()
+    }
+
+    /// Lässt einen Ortsnamen nachschlagen.
+    pub fn request_place(&self, id: &str, lat: f64, lon: f64) {
+        if let Some(geocoder) = self.geocoder.borrow().as_ref() {
+            geocoder.request(id, lat, lon);
         }
     }
 
@@ -595,6 +617,7 @@ pub fn build(app: &adw::Application, state: Rc<AppState>) {
 
     install_skeleton_css();
     start_downloader(&state, &status, &stack, &window, &toasts);
+    start_geocoder(&state);
 
     // Waehrend eines Syncs laufend nachziehen, statt erst am Ende umzuschalten.
     glib::timeout_add_local(LIVE_REFRESH, {
@@ -812,6 +835,23 @@ fn build_login_page(state: &Rc<AppState>, trigger: Rc<dyn Fn()>) -> gtk::Widget 
     });
 
     page.upcast()
+}
+
+/// Startet den Geocoder und trägt eintreffende Ortsnamen in den Betrachter ein.
+fn start_geocoder(state: &Rc<AppState>) {
+    let db_path = state.config.borrow().paths.db_path.clone();
+    let (geocoder, mut answers) = geocode::spawn(db_path);
+    *state.geocoder.borrow_mut() = Some(geocoder);
+
+    let state = state.clone();
+    glib::spawn_future_local(async move {
+        while let Some(resolved) = answers.recv().await {
+            let viewer = state.viewer.borrow().clone();
+            if let Some(viewer) = viewer {
+                viewer.deliver_place(&resolved.id, resolved.place.as_deref());
+            }
+        }
+    });
 }
 
 /// Startet den Download-Thread und verarbeitet seine Meldungen in der UI.

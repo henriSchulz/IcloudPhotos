@@ -40,6 +40,8 @@ mod imp {
         /// Platzhalter fuer ein noch nicht synchronisiertes Foto.
         pub is_placeholder: RefCell<bool>,
         pub is_video: RefCell<bool>,
+        /// Aufnahmeort, sofern das Foto einen hat.
+        pub coordinates: RefCell<Option<(f64, f64)>>,
         /// Aufnahmemonat als Beschriftung, z.B. "Juli 2024" — die Ansicht
         /// zeigt ihn als mitlaufende Datumszeile ueber dem Raster.
         pub month_label: RefCell<String>,
@@ -76,6 +78,7 @@ impl PhotoObject {
             .map(|p| p.to_string_lossy().into_owned());
         *imp.is_orig_cached.borrow_mut() = photo.is_orig_cached;
         *imp.is_video.borrow_mut() = photo.record.is_video();
+        *imp.coordinates.borrow_mut() = photo.record.coordinates();
 
         // Gezeigt wird Ortszeit: der Katalog haelt UTC, aber "aufgenommen am"
         // meint die Uhr, die beim Auslösen danebenstand.
@@ -123,6 +126,11 @@ impl PhotoObject {
 
     pub fn is_video(&self) -> bool {
         *self.imp().is_video.borrow()
+    }
+
+    /// Breiten- und Längengrad der Aufnahme, sofern hinterlegt.
+    pub fn coordinates(&self) -> Option<(f64, f64)> {
+        *self.imp().coordinates.borrow()
     }
 
     pub fn month_label(&self) -> String {

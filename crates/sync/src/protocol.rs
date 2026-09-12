@@ -5,7 +5,7 @@ use icloud_photos_core::model::PhotoRecord;
 use serde::Deserialize;
 
 /// Eine Zeile, die der Sidecar auf stdout schreibt.
-#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum SidecarMessage {
     /// Der Sidecar hat kein Passwort im Keyring und wartet auf eines auf stdin.

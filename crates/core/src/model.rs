@@ -9,7 +9,7 @@ use serde::{Deserialize, Serialize};
 ///
 /// Enthält bewusst keine Cache-Felder — die gehören dem lokalen Katalog und
 /// werden von einem Sync nie überschrieben.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct PhotoRecord {
     pub id: String,
     /// Name des CPLMaster-Records. Spart beim Full-Res-Download einen Lookup.
@@ -28,6 +28,13 @@ pub struct PhotoRecord {
     pub width: Option<u32>,
     #[serde(default)]
     pub height: Option<u32>,
+    /// Aufnahmeort, sofern das Foto einen hat. iCloud liefert nur
+    /// Koordinaten, keinen Ortsnamen — den löst die App nach und legt ihn im
+    /// Katalog ab.
+    #[serde(default)]
+    pub lat: Option<f64>,
+    #[serde(default)]
+    pub lon: Option<f64>,
     /// Was iCloud als Medientyp meldet — `"image"` oder `"movie"`.
     ///
     /// Fehlt bei Katalogzeilen aus der Zeit vor Schema 4; für die springt
@@ -68,6 +75,16 @@ impl PhotoRecord {
         self.kind() == MediaKind::Video
     }
 
+    /// Der Aufnahmeort, sofern beide Koordinaten da sind.
+    pub fn coordinates(&self) -> Option<(f64, f64)> {
+        match (self.lat, self.lon) {
+            // Genau (0, 0) liegt im Golf von Guinea: in einer Foto-Bibliothek
+            // ist das immer ein leeres Feld, kein Aufnahmeort.
+            (Some(lat), Some(lon)) if lat != 0.0 || lon != 0.0 => Some((lat, lon)),
+            _ => None,
+        }
+    }
+
     /// Der Zeitpunkt, nach dem die Bibliothek geordnet wird.
     ///
     /// Der Aufnahmezeitpunkt, so wie es auch macOS Photos hält — wann ein Foto
@@ -85,7 +102,7 @@ fn extension(filename: &str) -> Option<String> {
 }
 
 /// Eine vollständige Zeile der Tabelle `photos`.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct Photo {
     pub record: PhotoRecord,
     pub thumb_path: Option<PathBuf>,
@@ -149,6 +166,8 @@ mod tests {
             checksum: None,
             width: None,
             height: None,
+            lat: None,
+            lon: None,
             item_type: item_type.map(str::to_string),
         }
     }
@@ -171,6 +190,23 @@ mod tests {
         assert!(!record("ohne-endung", None).is_video());
         // Kommt in echten Bibliotheken vor: doppelte Endung.
         assert!(record("IMG_0004.MP4.MOV", None).is_video());
+    }
+
+    #[test]
+    fn coordinates_need_both_halves_and_ignore_the_null_island() {
+        let mut rec = record("x.HEIC", None);
+        assert_eq!(rec.coordinates(), None);
+
+        rec.lat = Some(48.137);
+        assert_eq!(rec.coordinates(), None, "halbe Angabe ist keine");
+
+        rec.lon = Some(11.575);
+        assert_eq!(rec.coordinates(), Some((48.137, 11.575)));
+
+        // Genau (0, 0) ist ein leeres Feld, kein Ort im Golf von Guinea.
+        rec.lat = Some(0.0);
+        rec.lon = Some(0.0);
+        assert_eq!(rec.coordinates(), None);
     }
 
     #[test]

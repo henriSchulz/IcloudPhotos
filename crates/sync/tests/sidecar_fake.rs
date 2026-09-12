@@ -50,6 +50,38 @@ fn options(python: &str, fake: u64) -> SidecarOptions {
 }
 
 #[tokio::test]
+async fn a_permanent_gap_does_not_restart_the_baseline_forever() {
+    let python = python_or_skip!();
+    let mut catalog = Catalog::open_in_memory().unwrap();
+
+    // Die Bibliothek meldet 12 Assets, liefert aber nur 10 — so verhalten sich
+    // echte Bibliotheken, in denen ein Teil der gezaehlten Records nie als
+    // Asset ankommt.
+    let mut with_gap = options(&python, 10);
+    with_gap.fake_missing = 2;
+
+    let summary = run_sync(&mut catalog, &with_gap, &Prompts::default())
+        .await
+        .unwrap();
+    assert!(summary.baseline_complete);
+    assert_eq!(catalog.count().unwrap(), 10);
+
+    // Der Durchlauf ist fertig und muss fertig bleiben. Setzte die Luecke den
+    // Merker zurueck, finge der naechste Lauf wieder von vorn an — und der
+    // uebernaechste auch, endlos. Genau das lief an einer Bibliothek mit
+    // 19.646 Assets: sie kam nie aus dem Vollabgleich heraus.
+    let state = catalog.sync_state().unwrap();
+    assert!(
+        state.baseline_done,
+        "nach einem vollstaendigen Durchlauf darf eine strukturelle Luecke ihn nicht entwerten"
+    );
+    assert!(state.last_baseline_at.is_some());
+
+    // Und der Token gilt, damit der naechste Lauf ein Delta zieht statt alles.
+    assert!(state.zone_token.is_some());
+}
+
+#[tokio::test]
 async fn stores_all_records_from_fake_run() {
     let python = python_or_skip!();
     let mut catalog = Catalog::open_in_memory().unwrap();

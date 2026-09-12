@@ -247,8 +247,9 @@ CloudKit-**syncToken** der Foto-Zone:
 | 3. Vollständiger Durchlauf | Erstaufbau, abgelehnter Token, 24-h-Abgleich | ~170 Seitenabrufe, einmalig |
 
 Zustand liegt in `sync_state` (einzeilig): `zone_sync_token`, `baseline_done`,
-`baseline_offset`, `last_baseline_at` und `last_sync_at` — letzteres für die
-Anzeige „zuletzt aktualisiert", die jeden Lauf zählt, nicht nur vollständige.
+`baseline_offset`, `last_baseline_at`, `last_sync_at` — letzteres für die
+Anzeige „zuletzt aktualisiert", die jeden Lauf zählt, nicht nur vollständige —
+und `baseline_gap`, die hingenommene Bestandslücke.
 
 **Zwei Regeln, an denen die Korrektheit hängt:**
 
@@ -262,9 +263,25 @@ Anzeige „zuletzt aktualisiert", die jeden Lauf zählt, nicht nur vollständige
 Ein durch `--limit` abgeschnittener Durchlauf meldet deshalb bewusst kein
 `baseline_complete`, sondern nur seinen `offset`.
 
-Alle 24 Stunden läuft trotzdem ein vollständiger Abgleich (`RECONCILE_AFTER`)
-— Sicherheitsnetz gegen langsames Abdriften durch Records, die sich keinem
-Asset zuordnen lassen.
+Einmal pro Woche läuft trotzdem ein vollständiger Abgleich (`RECONCILE_AFTER`)
+— Sicherheitsnetz gegen langsames Abdriften. Öfter lohnt nicht: bei 19.646
+Assets sind das rund 170 Seitenabrufe, während der laufende Abgleich über den
+Token bei unveränderter Bibliothek einen einzigen Request kostet.
+
+### Die Bestandslücke
+
+`photos.all` zählt Dinge mit, die nie als Asset ankommen — an einer echten
+Bibliothek mit 19.646 gezählten Assets fehlten dauerhaft 77. Daraus wurde eine
+Schleife: Durchlauf fertig → Zahlen passen nicht → Erstaufbau-Merker zurück →
+nächster Lauf fängt von vorn an. Bei **jeder** Synchronisation, für immer; für
+zehn neue Fotos lief die App durch die ganze Bibliothek.
+
+Gemerkt wird deshalb in `sync_state.baseline_gap` (Schema 7), wie groß die
+Lücke nach einem vollständigen Durchlauf war. Was danach *darüber hinaus*
+fehlt, ist eine verpasste Änderung und erzwingt einen neuen Durchlauf — die
+bekannte Lücke selbst nicht mehr. Nur ein Delta-Lauf darf das auslösen: ein
+abgeschnittener Durchlauf hat schlicht noch nicht alles gesehen und verwürfe
+sonst seinen eigenen Fortschritt.
 
 ## Full-Res-Download: warum nicht `PhotoAlbum.get`
 

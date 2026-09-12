@@ -128,6 +128,8 @@ mod tests {
                     checksum: None,
                     width: None,
                     height: None,
+                    lat: None,
+                    lon: None,
                     item_type: None,
                 })
                 .unwrap();

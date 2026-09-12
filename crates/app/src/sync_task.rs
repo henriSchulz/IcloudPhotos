@@ -10,7 +10,7 @@ use chrono::Utc;
 use icloud_photos_cache::Catalog;
 use icloud_photos_core::Config;
 use icloud_photos_sync::{
-    Prompts, SecretRequest, SidecarOptions, SyncEvent, SyncSummary, run_sync,
+    Prompts, RECONCILE_AFTER, SecretRequest, SidecarOptions, SyncEvent, SyncSummary, run_sync,
 };
 use tokio::sync::mpsc;
 
@@ -236,13 +236,6 @@ pub fn spawn(
 /// Hoechstens so viele Vorschauen pro Lauf nachladen, damit ein erster Sync
 /// einer grossen Bibliothek nicht endlos blockiert.
 const BACKFILL_LIMIT: u64 = 500;
-
-/// Auch bei unveraendertem Token gelegentlich vollstaendig abgleichen.
-///
-/// Der Delta-Weg kann Records enthalten, die sich keinem Asset zuordnen
-/// lassen; ohne diesen Abgleich koennte der Katalog langsam abdriften, ohne
-/// dass es jemand merkt.
-const RECONCILE_AFTER: chrono::TimeDelta = chrono::TimeDelta::hours(24);
 
 /// Uebersetzt den gespeicherten Zustand in Sidecar-Schalter.
 ///

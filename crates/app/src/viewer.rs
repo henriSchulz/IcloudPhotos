@@ -245,6 +245,17 @@ impl Viewer {
         }
     }
 
+    /// Ein Ortsname ist eingetroffen.
+    ///
+    /// Kommt er verspätet — die Anfrage geht über das Netz —, hat der Betrachter
+    /// womöglich längst ein anderes Foto. Dann gehört der Name nicht hierher.
+    pub fn deliver_place(&self, id: &str, place: Option<&str>) {
+        let (Some(place), true) = (place, self.wants(id)) else {
+            return;
+        };
+        self.title.set_title(place);
+    }
+
     /// Sucht das gerade gezeigte Foto im Modell wieder.
     ///
     /// Während eines Syncs wird das Modell neu bestückt; ohne dieses Nachziehen
@@ -343,7 +354,19 @@ impl Viewer {
             return;
         }
 
-        self.title.set_title(&photo.filename());
+        // Der Ort sagt mehr über ein Foto als sein Dateiname. Er kommt aber
+        // erst aus dem Netz, deshalb steht bis dahin der Dateiname da.
+        let place = photo
+            .coordinates()
+            .and_then(|(lat, lon)| self.state.known_place(lat, lon));
+        self.title
+            .set_title(place.as_deref().unwrap_or(&photo.filename()));
+        if place.is_none()
+            && let Some((lat, lon)) = photo.coordinates()
+        {
+            self.state.request_place(&photo.id(), lat, lon);
+        }
+
         let kind = if photo.is_video() { "Video · " } else { "" };
         self.title
             .set_subtitle(&format!("{kind}{}", photo.captured_label()));

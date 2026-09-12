@@ -16,6 +16,14 @@ use crate::protocol::{SidecarMessage, SyncEvent};
 /// So viele Datensätze werden gesammelt, bevor eine Transaktion geschrieben wird.
 const BATCH_SIZE: usize = 256;
 
+/// So lange gilt ein vollstaendiger Durchlauf als frisch.
+///
+/// Der laufende Abgleich geht ueber den Zone-Token und kostet bei
+/// unveraenderter Bibliothek einen Request. Der vollstaendige Durchlauf ist nur
+/// das Sicherheitsnetz gegen langsames Abdriften — bei 19.646 Assets sind das
+/// rund 170 Seitenabrufe, das gehoert nicht in den Tagesrhythmus.
+pub const RECONCILE_AFTER: chrono::TimeDelta = chrono::TimeDelta::days(7);
+
 /// Wie der Sidecar gestartet wird.
 #[derive(Debug, Clone)]
 pub struct SidecarOptions {
@@ -49,6 +57,9 @@ pub struct SidecarOptions {
     pub fake_password: bool,
     /// Testmodus: je Asset so lange warten, damit das Einlaufen sichtbar wird.
     pub fake_delay_ms: u64,
+    /// Testmodus: so viele Assets mehr zaehlen als liefern. Stellt die
+    /// Bestandsluecke nach, die es in echten Bibliotheken gibt.
+    pub fake_missing: u64,
 }
 
 impl SidecarOptions {
@@ -73,6 +84,7 @@ impl SidecarOptions {
             fake_two_factor: false,
             fake_password: false,
             fake_delay_ms: 0,
+            fake_missing: 0,
         }
     }
 
@@ -115,6 +127,10 @@ impl SidecarOptions {
             if self.fake_delay_ms > 0 {
                 args.push("--fake-delay-ms".into());
                 args.push(self.fake_delay_ms.to_string());
+            }
+            if self.fake_missing > 0 {
+                args.push("--fake-missing".into());
+                args.push(self.fake_missing.to_string());
             }
             return args;
         }
@@ -483,19 +499,52 @@ pub async fn run_sync(
         catalog.set_baseline_progress(0, true, Utc::now())?;
     }
 
-    // Bestandsabgleich: weicht der lokale Stand nach einem Delta-Lauf vom
-    // gemeldeten Bestand ab, wurde eine Aenderung verpasst. Dann den
-    // Erstaufbau-Merker zuruecksetzen, damit der naechste Lauf vollstaendig
-    // durchgeht — statt still weiter auseinanderzudriften.
+    // Bestandsabgleich. `photos.all` zaehlt Dinge mit, die nie als Asset
+    // ankommen — an einer Bibliothek mit 19.646 gezaehlten Assets fehlten
+    // dauerhaft 77. Diese Luecke ist strukturell; ein erneuter Durchlauf
+    // findet sie auch nicht.
+    //
+    // Frueher loeste jede Abweichung einen neuen Vollabgleich aus. Das ergab
+    // eine Schleife: Durchlauf fertig -> Zahlen passen nicht -> Merker zurueck
+    // -> naechster Lauf faengt von vorn an, und das bei jeder Synchronisation.
+    // Fuer zehn neue Fotos lief die App durch die ganze Bibliothek.
+    //
+    // Gemerkt wird deshalb, wie gross die Luecke nach einem vollstaendigen
+    // Durchlauf war. Nur was darueber hinausgeht, ist eine verpasste Aenderung
+    // — und nur die erzwingt einen neuen Durchlauf.
     if let Some(expected) = summary.library_count {
         let local = catalog.count()?;
-        if local != expected {
-            tracing::warn!(
-                local,
-                expected,
-                "Bestand weicht ab — naechster Lauf gleicht vollstaendig ab"
-            );
-            catalog.set_baseline_progress(0, false, Utc::now())?;
+        // Mehr lokal als gemeldet heisst: hier stehen noch Fotos, die in
+        // iCloud geloescht wurden. Die raeumt der Delta-Lauf ueber Tombstones
+        // weg, kein Vollabgleich.
+        let gap = expected.saturating_sub(local);
+
+        if summary.baseline_complete {
+            if gap > 0 {
+                tracing::info!(
+                    local,
+                    expected,
+                    gap,
+                    "Bestandsluecke nach vollstaendigem Durchlauf — wird als strukturell vermerkt"
+                );
+            }
+            catalog.set_baseline_gap(gap)?;
+        } else if options.since_token.is_some() {
+            // Nur ein Delta-Lauf kann eine Aenderung verpasst haben. Ein
+            // abgeschnittener Durchlauf hat schlicht noch nicht alles gesehen —
+            // wuerde er hier zuruecksetzen, verwuerfe er seinen eigenen
+            // Fortschritt.
+            let known = catalog.sync_state()?.baseline_gap;
+            if gap > known {
+                tracing::warn!(
+                    local,
+                    expected,
+                    gap,
+                    known,
+                    "Bestand weicht staerker ab als bekannt — naechster Lauf gleicht vollstaendig ab"
+                );
+                catalog.set_baseline_progress(0, false, Utc::now())?;
+            }
         }
     }
 

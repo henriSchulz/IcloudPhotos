@@ -39,6 +39,8 @@ pub fn seed(catalog: &Catalog, config: &Config) -> anyhow::Result<()> {
             checksum: None,
             width: Some(ORIGINAL_PX as u32),
             height: Some(ORIGINAL_PX as u32),
+            lat: None,
+            lon: None,
             item_type: Some("image".into()),
         })?;
 

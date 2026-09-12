@@ -7,7 +7,7 @@ pub mod sidecar;
 
 pub use protocol::{SidecarMessage, SyncEvent};
 pub use session::{Original, SidecarSession};
-pub use sidecar::{Prompts, SecretRequest, SidecarOptions, SyncSummary, run_sync};
+pub use sidecar::{Prompts, RECONCILE_AFTER, SecretRequest, SidecarOptions, SyncSummary, run_sync};
 
 /// Fehler eines Sync-Laufs.
 #[derive(Debug, thiserror::Error)]

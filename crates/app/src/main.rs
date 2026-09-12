@@ -3,6 +3,7 @@
 mod demo;
 mod downloader;
 mod export;
+mod geocode;
 mod photo_object;
 mod progress;
 mod sync_task;
