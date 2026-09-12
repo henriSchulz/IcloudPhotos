@@ -2,8 +2,10 @@
 
 mod demo;
 mod downloader;
+mod export;
 mod photo_object;
 mod sync_task;
+mod viewer;
 mod window;
 
 use std::rc::Rc;

@@ -171,7 +171,7 @@ icloud-photos/
 ├── config.example.toml        # Vorlage für ~/.config/icloud-photos/config.toml
 ├── crates/
 │   ├── core/                  # Config, Foto-Modell — von allen anderen genutzt
-│   ├── app/                   # GTK4-UI, Grid-View, Viewer
+│   ├── app/                   # GTK4-UI: window (Raster), viewer, export
 │   ├── sync/                  # Sync-Orchestrator, spawnt Sidecar, füllt SQLite
 │   └── cache/                 # Katalog (SQLite), LRU-Eviction, Housekeeping
 ├── sidecar/
@@ -295,6 +295,79 @@ Ein abgebrochener Sync wird vom nächsten Lauf vervollständigt:
 - Ein abgebrochener Erstaufbau setzt bei `baseline_offset` fort, statt von
   vorn zu paginieren. Der Fortschritt wird alle 50 Assets festgehalten.
 
+## Bedienung (Phase 2)
+
+**Betrachter** (`crates/app/src/viewer.rs`) — keine eigene Fensterebene,
+sondern eine **Seite desselben Fensters**: ein geöffnetes Foto füllt das
+Fenster, das Raster tritt dahinter zurück. Ein zweites Fenster wäre unter
+Hyprland fehl am Platz — es landete als eigene Kachel neben der App statt über
+ihr. Die Seite kennt ihre Position im Raster, nicht das einzelne Foto; nur so
+lässt sich blättern, ohne zwischendurch ins Raster zurückzumüssen.
+
+Drei Fallen dieser Bauweise:
+
+- Die Seite wird beim Schließen wieder **ausgehängt** und beim nächsten Öffnen
+  neu gebaut. Bleibt sie stehen, meldet GTK „duplicate child name in GtkStack"
+  und zeigt beim zweiten Öffnen die alte Seite. `open` entfernt deshalb
+  zusätzlich eine etwaige Restseite, bevor es die neue einhängt — der Stack
+  gibt die alte während einer laufenden Blende nicht immer sofort los.
+- Die **Tastatursteuerung hängt am Fenster**, nicht an der Seite: solange der
+  Fokus im Raster steht, bekäme die Seite sonst keine Taste. Sie läuft in der
+  Erfassungsphase und gibt jede Taste weiter, solange der Betrachter nicht die
+  sichtbare Seite ist. Beim Schließen wird sie wieder abgenommen, sonst sammelt
+  das Fenster mit jedem geöffneten Foto eine weitere an.
+- Zurück im Raster wird auf die Position des zuletzt gezeigten Fotos gescrollt
+  (`AppState::return_to_grid`) — sonst steht man nach dem Schließen irgendwo.
+
+| Taste | Wirkung |
+|---|---|
+| ← → ↑ ↓ | ein Foto zurück/vor |
+| Bild ↑/↓ | zehn Fotos |
+| Pos1 / Ende | erstes / letztes Foto |
+| `+` `−` / Mausrad | zoomen, am Zeiger statt an der Bildmitte |
+| `0` / `1` | einpassen / 1:1 |
+| Doppelklick | zwischen beiden wechseln |
+| Ziehen | Ausschnitt verschieben (nur gezoomt) |
+| `F` / F11 | Vollbild |
+| Esc | Vollbild verlassen, sonst zurück zur Übersicht |
+
+Solange das Original noch lädt, zeigt der Betrachter die Vorschau hochskaliert
+— eine unscharfe Fläche ist besser als eine leere. Videos (`item_type ==
+"movie"` bzw. Videoendung) laufen über `GtkVideo`; GTK 4.22 bringt den
+GStreamer-Rückfall als `GtkGstMediaFileBuiltin` mit, ein Media-Modul muss nicht
+installiert sein. Beim Blättern wird das Video angehalten, sonst spielte es im
+Hintergrund weiter.
+
+**Raster** — Die Kachel ist nur das Bild: **kein Dateiname darunter**. Er sagt
+über ein Foto nichts, was man nicht sieht, kostet aber in jeder Reihe eine
+Zeile Höhe; wer ihn braucht, findet ihn im Tooltip und im Betrachter. Dazu
+Mehrfachauswahl (`GtkMultiSelection`), das Video-Kennzeichen als Overlay auf
+der Kachel (nicht daneben, sonst verschöbe es das Raster) und eine mitlaufende
+Datumszeile über dem Raster. `GtkGridView` kennt keine
+Abschnittsköpfe — nur `GtkListView` hat eine `header_factory`. Die Datumszeile
+liest deshalb den Monat der obersten sichtbaren Kachel ab, die ihn in ihrem
+Widget-Namen trägt; die Virtualisierung bleibt unangetastet. Findet sie nichts
+(direkt nach einem Sprung sind die Kacheln am Ziel noch nicht zugeteilt),
+bleibt die letzte Angabe stehen, statt zu verschwinden.
+
+**Aktionen** (`crates/app/src/export.rs`) — Sichern, Kopieren und Öffnen
+brauchen alle dasselbe: die Originale der Auswahl. Die liegen aber nur im
+Cache, wenn sie schon einmal geöffnet wurden. Jede Aktion ist deshalb ein
+`Job`, der auf eintreffende Downloads wartet und erst am Ende ausgeführt wird.
+Dateinamen aus iCloud sind nicht eindeutig (`IMG_0001.HEIC` gibt es mehrfach),
+deshalb weicht `save_into` auf `IMG_0001-1.HEIC` aus, statt zu überschreiben.
+
+| Kürzel | Wirkung |
+|---|---|
+| Strg+A | alles auswählen |
+| Strg+S | Auswahl in ein Verzeichnis sichern |
+| Strg+C | Auswahl als Dateiliste in die Zwischenablage |
+| Strg+O | mit der Standardanwendung öffnen (nur bei genau einem Foto) |
+| Strg+J | Monatsliste zum Springen |
+
+Strg+J gibt es, weil `GtkGridView` die Tabulatortaste für seine Kacheln behält
+— die Kopfzeile ist von der Auswahl aus sonst gar nicht erreichbar.
+
 ## Offene Punkte / TODO
 
 - [x] **Anmeldung in der App**, kein Terminal nötig: Beim ersten Start zeigt die
@@ -332,10 +405,25 @@ Ein abgebrochener Sync wird vom nächsten Lauf vervollständigt:
 - [x] **Inkrementeller Sync über den CloudKit-Zone-Token** (siehe eigener
       Abschnitt). Löst auch Löschungen, die über `added_date` prinzipiell
       unsichtbar sind.
+- [x] **Betrachter, Raster und Aktionen aus Phase 2** — siehe „Bedienung".
+      Sortierung nach Aufnahmedatum (Schema 4), Blättern/Zoom/Vollbild,
+      Videowiedergabe, Mehrfachauswahl, Sichern/Kopieren/Öffnen.
 - [ ] `change_unresolved` beobachten: welche `record_type`-Werte in der Zone
       auftauchen, die kein Asset sind. Bislang nur gegen den Fake-Sidecar
       geprüft, nicht gegen die echte API.
 - [ ] Session-Refresh-Handling bei abgelaufener pyicloud-Session
+- [ ] Drag-and-drop aus dem Raster. Bräuchte einen `GdkContentProvider`, der
+      den Download abwarten kann — ein Zug darf die Oberfläche nicht blockieren,
+      und ein noch nicht geladenes Original hat keinen Pfad, den man mitgeben
+      könnte.
+- [ ] Favoriten. `PhotoAsset` aus `timlaing/pyicloud` hat dafür **keine**
+      Eigenschaft (`added_date`, `asset_date`, `dimensions`, `filename`, `id`,
+      `is_live_photo`, `item_type`, `master_id`, `resources`, `size`,
+      `versions`) — es bräuchte den Rohzugriff auf das CloudKit-Feld.
+- [ ] Alben-Seitenleiste (`api.photos.albums`), Suche und Info-Panel mit EXIF
+- [ ] Vorschauen im Hintergrund dekodieren. `connect_bind` ruft
+      `gdk::Texture::from_filename` synchron im UI-Thread; bei sechstelligen
+      Bibliotheken ist schnelles Scrollen damit nicht flüssig zu halten.
 - [ ] `GListModel`-Implementierung für paginierte SQLite-Queries.
       Zwischenlösung: `gio::ListStore`, der beim Scrollen seitenweise nachlädt
       (`PAGE_SIZE = 200`) — der Katalog landet nie ganz im RAM, aber
@@ -381,6 +469,11 @@ dahinter ist ein PNG, der Abspieler zeigt für sie also seinen eigenen Fehler;
 das ist gewollt und kein Defekt. Aufnahme- und Hinzufügedatum fallen im Fake
 bewusst auseinander, sonst fiele eine Ansicht, die nach dem falschen der beiden
 sortiert, im Test nicht auf.
+
+Ein isolierter Lauf braucht eine eigene `config.toml` mit gesetzten `[paths]`
+— `XDG_CONFIG_HOME` allein genügt nicht, weil die Vorgabepfade fest auf
+`~/.cache` und `~/.local/share` zeigen und der Testlauf sonst in die echten
+Verzeichnisse schreibt.
 
 ## Konventionen für Claude Code
 

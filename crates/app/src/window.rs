@@ -10,8 +10,10 @@ use icloud_photos_core::Config;
 use std::path::PathBuf;
 
 use crate::downloader::{self, DownloadMessage, Downloader};
+use crate::export;
 use crate::photo_object::PhotoObject;
 use crate::sync_task::{self, SyncMessage};
+use crate::viewer::{self, Viewer};
 
 /// So viele Katalogzeilen werden pro Nachladeschritt geholt. Der Katalog landet
 /// dadurch nie vollständig im Speicher.
@@ -43,6 +45,25 @@ const SKELETON_CSS: &str = "
     0%   { opacity: 0.55; }
     50%  { opacity: 1.0; }
     100% { opacity: 0.55; }
+}
+/* Video-Kennzeichen: auf jedem Bild lesbar, deshalb eigener Grund. */
+.photo-badge {
+    background-color: alpha(black, 0.55);
+    color: white;
+    border-radius: 99px;
+    padding: 4px;
+}
+/* Mitlaufende Datumszeile ueber dem Raster. */
+.photo-date {
+    background-color: alpha(@theme_bg_color, 0.85);
+    border-radius: 99px;
+    padding: 4px 14px;
+    font-weight: bold;
+}
+/* Ausgewaehlte Kacheln sollen als solche erkennbar sein. */
+gridview > child:selected picture {
+    outline: 3px solid @accent_bg_color;
+    outline-offset: -3px;
 }
 ";
 
@@ -77,15 +98,32 @@ pub struct AppState {
     last_seen_count: Cell<u64>,
     /// Laeuft im Hintergrund und holt Originale auf Abruf.
     downloader: RefCell<Option<Downloader>>,
-    /// Das gerade offene Foto, damit ein eintreffendes Original dorthin findet.
-    open_photo: RefCell<Option<OpenPhoto>>,
+    /// Der offene Betrachter, damit ein eintreffendes Original dorthin findet.
+    viewer: RefCell<Option<Rc<Viewer>>>,
+    /// Die beiden Fensterebenen — Bibliothek und Betrachter.
+    screens: RefCell<Option<gtk::Stack>>,
+    /// Das Raster, um nach dem Schliessen des Betrachters dorthin
+    /// zurueckzufinden, wo das Foto lag.
+    grid: RefCell<Option<gtk::GridView>>,
+    /// Ein laufender Sicherungs-, Kopier- oder Oeffnen-Auftrag.
+    job: RefCell<Option<export::Job>>,
+    /// Loest Sichern, Kopieren und Oeffnen aus. Vom Hauptfenster eingehaengt,
+    /// weil nur dort Dialog und Fortschrittsanzeige sitzen.
+    actions: RefCell<Option<ActionHandler>>,
 }
 
-/// Das im Viewer gezeigte Foto und die Stellen, die ein Original ersetzt.
-struct OpenPhoto {
-    id: String,
-    picture: gtk::Picture,
-    stack: gtk::Stack,
+/// Die Stelle, die Sichern, Kopieren und Oeffnen ausfuehrt.
+type ActionHandler = Rc<dyn Fn(UiAction, Vec<export::Item>)>;
+
+/// Was mit den ausgewaehlten Fotos geschehen soll.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum UiAction {
+    /// In ein Verzeichnis sichern.
+    Save,
+    /// In die Zwischenablage legen.
+    Clipboard,
+    /// Mit der Standardanwendung oeffnen.
+    Open,
 }
 
 /// Die Teile der Anmeldemaske, die von aussen gesteuert werden.
@@ -114,7 +152,11 @@ impl AppState {
             expected_total: Cell::new(0),
             last_seen_count: Cell::new(0),
             downloader: RefCell::new(None),
-            open_photo: RefCell::new(None),
+            viewer: RefCell::new(None),
+            screens: RefCell::new(None),
+            grid: RefCell::new(None),
+            job: RefCell::new(None),
+            actions: RefCell::new(None),
         })
     }
 
@@ -201,7 +243,7 @@ impl AppState {
     }
 
     /// Fordert das Original eines Fotos an.
-    fn request_original(&self, id: &str) {
+    pub fn request_original(&self, id: &str) {
         if let Some(downloader) = self.downloader.borrow().as_ref() {
             downloader.request(id);
         } else {
@@ -209,25 +251,68 @@ impl AppState {
         }
     }
 
-    /// Traegt ein eingetroffenes Original in den offenen Viewer ein.
-    ///
-    /// Gehoert es zu einem inzwischen geschlossenen Fenster, passiert nichts.
-    fn deliver_original(&self, id: &str, path: &std::path::Path) {
-        let open = self.open_photo.borrow();
-        let Some(open) = open.as_ref() else { return };
-        if open.id != id {
-            return;
+    /// Holt ein Original im Voraus — ohne es als benutzt zu zaehlen.
+    pub fn prefetch_original(&self, id: &str) {
+        if let Some(downloader) = self.downloader.borrow().as_ref() {
+            downloader.prefetch(id);
         }
-        set_image(&open.picture, Some(&path.to_string_lossy()));
-        open.stack.set_visible_child_name("image");
     }
 
-    /// Meldet dem offenen Viewer, dass das Original nicht zu haben ist.
+    /// Vermerkt einen Zugriff auf ein Foto.
+    pub fn touch(&self, id: &str) {
+        if let Err(error) = self.catalog.borrow().touch(id, chrono_now()) {
+            tracing::error!(%error, "last_accessed_at konnte nicht aktualisiert werden");
+        }
+    }
+
+    /// Loest eine Aktion auf einer Auswahl aus.
+    pub fn run_action(&self, action: UiAction, items: Vec<export::Item>) {
+        let handler = self.actions.borrow().clone();
+        match handler {
+            Some(handler) => handler(action, items),
+            None => tracing::warn!("keine Aktionsstelle eingehaengt"),
+        }
+    }
+
+    /// Der Betrachter ist geschlossen worden.
+    ///
+    /// Die Seite bleibt im Stack stehen; nur der Griff darauf wird
+    /// losgelassen, damit der naechste Aufruf sie frisch aufbaut.
+    pub fn close_viewer(&self) {
+        self.viewer.borrow_mut().take();
+    }
+
+    /// Stellt das Raster auf die Position, die der Betrachter zuletzt zeigte.
+    pub fn return_to_grid(&self, position: u32) {
+        let Some(grid) = self.grid.borrow().clone() else {
+            return;
+        };
+        if position < self.model.n_items() {
+            grid.scroll_to(position, gtk::ListScrollFlags::FOCUS, None);
+        }
+        grid.grab_focus();
+    }
+
+    /// Traegt ein eingetroffenes Original ein — im Betrachter wie im
+    /// laufenden Auftrag.
+    fn deliver_original(&self, id: &str, path: &std::path::Path) {
+        let viewer = self.viewer.borrow().clone();
+        if let Some(viewer) = viewer {
+            viewer.deliver(id, path);
+        }
+        if let Some(job) = self.job.borrow_mut().as_mut() {
+            job.resolve(id, path);
+        }
+    }
+
+    /// Meldet, dass ein Original nicht zu haben ist.
     fn deliver_failure(&self, id: &str) {
-        let open = self.open_photo.borrow();
-        let Some(open) = open.as_ref() else { return };
-        if open.id == id {
-            open.stack.set_visible_child_name("failed");
+        let viewer = self.viewer.borrow().clone();
+        if let Some(viewer) = viewer {
+            viewer.fail(id);
+        }
+        if let Some(job) = self.job.borrow_mut().as_mut() {
+            job.reject(id);
         }
     }
 
@@ -244,11 +329,33 @@ impl AppState {
 
     /// Verwirft das Modell und lädt von vorn — nach einem Sync.
     fn reload(&self) {
+        let open = self.viewer_id();
         self.model.remove_all();
         self.loaded.set(0);
         self.exhausted.set(false);
         self.last_seen_count.set(0);
         self.load_next_page();
+        self.relocate_viewer(open);
+    }
+
+    /// Die ID des Fotos, das der Betrachter gerade zeigt.
+    fn viewer_id(&self) -> Option<String> {
+        self.viewer
+            .borrow()
+            .as_ref()
+            .and_then(|viewer| viewer.current_id())
+    }
+
+    /// Nach einem Umbau des Modells: den Betrachter wieder auf sein Foto
+    /// setzen.
+    ///
+    /// Ein Sync schiebt Fotos mitten ins Raster; ohne dieses Nachziehen zeigte
+    /// die nächste Pfeiltaste im Betrachter auf ein anderes Foto als erwartet.
+    fn relocate_viewer(&self, id: Option<String>) {
+        let (Some(id), Some(viewer)) = (id, self.viewer.borrow().clone()) else {
+            return;
+        };
+        viewer.relocate(&id);
     }
 
     /// Zieht die sichtbaren Kacheln auf den aktuellen Katalogstand nach.
@@ -262,6 +369,7 @@ impl AppState {
             return false;
         }
         self.last_seen_count.set(total);
+        let open = self.viewer_id();
 
         // So viele Zeilen wie bisher geladen, mindestens eine Seite. Der
         // Katalog ist nach `added_date` sortiert, neue Fotos koennen also
@@ -281,6 +389,7 @@ impl AppState {
 
         objects.extend(self.placeholders(total, objects.len() as u64));
         self.model.splice(0, self.model.n_items(), &objects);
+        self.relocate_viewer(open);
         true
     }
 
@@ -332,16 +441,50 @@ pub fn build(app: &adw::Application, state: Rc<AppState>) {
         .child(&grid)
         .build();
 
-    // Nachladen, sobald das Ende in Sichtweite kommt.
+    // Mitlaufende Datumszeile. Ein GtkGridView kennt keine Abschnittsköpfe —
+    // eine Zeile, die immer den Monat der obersten sichtbaren Reihe zeigt,
+    // leistet dasselbe und lässt die Virtualisierung unangetastet.
+    let month = gtk::Label::builder()
+        .css_classes(["photo-date"])
+        .halign(gtk::Align::Center)
+        .valign(gtk::Align::Start)
+        .margin_top(10)
+        .visible(false)
+        .build();
+    // Sonst finge die Zeile Klicks ab, die den Kacheln darunter gelten.
+    month.set_can_target(false);
+
+    let photos = gtk::Overlay::new();
+    photos.set_child(Some(&scroller));
+    photos.add_overlay(&month);
+
     let adjustment = scroller.vadjustment();
+
+    // Eine Stelle, die die Datumszeile nachführt — aufgerufen beim Scrollen,
+    // beim Einlaufen neuer Fotos und nach einem Sprung.
+    let refresh_month: Rc<dyn Fn()> = {
+        let grid = grid.clone();
+        let month = month.clone();
+        let adjustment = adjustment.clone();
+        Rc::new(move || update_month(&grid, &month, adjustment.value()))
+    };
+
+    // Nachladen, sobald das Ende in Sichtweite kommt.
     adjustment.connect_value_changed({
         let state = state.clone();
+        let refresh_month = refresh_month.clone();
         move |adj| {
             let remaining = adj.upper() - (adj.value() + adj.page_size());
             if remaining < PREFETCH_MARGIN {
                 state.load_next_page();
             }
+            refresh_month();
         }
+    });
+    // Auch ohne Scrollen soll die Zeile stimmen, sobald Fotos da sind.
+    state.model.connect_items_changed({
+        let refresh_month = refresh_month.clone();
+        move |_, _, _, _| refresh_month()
     });
 
     let empty = adw::StatusPage::builder()
@@ -351,13 +494,47 @@ pub fn build(app: &adw::Application, state: Rc<AppState>) {
         .build();
 
     let stack = gtk::Stack::new();
-    stack.add_named(&scroller, Some("grid"));
+    stack.add_named(&photos, Some("grid"));
     stack.add_named(&empty, Some("empty"));
 
-    let content = gtk::Box::new(gtk::Orientation::Vertical, 0);
-    content.append(&header);
-    content.append(&stack);
-    window.set_content(Some(&content));
+    let library = gtk::Box::new(gtk::Orientation::Vertical, 0);
+    library.append(&header);
+    library.append(&stack);
+
+    // Die beiden Ebenen des Fensters. Ein geöffnetes Foto ist keine zweite
+    // Fensterebene, sondern diese Seite — auf einem Kachel-Compositor landete
+    // ein eigenes Fenster sonst als Kachel neben der App statt über ihr.
+    let screens = gtk::Stack::new();
+    screens.set_transition_type(gtk::StackTransitionType::Crossfade);
+    screens.add_named(&library, Some(viewer::LIBRARY_PAGE));
+
+    // Rückmeldungen zu Sichern und Kopieren gehören nicht in einen Dialog, den
+    // man wegklicken muss.
+    let toasts = adw::ToastOverlay::new();
+    toasts.set_child(Some(&screens));
+    window.set_content(Some(&toasts));
+
+    // Damit der Betrachter beim Schliessen dorthin zurückspringen kann, wo das
+    // Foto im Raster liegt.
+    *state.grid.borrow_mut() = Some(grid.clone());
+    *state.screens.borrow_mut() = Some(screens.clone());
+
+    let group = build_selection_actions(&state, &window, &header, &grid, &status, &toasts);
+
+    // Das Raster behält die Tabulatortaste für seine Kacheln — die Kopfzeile
+    // ist von dort aus also nicht erreichbar. Deshalb hat die Sprungliste ein
+    // eigenes Kürzel.
+    let jump = build_jump_button(&state, &grid, &month);
+    header.pack_start(&jump);
+    let show_jump = gio::SimpleAction::new("jump", None);
+    show_jump.connect_activate({
+        let jump = jump.clone();
+        move |_, _| jump.popup()
+    });
+    group.add_action(&show_jump);
+    app.set_accels_for_action("photos.jump", &["<Control>j"]);
+
+    window.insert_action_group("photos", Some(&group));
 
     state.load_next_page();
 
@@ -404,7 +581,7 @@ pub fn build(app: &adw::Application, state: Rc<AppState>) {
     stack.add_named(&login, Some("login"));
 
     install_skeleton_css();
-    start_downloader(&state, &status, &stack, &window);
+    start_downloader(&state, &status, &stack, &window, &toasts);
 
     // Waehrend eines Syncs laufend nachziehen, statt erst am Ende umzuschalten.
     glib::timeout_add_local(LIVE_REFRESH, {
@@ -423,6 +600,7 @@ pub fn build(app: &adw::Application, state: Rc<AppState>) {
         let trigger = trigger.clone();
         move |_| trigger()
     });
+
 
     update_status(&state, &status, &stack);
     window.present();
@@ -620,6 +798,7 @@ fn start_downloader(
     status: &gtk::Label,
     stack: &gtk::Stack,
     window: &adw::ApplicationWindow,
+    toasts: &adw::ToastOverlay,
 ) {
     let (downloader, mut messages) =
         downloader::spawn(&state.config.borrow(), sync_task::fake_count());
@@ -629,6 +808,7 @@ fn start_downloader(
     let status = status.clone();
     let stack = stack.clone();
     let window = window.clone();
+    let toasts = toasts.clone();
 
     glib::spawn_future_local(async move {
         while let Some(message) = messages.recv().await {
@@ -636,10 +816,12 @@ fn start_downloader(
                 DownloadMessage::Ready { id, path } => {
                     tracing::info!(%id, path = %path.display(), "Original geladen");
                     state.deliver_original(&id, &path);
+                    advance_job(&state, &window, &status, &toasts);
                 }
                 DownloadMessage::Failed { id, message } => {
                     tracing::warn!(%id, %message, "Original nicht ladbar");
                     state.deliver_failure(&id);
+                    advance_job(&state, &window, &status, &toasts);
                 }
                 DownloadMessage::CacheChanged => {
                     // Die Belegung in der Kopfzeile stimmt nach einer Eviction
@@ -707,16 +889,26 @@ fn build_grid(state: &Rc<AppState>, window: &adw::ApplicationWindow) -> gtk::Gri
             .build();
         picture.add_css_class("card");
 
-        let label = gtk::Label::builder()
-            .ellipsize(gtk::pango::EllipsizeMode::Middle)
-            .max_width_chars(20)
-            .css_classes(["caption", "dim-label"])
+        // Das Video-Kennzeichen liegt ueber der Kachel, nicht daneben: sonst
+        // verschoebe es das Raster, sobald ein Video darin vorkommt.
+        let badge = gtk::Image::builder()
+            .icon_name("media-playback-start-symbolic")
+            .halign(gtk::Align::End)
+            .valign(gtk::Align::End)
+            .margin_end(6)
+            .margin_bottom(6)
+            .css_classes(["photo-badge"])
+            .visible(false)
             .build();
 
-        let boxed = gtk::Box::new(gtk::Orientation::Vertical, 4);
-        boxed.append(&picture);
-        boxed.append(&label);
-        item.set_child(Some(&boxed));
+        // Die Kachel ist nur das Bild. Ein Dateiname darunter sagt über ein
+        // Foto nichts, was man nicht sieht, kostet aber in jeder Reihe eine
+        // Zeile Höhe — wer ihn braucht, findet ihn im Tooltip und im
+        // Betrachter.
+        let overlay = gtk::Overlay::new();
+        overlay.set_child(Some(&picture));
+        overlay.add_overlay(&badge);
+        item.set_child(Some(&overlay));
     });
 
     factory.connect_bind(|_, item| {
@@ -724,46 +916,53 @@ fn build_grid(state: &Rc<AppState>, window: &adw::ApplicationWindow) -> gtk::Gri
         let Some(photo) = item.item().and_downcast::<PhotoObject>() else {
             return;
         };
-        let Some(boxed) = item.child().and_downcast::<gtk::Box>() else {
+        let Some(overlay) = item.child().and_downcast::<gtk::Overlay>() else {
             return;
         };
-        let picture = boxed
-            .first_child()
-            .unwrap()
-            .downcast::<gtk::Picture>()
-            .unwrap();
-        let label = boxed
-            .last_child()
-            .unwrap()
-            .downcast::<gtk::Label>()
-            .unwrap();
+        let Some((picture, badge)) = tile_parts(&overlay) else {
+            return;
+        };
+
+        // Die Datumszeile ueber dem Raster liest den Monat der obersten
+        // sichtbaren Kachel hier ab.
+        overlay.set_widget_name(&photo.month_label());
 
         if photo.needs_skeleton() {
             // Noch kein Bild da: Platzhalter statt leerer Flaeche, damit die
             // Ansicht von Anfang an ihre spaetere Form hat.
             picture.add_css_class("photo-skeleton");
             picture.set_paintable(gdk::Paintable::NONE);
-            label.set_label(if photo.is_placeholder() { "" } else { "…" });
+            badge.set_visible(false);
+            overlay.set_tooltip_text(None);
             return;
         }
 
         picture.remove_css_class("photo-skeleton");
-        label.set_label(&photo.filename());
+        badge.set_visible(photo.is_video());
+        overlay.set_tooltip_text(Some(&format!(
+            "{}\n{}",
+            photo.filename(),
+            photo.captured_label()
+        )));
         set_image(&picture, photo.thumb_path().as_deref());
     });
 
     // Freigeben, sonst hält jede recycelte Zelle ihre Textur fest.
     factory.connect_unbind(|_, item| {
         let item = item.downcast_ref::<gtk::ListItem>().unwrap();
-        if let Some(boxed) = item.child().and_downcast::<gtk::Box>()
-            && let Some(picture) = boxed.first_child().and_downcast::<gtk::Picture>()
+        if let Some(overlay) = item.child().and_downcast::<gtk::Overlay>()
+            && let Some((picture, badge)) = tile_parts(&overlay)
         {
             picture.set_paintable(gdk::Paintable::NONE);
             picture.remove_css_class("photo-skeleton");
+            badge.set_visible(false);
+            overlay.set_tooltip_text(None);
         }
     });
 
-    let selection = gtk::SingleSelection::new(Some(state.model.clone()));
+    // Mehrfachauswahl: Strg- und Umschalt-Klick gehören zu einer Bibliothek,
+    // aus der man etwas herausholen will.
+    let selection = gtk::MultiSelection::new(Some(state.model.clone()));
     let grid = gtk::GridView::builder()
         .model(&selection)
         .factory(&factory)
@@ -790,101 +989,33 @@ fn build_grid(state: &Rc<AppState>, window: &adw::ApplicationWindow) -> gtk::Gri
             if photo.is_placeholder() {
                 return;
             }
-            open_viewer(&state, &window, &photo);
+            open_viewer(&state, &window, position);
         }
     });
 
     grid
 }
 
-/// Öffnet ein Foto und vermerkt den Zugriff.
-fn open_viewer(state: &Rc<AppState>, parent: &adw::ApplicationWindow, photo: &PhotoObject) {
-    // Auch das reine Ansehen eines bereits gecachten Fotos zählt als Zugriff —
-    // sonst verhält sich der Full-Res-Cache wie FIFO statt LRU.
-    if let Err(error) = state.catalog.borrow().touch(&photo.id(), chrono_now()) {
-        tracing::error!(%error, "last_accessed_at konnte nicht aktualisiert werden");
+/// Bild und Video-Kennzeichen einer Kachel.
+fn tile_parts(overlay: &gtk::Overlay) -> Option<(gtk::Picture, gtk::Image)> {
+    let picture = overlay.child().and_downcast::<gtk::Picture>()?;
+    let badge = overlay.last_child().and_downcast::<gtk::Image>()?;
+    Some((picture, badge))
+}
+
+/// Öffnet den Betrachter als Seite desselben Fensters.
+fn open_viewer(state: &Rc<AppState>, parent: &adw::ApplicationWindow, position: u32) {
+    let existing = state.viewer.borrow().clone();
+    if let Some(viewer) = existing {
+        viewer.show(position);
+        return;
     }
-
-    let picture = gtk::Picture::builder()
-        .content_fit(gtk::ContentFit::Contain)
-        .vexpand(true)
-        .hexpand(true)
-        .build();
-
-    let spinner = gtk::Spinner::builder().spinning(true).build();
-    let loading = adw::StatusPage::builder()
-        .title("Original wird geladen …")
-        .description("Die Vorschau liegt lokal, das Original kommt aus iCloud.")
-        .child(&spinner)
-        .build();
-
-    let failed = adw::StatusPage::builder()
-        .icon_name("dialog-warning-symbolic")
-        .title("Original nicht verfügbar")
-        .build();
-
-    let stack = gtk::Stack::new();
-    stack.add_named(&picture, Some("image"));
-    stack.add_named(&loading, Some("loading"));
-    stack.add_named(&failed, Some("failed"));
-
-    match photo.cached_original() {
-        // Schon im Cache: sofort zeigen, kein Netz nötig.
-        Some(path) => {
-            set_image(&picture, Some(&path));
-            stack.set_visible_child_name("image");
-        }
-        None => {
-            stack.set_visible_child_name("loading");
-            state.request_original(&photo.id());
-        }
-    }
-
-    *state.open_photo.borrow_mut() = Some(OpenPhoto {
-        id: photo.id(),
-        picture,
-        stack: stack.clone(),
-    });
-
-    let header = adw::HeaderBar::new();
-    let viewer = adw::Window::builder()
-        .transient_for(parent)
-        .modal(true)
-        .title(photo.filename())
-        .default_width(900)
-        .default_height(700)
-        .build();
-
-    // AdwWindow schliesst nicht von selbst auf Escape — fuer einen Viewer ist
-    // das aber die erwartete Geste.
-    let keys = gtk::EventControllerKey::new();
-    keys.connect_key_pressed({
-        let viewer = viewer.clone();
-        move |_, key, _, _| {
-            if key == gdk::Key::Escape {
-                viewer.close();
-                glib::Propagation::Stop
-            } else {
-                glib::Propagation::Proceed
-            }
-        }
-    });
-    viewer.add_controller(keys);
-
-    // Trifft ein Original nach dem Schliessen ein, soll es nirgends landen.
-    viewer.connect_close_request({
-        let state = state.clone();
-        move |_| {
-            state.open_photo.borrow_mut().take();
-            glib::Propagation::Proceed
-        }
-    });
-
-    let content = gtk::Box::new(gtk::Orientation::Vertical, 0);
-    content.append(&header);
-    content.append(&stack);
-    viewer.set_content(Some(&content));
-    viewer.present();
+    let Some(screens) = state.screens.borrow().clone() else {
+        tracing::error!("Fensterebenen fehlen — Betrachter kann nicht öffnen");
+        return;
+    };
+    let viewer = viewer::open(state, parent, &screens, position);
+    *state.viewer.borrow_mut() = Some(viewer);
 }
 
 /// Lädt ein Bild von der Platte; fehlt oder bricht es, bleibt ein Platzhalter.
@@ -975,8 +1106,9 @@ fn start_sync(
                     tracing::debug!("Bibliothek unveraendert");
                 }
                 SyncMessage::LibraryCount { total } => {
-                    // Ab jetzt kennt die Ansicht ihre spaetere Groesse und kann
-                    // die Luecke mit Skeletten fuellen.
+                    // Ab jetzt kennt die Ansicht ihre spaetere Groesse — das
+                    // Raster kann die Luecke mit Skeletten fuellen, der Balken
+                    // einen Stand statt nur Bewegung zeigen.
                     state.expected_total.set(total);
                     state.refresh_in_place();
                     update_status(&state, &status, &stack);
@@ -1138,6 +1270,476 @@ fn show_error(parent: &adw::ApplicationWindow, heading: &str, body: &str) {
         .build();
     dialog.add_response("ok", "OK");
     dialog.present(Some(parent));
+}
+
+// ---------------------------------------------------------------------------
+// Datumszeile und Sprungliste
+// ---------------------------------------------------------------------------
+
+/// Führt die Datumszeile auf den Monat der obersten sichtbaren Reihe nach.
+///
+/// Die Kacheln tragen ihren Monat als Widget-Namen (siehe `connect_bind`) —
+/// nur die gerade aufgebauten Kacheln existieren überhaupt, und genau die
+/// stehen auch im Bild.
+fn update_month(grid: &gtk::GridView, label: &gtk::Label, top: f64) {
+    match visible_month(grid, top) {
+        Some(month) => {
+            label.set_label(&month);
+            label.set_visible(true);
+        }
+        // Kein Treffer heisst fast immer: die Kacheln an dieser Stelle sind
+        // noch nicht zugeteilt — nach einem Sprung etwa. Die zuletzt bekannte
+        // Angabe stehenzulassen ist dann richtiger, als die Zeile wegzunehmen;
+        // der nächste Scrollschritt bringt sie ohnehin auf den Stand.
+        None => label.set_visible(!label.label().is_empty()),
+    }
+}
+
+fn visible_month(grid: &gtk::GridView, top: f64) -> Option<String> {
+    let mut child = grid.first_child();
+    let mut best: Option<(f32, String)> = None;
+    while let Some(cell) = child {
+        // Angeschnittene Reihen zählen nicht: gesucht ist die oberste Kachel,
+        // die wirklich im Bild steht.
+        if let Some(bounds) = cell.compute_bounds(grid)
+            && (bounds.y() + bounds.height()) as f64 > top + 1.0
+            && best.as_ref().is_none_or(|(y, _)| bounds.y() < *y)
+            && let Some(tile) = cell.first_child()
+        {
+            let name = tile.widget_name().to_string();
+            if !name.is_empty() {
+                best = Some((bounds.y(), name));
+            }
+        }
+        child = cell.next_sibling();
+    }
+    best.map(|(_, month)| month)
+}
+
+/// Knopf mit der Monatsliste der Bibliothek.
+fn build_jump_button(
+    state: &Rc<AppState>,
+    grid: &gtk::GridView,
+    month_line: &gtk::Label,
+) -> gtk::MenuButton {
+    // Eine GtkListBox mit aktivierbaren Zeilen statt einer Liste von Knöpfen:
+    // nur so lässt sich die Liste auch mit den Pfeiltasten bedienen.
+    let list = gtk::ListBox::builder()
+        .selection_mode(gtk::SelectionMode::None)
+        .css_classes(["navigation-sidebar"])
+        .build();
+
+    // Zu welcher Rasterposition und welchem Monat jede Zeile gehört.
+    let offsets: Rc<RefCell<Vec<u64>>> = Rc::new(RefCell::new(Vec::new()));
+    let months: Rc<RefCell<Vec<String>>> = Rc::new(RefCell::new(Vec::new()));
+
+    let scroller = gtk::ScrolledWindow::builder()
+        .hscrollbar_policy(gtk::PolicyType::Never)
+        .min_content_width(220)
+        .max_content_height(420)
+        .propagate_natural_height(true)
+        .child(&list)
+        .build();
+
+    let popover = gtk::Popover::builder().child(&scroller).build();
+    let button = gtk::MenuButton::builder()
+        .icon_name("x-office-calendar-symbolic")
+        .tooltip_text("Zu einem Monat springen (Strg+J)")
+        .popover(&popover)
+        .build();
+
+    list.connect_row_activated({
+        let state = state.clone();
+        let grid = grid.clone();
+        let popover = popover.clone();
+        let offsets = offsets.clone();
+        let months = months.clone();
+        let month_line = month_line.clone();
+        move |_, row| {
+            let index = row.index().max(0) as usize;
+            let Some(&offset) = offsets.borrow().get(index) else {
+                return;
+            };
+            popover.popdown();
+            jump_to(&state, &grid, offset);
+
+            // Die Datumszeile liest sonst die sichtbaren Kacheln ab — die gibt
+            // es am Ziel erst nach der nächsten Zuteilung. Woher der Sprung
+            // kam, ist hier aber ohnehin bekannt.
+            if let Some(month) = months.borrow().get(index) {
+                month_line.set_label(month);
+                month_line.set_visible(true);
+            }
+        }
+    });
+
+    // Erst beim Öffnen füllen: der Katalog wächst, solange ein Sync läuft.
+    popover.connect_show({
+        let state = state.clone();
+        let list = list.clone();
+        let months = months.clone();
+        move |_| {
+            while let Some(row) = list.first_child() {
+                list.remove(&row);
+            }
+            let groups = match state.catalog.borrow().month_groups() {
+                Ok(groups) => groups,
+                Err(error) => {
+                    tracing::error!(%error, "Monatsliste nicht lesbar");
+                    return;
+                }
+            };
+            *offsets.borrow_mut() = groups.iter().map(|group| group.offset).collect();
+            *months.borrow_mut() = groups
+                .iter()
+                .map(|group| month_title(&group.month))
+                .collect();
+
+            for group in &groups {
+                let label = gtk::Label::builder()
+                    .label(format!("{}  ·  {}", month_title(&group.month), group.count))
+                    .xalign(0.0)
+                    .margin_top(8)
+                    .margin_bottom(8)
+                    .margin_start(12)
+                    .margin_end(12)
+                    .build();
+                let row = gtk::ListBoxRow::builder().child(&label).build();
+                list.append(&row);
+            }
+
+            // Ohne das bliebe die Liste nach Strg+J ohne Fokus — die
+            // Pfeiltasten gingen dann ins Leere.
+            if let Some(first) = list.row_at_index(0) {
+                first.grab_focus();
+            }
+        }
+    });
+
+    button
+}
+
+/// Macht aus `2024-07` ein „Juli 2024".
+fn month_title(month: &str) -> String {
+    let Some((year, number)) = month.split_once('-') else {
+        return month.to_string();
+    };
+    match number.parse::<u32>() {
+        Ok(number) => format!("{} {year}", crate::photo_object::month_name(number)),
+        Err(_) => month.to_string(),
+    }
+}
+
+/// Scrollt an die Position im Raster, notfalls nach Nachladen.
+fn jump_to(state: &Rc<AppState>, grid: &gtk::GridView, offset: u64) {
+    // Der Sprung kann weit hinter dem liegen, was bisher geladen wurde.
+    while (state.model.n_items() as u64) <= offset && state.load_next_page() {}
+    let last = state.model.n_items().saturating_sub(1);
+    let position = u32::try_from(offset).unwrap_or(last).min(last);
+    grid.scroll_to(position, gtk::ListScrollFlags::FOCUS, None);
+}
+
+// ---------------------------------------------------------------------------
+// Auswahl: sichern, kopieren, öffnen
+// ---------------------------------------------------------------------------
+
+/// Hängt die Aktionen für die Auswahl in die Kopfzeile und macht sie auch für
+/// den Betrachter erreichbar.
+fn build_selection_actions(
+    state: &Rc<AppState>,
+    window: &adw::ApplicationWindow,
+    header: &adw::HeaderBar,
+    grid: &gtk::GridView,
+    status: &gtk::Label,
+    toasts: &adw::ToastOverlay,
+) -> gio::SimpleActionGroup {
+    let save = gtk::Button::builder()
+        .icon_name("document-save-symbolic")
+        .tooltip_text("Auswahl sichern …")
+        .sensitive(false)
+        .build();
+    let copy = gtk::Button::builder()
+        .icon_name("edit-copy-symbolic")
+        .tooltip_text("Auswahl kopieren")
+        .sensitive(false)
+        .build();
+    let open = gtk::Button::builder()
+        .icon_name("document-open-symbolic")
+        .tooltip_text("Mit Standardanwendung öffnen")
+        .sensitive(false)
+        .build();
+
+    let actions = gtk::Box::new(gtk::Orientation::Horizontal, 0);
+    actions.add_css_class("linked");
+    for button in [&save, &copy, &open] {
+        actions.append(button);
+    }
+    header.pack_end(&actions);
+
+    // Die Aktionsstelle: der Betrachter greift über sie auf dieselbe
+    // Warteschlange zu wie das Raster.
+    let run: ActionHandler = {
+        let state = state.clone();
+        let window = window.clone();
+        let status = status.clone();
+        let toasts = toasts.clone();
+        Rc::new(move |action, items| {
+            start_action(&state, &window, &status, &toasts, action, items);
+        })
+    };
+    *state.actions.borrow_mut() = Some(run.clone());
+
+    // Dieselben drei Wege als Fensteraktionen, damit sie auch über die
+    // gewohnten Tastenkürzel erreichbar sind.
+    let group = gio::SimpleActionGroup::new();
+    for (button, name, action, accelerator) in [
+        (&save, "save", UiAction::Save, "<Control>s"),
+        (&copy, "copy", UiAction::Clipboard, "<Control>c"),
+        (&open, "open", UiAction::Open, "<Control>o"),
+    ] {
+        let entry = gio::SimpleAction::new(name, None);
+        entry.connect_activate({
+            let state = state.clone();
+            let grid = grid.clone();
+            move |_, _| {
+                let items = selected_items(&grid);
+                if !items.is_empty() {
+                    state.run_action(action, items);
+                }
+            }
+        });
+        group.add_action(&entry);
+
+        button.connect_clicked({
+            let entry = entry.clone();
+            move |_| entry.activate(None)
+        });
+        if let Some(app) = window.application() {
+            app.set_accels_for_action(&format!("photos.{name}"), &[accelerator]);
+        }
+    }
+
+    // Ohne Auswahl gibt es nichts zu sichern.
+    if let Some(model) = grid.model() {
+        model.connect_selection_changed({
+            let save = save.clone();
+            let copy = copy.clone();
+            let open = open.clone();
+            let grid = grid.clone();
+            move |_, _, _| {
+                let count = selected_items(&grid).len();
+                save.set_sensitive(count > 0);
+                copy.set_sensitive(count > 0);
+                // Mehrere Fotos gleichzeitig zu öffnen ergibt keinen Sinn.
+                open.set_sensitive(count == 1);
+            }
+        });
+    }
+
+    group
+}
+
+/// Die ausgewählten Fotos, Platzhalter ausgenommen.
+fn selected_items(grid: &gtk::GridView) -> Vec<export::Item> {
+    let Some(model) = grid.model() else {
+        return Vec::new();
+    };
+    let selection = model.selection();
+    let mut items = Vec::new();
+    let mut add = |position: u32| {
+        if let Some(photo) = model.item(position).and_downcast::<PhotoObject>()
+            && !photo.is_placeholder()
+        {
+            items.push(export::Item {
+                id: photo.id(),
+                filename: photo.filename(),
+            });
+        }
+    };
+    if let Some((iter, first)) = gtk::BitsetIter::init_first(&selection) {
+        add(first);
+        for position in iter {
+            add(position);
+        }
+    }
+    items
+}
+
+/// Startet eine Aktion auf einer Auswahl.
+fn start_action(
+    state: &Rc<AppState>,
+    window: &adw::ApplicationWindow,
+    status: &gtk::Label,
+    toasts: &adw::ToastOverlay,
+    action: UiAction,
+    items: Vec<export::Item>,
+) {
+    if items.is_empty() {
+        return;
+    }
+    if state.job.borrow().is_some() {
+        toasts.add_toast(adw::Toast::new("Es läuft bereits ein Auftrag."));
+        return;
+    }
+
+    match action {
+        UiAction::Save => {
+            // Erst das Ziel, dann die Downloads: wer abbricht, soll nichts
+            // angestoßen haben.
+            let dialog = gtk::FileDialog::builder()
+                .title("Fotos sichern")
+                .accept_label("Hierhin sichern")
+                .build();
+            dialog.select_folder(
+                Some(window),
+                gio::Cancellable::NONE,
+                glib::clone!(
+                    #[strong]
+                    state,
+                    #[strong]
+                    status,
+                    #[strong]
+                    toasts,
+                    #[strong]
+                    window,
+                    move |result| {
+                        let Ok(folder) = result else { return };
+                        let Some(path) = folder.path() else { return };
+                        begin_job(
+                            &state,
+                            &window,
+                            &status,
+                            &toasts,
+                            export::Action::SaveTo(path),
+                            items.clone(),
+                        );
+                    }
+                ),
+            );
+        }
+        UiAction::Clipboard => begin_job(
+            state,
+            window,
+            status,
+            toasts,
+            export::Action::Clipboard,
+            items,
+        ),
+        UiAction::Open => begin_job(state, window, status, toasts, export::Action::Open, items),
+    }
+}
+
+/// Legt den Auftrag an und fordert die fehlenden Originale an.
+fn begin_job(
+    state: &Rc<AppState>,
+    window: &adw::ApplicationWindow,
+    status: &gtk::Label,
+    toasts: &adw::ToastOverlay,
+    action: export::Action,
+    items: Vec<export::Item>,
+) {
+    let (job, wanted) = export::Job::new(action, items, |id| {
+        state
+            .catalog
+            .borrow()
+            .get(id)
+            .ok()
+            .flatten()
+            .filter(|photo| photo.is_orig_cached)
+            .and_then(|photo| photo.orig_path)
+            .filter(|path| path.is_file())
+    });
+    *state.job.borrow_mut() = Some(job);
+
+    // Ein Export ist eine Benutzung: diese Originale sollen in der LRU-Reihe
+    // nach hinten rücken, nicht als Prefetch gelten.
+    for id in &wanted {
+        state.request_original(id);
+    }
+    advance_job(state, window, status, toasts);
+}
+
+/// Zeigt den Fortschritt an und schließt den Auftrag ab, sobald alle
+/// Originale beisammen sind.
+fn advance_job(
+    state: &Rc<AppState>,
+    window: &adw::ApplicationWindow,
+    status: &gtk::Label,
+    toasts: &adw::ToastOverlay,
+) {
+    let done = match state.job.borrow().as_ref() {
+        Some(job) => {
+            let (ready, total) = job.progress();
+            if !job.is_done() {
+                status.set_label(&format!("{} … {ready} / {total}", job.action.verb()));
+            }
+            job.is_done()
+        }
+        None => return,
+    };
+    if !done {
+        return;
+    }
+
+    let Some(job) = state.job.borrow_mut().take() else {
+        return;
+    };
+    let message = finish_job(window, &job);
+    toasts.add_toast(adw::Toast::new(&message));
+    status.set_label("");
+}
+
+/// Führt den fertigen Auftrag aus und beschreibt, was dabei herauskam.
+fn finish_job(window: &adw::ApplicationWindow, job: &export::Job) -> String {
+    let files = job.ready();
+    if files.is_empty() {
+        return "Kein Original verfügbar.".to_string();
+    }
+    let missing = job.failed();
+
+    match &job.action {
+        export::Action::SaveTo(dir) => {
+            let (saved, errors) = export::save_into(dir, files);
+            for error in &errors {
+                tracing::warn!(%error, "Sichern fehlgeschlagen");
+            }
+            let mut message = match saved {
+                1 => "1 Foto gesichert".to_string(),
+                other => format!("{other} Fotos gesichert"),
+            };
+            if missing + errors.len() > 0 {
+                message.push_str(&format!(" · {} nicht", missing + errors.len()));
+            }
+            message
+        }
+        export::Action::Clipboard => {
+            let paths: Vec<gio::File> = files
+                .iter()
+                .map(|(_, path)| gio::File::for_path(path))
+                .collect();
+            let list = gdk::FileList::from_array(&paths);
+            window
+                .clipboard()
+                .set_content(Some(&gdk::ContentProvider::for_value(&list.to_value())))
+                .unwrap_or_else(
+                    |error| tracing::warn!(%error, "Zwischenablage nicht beschreibbar"),
+                );
+            match files.len() {
+                1 => "1 Foto kopiert".to_string(),
+                other => format!("{other} Fotos kopiert"),
+            }
+        }
+        export::Action::Open => {
+            let (_, path) = &files[0];
+            let launcher = gtk::FileLauncher::new(Some(&gio::File::for_path(path)));
+            launcher.launch(Some(window), gio::Cancellable::NONE, |result| {
+                if let Err(error) = result {
+                    tracing::warn!(%error, "Öffnen fehlgeschlagen");
+                }
+            });
+            "Wird geöffnet …".to_string()
+        }
+    }
 }
 
 #[cfg(test)]

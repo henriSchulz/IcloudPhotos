@@ -1,8 +1,29 @@
 //! GObject-Wrapper für eine Katalogzeile, damit Fotos in ein `GListModel` passen.
 
+use chrono::{Datelike, Local};
 use gtk::glib;
 use gtk::subclass::prelude::*;
 use icloud_photos_core::model::Photo;
+
+/// Monatsnamen von Hand: `chrono` formatiert `%B` nur englisch, und eine
+/// Lokalisierungsbibliothek fuer zwoelf Woerter waere unverhaeltnismaessig.
+pub fn month_name(month: u32) -> &'static str {
+    const NAMES: [&str; 12] = [
+        "Januar",
+        "Februar",
+        "März",
+        "April",
+        "Mai",
+        "Juni",
+        "Juli",
+        "August",
+        "September",
+        "Oktober",
+        "November",
+        "Dezember",
+    ];
+    NAMES.get((month as usize).saturating_sub(1)).unwrap_or(&"")
+}
 
 mod imp {
     use std::cell::RefCell;
@@ -18,6 +39,12 @@ mod imp {
         pub is_orig_cached: RefCell<bool>,
         /// Platzhalter fuer ein noch nicht synchronisiertes Foto.
         pub is_placeholder: RefCell<bool>,
+        pub is_video: RefCell<bool>,
+        /// Aufnahmemonat als Beschriftung, z.B. "Juli 2024" — die Ansicht
+        /// zeigt ihn als mitlaufende Datumszeile ueber dem Raster.
+        pub month_label: RefCell<String>,
+        /// Voller Aufnahmezeitpunkt fuer die Kopfzeile des Viewers.
+        pub captured_label: RefCell<String>,
     }
 
     #[glib::object_subclass]
@@ -48,6 +75,20 @@ impl PhotoObject {
             .as_ref()
             .map(|p| p.to_string_lossy().into_owned());
         *imp.is_orig_cached.borrow_mut() = photo.is_orig_cached;
+        *imp.is_video.borrow_mut() = photo.record.is_video();
+
+        // Gezeigt wird Ortszeit: der Katalog haelt UTC, aber "aufgenommen am"
+        // meint die Uhr, die beim Auslösen danebenstand.
+        let captured = photo.record.capture_date().with_timezone(&Local);
+        *imp.month_label.borrow_mut() =
+            format!("{} {}", month_name(captured.month()), captured.format("%Y"));
+        *imp.captured_label.borrow_mut() = format!(
+            "{}. {} {}, {}",
+            captured.format("%-d"),
+            month_name(captured.month()),
+            captured.format("%Y"),
+            captured.format("%H:%M")
+        );
         object
     }
 
@@ -78,6 +119,18 @@ impl PhotoObject {
 
     pub fn thumb_path(&self) -> Option<String> {
         self.imp().thumb_path.borrow().clone()
+    }
+
+    pub fn is_video(&self) -> bool {
+        *self.imp().is_video.borrow()
+    }
+
+    pub fn month_label(&self) -> String {
+        self.imp().month_label.borrow().clone()
+    }
+
+    pub fn captured_label(&self) -> String {
+        self.imp().captured_label.borrow().clone()
     }
 
     /// Pfad zum Original, sofern es wirklich im Cache liegt.
