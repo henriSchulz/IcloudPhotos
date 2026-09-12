@@ -80,8 +80,10 @@ async fn unknown_asset_is_an_error_not_a_hang() {
         .fetch_original("fake-99999", None, &dir.path().join("x.png"))
         .await
         .unwrap_err();
+    // "missing" heisst: ein zweiter Anlauf braucht gar nicht erst zu starten.
+    // Die App unterscheidet daran, ob sie die Sitzung erneuert.
     assert!(
-        matches!(&error, SyncError::Sidecar { kind, .. } if kind == "download"),
+        matches!(&error, SyncError::Sidecar { kind, .. } if kind == "missing"),
         "unerwartet: {error:?}"
     );
 

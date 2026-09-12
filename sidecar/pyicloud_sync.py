@@ -14,6 +14,7 @@ Das Protokoll ist zeilenweises JSON; jede Zeile hat ein Feld ``type``:
     {"type": "library_count", "value": 19624}   Bestandsabgleich nach einem Delta
     {"type": "ready"}                           Serve-Modus nimmt Befehle entgegen
     {"type": "original", "id": ..., "path": "...", "bytes": 4200000}
+    {"type": "original_failed", "id": ..., "kind": "missing"|"error", "message": "..."}
     {"type": "offset", "value": 1200}           Fortschritt des Erstaufbaus
     {"type": "baseline_complete", "count": 17000}
     {"type": "token_expired", "message": "..."} Delta nicht moeglich
@@ -531,14 +532,11 @@ def download_original(asset: Any, dest: Path) -> dict[str, Any]:
     try:
         data = asset.download(original_version_for(asset))
     except Exception as exc:  # noqa: BLE001 - fremde API
-        return {
-            "type": "original_failed",
-            "id": asset.id,
-            "message": f"{type(exc).__name__}: {exc}",
-        }
+        # Kann ein Netzaussetzer oder eine abgelaufene Sitzung sein.
+        return original_failed(asset.id, f"{type(exc).__name__}: {exc}")
 
     if not data:
-        return {"type": "original_failed", "id": asset.id, "message": "kein Original verfuegbar"}
+        return original_failed(asset.id, "kein Original verfuegbar", kind="missing")
 
     dest.parent.mkdir(parents=True, exist_ok=True)
     # Wie bei den Vorschauen: erst vollstaendig schreiben, dann umbenennen.
@@ -546,6 +544,18 @@ def download_original(asset: Any, dest: Path) -> dict[str, Any]:
     tmp.write_bytes(data)
     tmp.replace(dest)
     return {"type": "original", "id": asset.id, "path": str(dest), "bytes": len(data)}
+
+
+def original_failed(asset_id: str, message: str, kind: str = "error") -> dict[str, Any]:
+    """Fehlschlag beim Holen eines Originals.
+
+    ``kind`` trennt, was ein zweiter Anlauf beheben kann, von dem, was er nicht
+    behebt: ``missing`` heisst, das Asset gibt es nicht oder es hat kein
+    Original — da hilft auch eine frische Anmeldung nicht. Alles andere
+    (Netzfehler, abgelaufene Sitzung, Ausnahme im Lookup) ist ``error``, und
+    die App setzt einmal neu auf.
+    """
+    return {"type": "original_failed", "id": asset_id, "kind": kind, "message": message}
 
 
 def master_record_name(record: Any) -> str | None:
@@ -655,28 +665,28 @@ def run_serve(username: str, cookie_dir: str | None) -> int:
         asset_id = command.get("id")
         dest = command.get("dest")
         if not asset_id or not dest:
-            emit({"type": "original_failed", "id": asset_id or "", "message": "id oder dest fehlt"})
+            emit(original_failed(asset_id or "", "id oder dest fehlt", kind="missing"))
             continue
 
         try:
             asset = resolver.get(asset_id, command.get("master"))
         except Exception as exc:  # noqa: BLE001 - fremde API
-            emit(
-                {
-                    "type": "original_failed",
-                    "id": asset_id,
-                    "message": f"{type(exc).__name__}: {exc}",
-                }
-            )
+            emit(original_failed(asset_id, f"{type(exc).__name__}: {exc}"))
             continue
 
         if asset is None:
-            emit({"type": "original_failed", "id": asset_id, "message": "Asset nicht gefunden"})
+            emit(original_failed(asset_id, "Asset nicht gefunden", kind="missing"))
             continue
 
         emit(download_original(asset, Path(dest)))
 
     return EXIT_OK
+
+
+# Eine Asset-ID, die im ersten Prozess scheitert und im zweiten liefert.
+# Damit laesst sich die abgelaufene Sitzung nachstellen: die App muss den
+# Sidecar wegwerfen und frisch anmelden, sonst kommt das Foto nie.
+FAKE_FLAKY_ID = "fake-flaky"
 
 
 def run_fake_serve(count: int, needs_password: bool) -> int:
@@ -699,12 +709,32 @@ def run_fake_serve(count: int, needs_password: bool) -> int:
         asset_id = command.get("id", "")
         dest = Path(command["dest"])
 
+        if asset_id == FAKE_FLAKY_ID:
+            # Der Merker liegt ausserhalb des Prozesses, damit der zweite
+            # Sidecar weiss, dass der erste schon gescheitert ist.
+            dest.parent.mkdir(parents=True, exist_ok=True)
+            marker = dest.parent / ".flaky-seen"
+            if not marker.exists():
+                marker.write_text("1")
+                emit(original_failed(asset_id, "Sitzung abgelaufen (nachgestellt)"))
+                continue
+            dest.write_bytes(fake_png(320, 1))
+            emit(
+                {
+                    "type": "original",
+                    "id": asset_id,
+                    "path": str(dest),
+                    "bytes": dest.stat().st_size,
+                }
+            )
+            continue
+
         if not asset_id.startswith("fake-"):
-            emit({"type": "original_failed", "id": asset_id, "message": "Asset nicht gefunden"})
+            emit(original_failed(asset_id, "Asset nicht gefunden", kind="missing"))
             continue
         number = int(asset_id.removeprefix("fake-"))
         if number >= count:
-            emit({"type": "original_failed", "id": asset_id, "message": "Asset nicht gefunden"})
+            emit(original_failed(asset_id, "Asset nicht gefunden", kind="missing"))
             continue
 
         dest.parent.mkdir(parents=True, exist_ok=True)

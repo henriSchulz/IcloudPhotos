@@ -203,6 +203,12 @@ Protokoll, alles Menschenlesbare geht nach stderr.
 Im Serve-Modus (`--serve`) kommen Befehle als JSON-Zeilen über stdin:
 `{"cmd": "original", "id": ..., "dest": ...}` und `{"cmd": "quit"}`.
 
+`original_failed` trägt ein `kind`: **`missing`** heisst, das Asset gibt es
+nicht oder es hat kein Original — ein zweiter Anlauf wäre vergeblich. Alles
+andere ist `error`: Netzfehler, Ausnahme im Lookup, abgelaufene Sitzung. Die
+App wirft dann die Sitzung weg und meldet sich neu an. Ohne diese
+Unterscheidung kostete jedes fehlende Asset eine überflüssige Neuanmeldung.
+
 Bricht die Leitung ab — die App wurde geschlossen, ein Sync abgebrochen, der
 Sidecar nach einem Fehler beendet —, endet der Lauf still mit Exit-Code 3
 (`EXIT_PIPE`) und einer Zeile auf stderr. Ohne das schreibt `emit` in eine
@@ -440,7 +446,12 @@ Strg+J gibt es, weil `GtkGridView` die Tabulatortaste für seine Kacheln behält
 - [ ] `change_unresolved` beobachten: welche `record_type`-Werte in der Zone
       auftauchen, die kein Asset sind. Bislang nur gegen den Fake-Sidecar
       geprüft, nicht gegen die echte API.
-- [ ] Session-Refresh-Handling bei abgelaufener pyicloud-Session
+- [x] **Abgelaufene Sitzung beim Full-Res-Download.** Der `--serve`-Prozess
+      lebt so lange wie die App; lief seine Sitzung ab, meldete Apple das als
+      gewöhnlichen Fehlschlag, und die tote Sitzung blieb stehen — ab da
+      scheiterte *jedes* geöffnete Foto bis zum Neustart. Ein Fehlschlag
+      verwirft die Sitzung jetzt und setzt einmal mit frischer Anmeldung neu
+      auf; das deckt den kurzen Netzaussetzer gleich mit ab.
 - [ ] Drag-and-drop aus dem Raster. Bräuchte einen `GdkContentProvider`, der
       den Download abwarten kann — ein Zug darf die Oberfläche nicht blockieren,
       und ein noch nicht geladenes Original hat keinen Pfad, den man mitgeben
@@ -457,7 +468,27 @@ Strg+J gibt es, weil `GtkGridView` die Tabulatortaste für seine Kacheln behält
       Zwischenlösung: `gio::ListStore`, der beim Scrollen seitenweise nachlädt
       (`PAGE_SIZE = 200`) — der Katalog landet nie ganz im RAM, aber
       Zurückscrollen gibt Speicher nicht frei.
-- [ ] Fehlerbehandlung bei Netzwerkausfall während Full-Res-Download
+- [ ] `glycin` statt `gdk::Texture::from_filename`: würde die undeklarierte
+      `libheif`-Abhängigkeit auflösen und das Dekodieren aus dem UI-Thread
+      holen — zwei offene Punkte mit einem Schritt.
+
+## Laufzeitabhängigkeiten
+
+Neben GTK4 und libadwaita braucht die App **`libheif`**. Es ist in Arch nur eine
+*optionale* Abhängigkeit von `gdk-pixbuf2`:
+
+```
+gdk-pixbuf2 → Optional Deps: libheif: Load .avif, .heic and .heif
+```
+
+Fehlt es, lädt das Raster weiter seine JPEG-Vorschauen, und der Betrachter
+zeigt für jedes HEIC nichts — in einer typischen iPhone-Bibliothek sind das
+drei von vier Fotos. Der Fehler ist von aussen nicht als Paketproblem zu
+erkennen, deshalb benennt die Fehlerseite im Betrachter die Ursache.
+
+Die saubere Lösung wäre `glycin` als eigene Abhängigkeit statt des Umwegs über
+den Pixbuf-Loader — das würde zugleich das Dekodieren aus dem UI-Thread holen.
+Siehe offene Punkte.
 
 ## Entwicklung
 

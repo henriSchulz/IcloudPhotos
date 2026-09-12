@@ -45,6 +45,8 @@ pub struct Viewer {
     scroller: gtk::ScrolledWindow,
     spinner: gtk::Spinner,
     zoom_label: gtk::Label,
+    /// Die Fehlerseite — sie bekommt je nach Ursache einen anderen Text.
+    failed: adw::StatusPage,
     /// Position im Modell des Rasters.
     position: Cell<u32>,
     /// Maßstab, oder `None` für "ins Fenster eingepasst".
@@ -91,6 +93,7 @@ pub fn open(
         .icon_name("dialog-warning-symbolic")
         .title("Original nicht verfügbar")
         .build();
+    let failed_page = failed.clone();
 
     let stack = gtk::Stack::new();
     stack.add_named(&scroller, Some("image"));
@@ -176,6 +179,7 @@ pub fn open(
         scroller: scroller.clone(),
         spinner,
         zoom_label,
+        failed: failed_page,
         position: Cell::new(position),
         zoom: Cell::new(None),
         natural: Cell::new((0.0, 0.0)),
@@ -235,6 +239,8 @@ impl Viewer {
         // Eine Vorschau ist besser als eine Fehlerseite: das Foto ist ja da,
         // nur nicht in voller Auflösung.
         if self.stack.visible_child_name().as_deref() != Some("image") {
+            self.failed
+                .set_description(Some("Das Original kam nicht aus iCloud."));
             self.stack.set_visible_child_name("failed");
         }
     }
@@ -408,10 +414,33 @@ impl Viewer {
                 self.stack.set_visible_child_name("image");
             }
             Err(error) => {
-                tracing::debug!(path = %path.display(), %error, "Bild nicht ladbar");
-                self.stack.set_visible_child_name("failed");
+                tracing::warn!(path = %path.display(), %error, "Bild nicht ladbar");
+                self.show_failure(path);
             }
         }
+    }
+
+    /// Zeigt die Fehlerseite — und sagt dazu, woran es liegt.
+    ///
+    /// Bei HEIC ist die Ursache fast immer dieselbe und von aussen behebbar:
+    /// `gdk-pixbuf2` fuehrt `libheif` nur als *optionale* Abhaengigkeit. Fehlt
+    /// sie, laedt das Raster brav seine JPEG-Vorschauen und der Betrachter
+    /// zeigt bei jedem zweiten Foto nichts — ohne diesen Hinweis sucht man den
+    /// Fehler bei iCloud statt beim Paketmanager.
+    fn show_failure(&self, path: &Path) {
+        let heic = path
+            .extension()
+            .map(|ext| ext.to_string_lossy().to_lowercase())
+            .is_some_and(|ext| matches!(ext.as_str(), "heic" | "heif" | "avif"));
+
+        self.failed.set_description(Some(if heic {
+            "Das Original liegt lokal, lässt sich aber nicht anzeigen. \
+             Für HEIC-Dateien braucht gdk-pixbuf die Bibliothek libheif \
+             (Paket »libheif«)."
+        } else {
+            "Das Original ließ sich nicht laden."
+        }));
+        self.stack.set_visible_child_name("failed");
     }
 
     fn show_video(&self, path: &Path) {

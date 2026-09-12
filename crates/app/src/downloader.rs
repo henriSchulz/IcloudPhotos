@@ -3,12 +3,14 @@
 //! Der Sidecar bleibt dafür stehen (Serve-Modus): Prozessstart plus Anmeldung
 //! kosten Sekunden und dürfen nicht bei jedem geöffneten Foto anfallen.
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use chrono::Utc;
 use icloud_photos_cache::{Catalog, enforce_limit};
 use icloud_photos_core::Config;
-use icloud_photos_sync::{Prompts, SecretRequest, SidecarOptions, SidecarSession};
+use icloud_photos_sync::{
+    Original, Prompts, SecretRequest, SidecarOptions, SidecarSession, SyncError,
+};
 use tokio::sync::mpsc;
 
 /// Was der Download-Thread der UI meldet.
@@ -152,23 +154,6 @@ pub fn spawn(
             let mut session: Option<SidecarSession> = None;
 
             while let Some(Request { id, purpose }) = request_rx.recv().await {
-                // Erst beim ersten Auftrag anmelden.
-                if session.is_none() {
-                    match SidecarSession::start(&options, &prompts).await {
-                        Ok(started) => session = Some(started),
-                        Err(error) => {
-                            let _ = message_tx.send(DownloadMessage::Failed {
-                                id,
-                                message: error.to_string(),
-                            });
-                            continue;
-                        }
-                    }
-                }
-
-                let Some(active) = session.as_mut() else {
-                    continue;
-                };
                 let dest = destination(&catalog, &full_res_dir, &id);
                 // Der Master-Record aus dem Katalog spart einen CloudKit-Lookup.
                 let master = catalog
@@ -177,7 +162,16 @@ pub fn spawn(
                     .flatten()
                     .and_then(|photo| photo.record.master_id);
 
-                match active.fetch_original(&id, master.as_deref(), &dest).await {
+                match fetch(
+                    &mut session,
+                    &options,
+                    &prompts,
+                    &id,
+                    master.as_deref(),
+                    &dest,
+                )
+                .await
+                {
                     Ok(original) => {
                         let stored = match purpose {
                             Purpose::View => catalog.set_original_cached(
@@ -217,16 +211,6 @@ pub fn spawn(
                     }
                     Err(error) => {
                         tracing::warn!(%id, %error, "Original nicht ladbar");
-                        // Eine gescheiterte Sitzung wird verworfen, damit der
-                        // naechste Auftrag frisch aufsetzt statt an einer
-                        // toten Pipe haengenzubleiben.
-                        if matches!(
-                            error,
-                            icloud_photos_sync::SyncError::Io(_)
-                                | icloud_photos_sync::SyncError::UnexpectedExit(_)
-                        ) {
-                            session = None;
-                        }
                         let _ = message_tx.send(DownloadMessage::Failed {
                             id,
                             message: error.to_string(),
@@ -248,6 +232,93 @@ pub fn spawn(
         },
         message_rx,
     )
+}
+
+/// So oft wird ein Original versucht, bevor der Auftrag als gescheitert gilt.
+/// Zwei reichen: der zweite Anlauf läuft über eine frische Anmeldung.
+const ATTEMPTS: u32 = 2;
+
+/// So lange wird vor dem zweiten Anlauf gewartet — gegen den kurzen
+/// Netzaussetzer, der sonst aus einem Foto eine Fehlermeldung macht.
+const RETRY_PAUSE: std::time::Duration = std::time::Duration::from_secs(1);
+
+/// Holt ein Original und setzt bei einem Fehlschlag einmal neu auf.
+///
+/// Die Sitzung im Sidecar läuft nach einigen Stunden ab, und Apple meldet das
+/// als gewöhnlichen Fehlschlag, nicht als Verbindungsabbruch. Ohne diesen
+/// zweiten Anlauf mit frischer Anmeldung scheitert danach *jedes* geöffnete
+/// Foto mit derselben Meldung, bis die App neu gestartet wird. Ein
+/// Netzaussetzer sieht von hier aus genauso aus und ist damit gleich mit
+/// erledigt.
+///
+/// Der Preis: ein vorgeblich behebbarer Fehlschlag kostet eine neue Anmeldung,
+/// auch wenn die alte Sitzung in Ordnung war. Das ist einmal ein paar Sekunden
+/// und allemal besser als eine App, die bis zum Neustart keine Originale mehr
+/// liefert.
+async fn fetch(
+    session: &mut Option<SidecarSession>,
+    options: &SidecarOptions,
+    prompts: &Prompts,
+    id: &str,
+    master: Option<&str>,
+    dest: &Path,
+) -> Result<Original, SyncError> {
+    let mut last: Option<SyncError> = None;
+
+    for attempt in 1..=ATTEMPTS {
+        if attempt > 1 {
+            tokio::time::sleep(RETRY_PAUSE).await;
+        }
+        if session.is_none() {
+            match SidecarSession::start(options, prompts).await {
+                Ok(started) => *session = Some(started),
+                Err(error) => {
+                    if is_final(&error) {
+                        return Err(error);
+                    }
+                    last = Some(error);
+                    continue;
+                }
+            }
+        }
+
+        let Some(active) = session.as_mut() else {
+            continue;
+        };
+        match active.fetch_original(id, master, dest).await {
+            Ok(original) => return Ok(original),
+            Err(error) => {
+                if is_final(&error) {
+                    return Err(error);
+                }
+                tracing::warn!(
+                    %id,
+                    %error,
+                    attempt,
+                    "Original nicht ladbar — Sitzung wird erneuert"
+                );
+                // Die Sitzung kann abgelaufen oder tot sein; sie wegzuwerfen
+                // ist der einzige Weg, das von hier aus herauszufinden.
+                // `kill_on_drop` beendet den Sidecar dabei mit.
+                *session = None;
+                last = Some(error);
+            }
+        }
+    }
+
+    Err(last.unwrap_or_else(|| SyncError::UnexpectedExit("kein Versuch".into())))
+}
+
+/// Ob ein zweiter Anlauf sinnlos wäre.
+fn is_final(error: &SyncError) -> bool {
+    match error {
+        // Der Sidecar sagt selbst, ob das Asset schlicht nicht da ist.
+        SyncError::Sidecar { kind, .. } => kind == "missing",
+        // Ein abgelehntes Passwort wird beim zweiten Mal nicht richtig.
+        SyncError::Credentials { .. } | SyncError::PasswordAborted => true,
+        SyncError::TwoFactorAborted => true,
+        _ => false,
+    }
 }
 
 /// Zielpfad für ein Original. Die Endung stammt aus dem Dateinamen in iCloud,
@@ -322,6 +393,38 @@ mod tests {
         // Unbekannte ID: keine Endung bekannt, und "/" darf nicht in den Pfad.
         let path = destination(&catalog, std::path::Path::new("/cache"), "a/b+c");
         assert_eq!(path, PathBuf::from("/cache/a_b_c.bin"));
+    }
+
+    #[test]
+    fn a_dead_session_is_replaced_instead_of_reused() {
+        // Der Fake-Sidecar laesst `fake-flaky` im ersten Prozess scheitern und
+        // liefert erst im zweiten. Ohne den zweiten Anlauf mit frischer
+        // Anmeldung bliebe es bei der Fehlermeldung — so verhaelt sich eine
+        // abgelaufene iCloud-Sitzung im Echtbetrieb.
+        let dir = tempfile::tempdir().unwrap();
+        let config = config(dir.path());
+
+        let catalog = Catalog::open(&config.paths.db_path).unwrap();
+        seed(&catalog, "fake-flaky");
+        drop(catalog);
+
+        let (downloader, mut messages) = spawn(&config, Some(5));
+        downloader.request("fake-flaky");
+
+        loop {
+            match messages.blocking_recv() {
+                Some(DownloadMessage::Ready { id, path }) => {
+                    assert_eq!(id, "fake-flaky");
+                    assert!(path.is_file(), "{} fehlt", path.display());
+                    break;
+                }
+                Some(DownloadMessage::Failed { id, message }) => {
+                    panic!("{id} haette beim zweiten Anlauf ankommen muessen: {message}");
+                }
+                Some(_) => continue,
+                None => panic!("Download-Thread beendet"),
+            }
+        }
     }
 
     #[test]

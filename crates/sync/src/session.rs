@@ -27,6 +27,10 @@ enum SessionMessage {
     OriginalFailed {
         id: String,
         message: String,
+        /// `missing` heisst: das Asset gibt es nicht. Alles andere kann ein
+        /// zweiter Anlauf beheben. Aeltere Sidecars kennen das Feld nicht.
+        #[serde(default = "retryable")]
+        kind: String,
     },
     PasswordRequired {
         #[serde(default)]
@@ -59,6 +63,12 @@ pub struct SidecarSession {
     child: Child,
     stdin: ChildStdin,
     lines: Lines<BufReader<ChildStdout>>,
+}
+
+/// Vorgabe fuer `original_failed` ohne `kind`: im Zweifel noch einmal
+/// versuchen. Ein Sidecar aelteren Standes meldet das Feld nicht.
+fn retryable() -> String {
+    "error".to_string()
 }
 
 impl SidecarSession {
@@ -179,11 +189,12 @@ impl SidecarSession {
                     path,
                     bytes,
                 } if got == id => return Ok(Original { path, bytes }),
-                SessionMessage::OriginalFailed { id: got, message } if got == id => {
-                    return Err(SyncError::Sidecar {
-                        kind: "download".to_string(),
-                        message,
-                    });
+                SessionMessage::OriginalFailed {
+                    id: got,
+                    message,
+                    kind,
+                } if got == id => {
+                    return Err(SyncError::Sidecar { kind, message });
                 }
                 SessionMessage::Error { kind, message } => {
                     return Err(SyncError::Sidecar { kind, message });
