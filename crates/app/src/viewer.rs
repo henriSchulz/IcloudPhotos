@@ -12,6 +12,7 @@ use adw::prelude::*;
 use gtk::{gdk, gio, glib};
 
 use crate::export;
+use crate::info_panel::InfoPanel;
 use crate::photo_object::PhotoObject;
 use crate::window::{AppState, UiAction};
 use crate::zoom_view::{ZOOM_STEP, ZoomView};
@@ -19,6 +20,18 @@ use crate::zoom_view::{ZOOM_STEP, ZoomView};
 /// So viele Nachbarn in jede Richtung werden im Voraus geholt. Einer reicht:
 /// er deckt den nächsten Tastendruck ab, ohne die Leitung vollzulaufen.
 const PREFETCH_NEIGHBOURS: i32 = 1;
+
+/// Unterhalb dieser Breite legt sich das Info-Panel über das Foto, statt es
+/// zu verdrängen. 720 sp sind das Panel (höchstens 340) plus ein Foto, das
+/// daneben noch als Foto zu erkennen ist.
+const INFO_OVERLAY_BELOW_SP: f64 = 720.0;
+
+thread_local! {
+    /// Ob das Info-Panel offen ist. Die Seite wird bei jedem Öffnen neu
+    /// gebaut (siehe CLAUDE.md, „Drei Fallen"); ohne diesen Merker wäre das
+    /// Panel nach jedem Schließen wieder zu — Photos behält es offen.
+    static INFO_OPEN: Cell<bool> = const { Cell::new(false) };
+}
 
 /// Der Betrachter, solange er offen ist.
 pub struct Viewer {
@@ -44,6 +57,10 @@ pub struct Viewer {
     zoom_label: gtk::Label,
     /// Die Fehlerseite — sie bekommt je nach Ursache einen anderen Text.
     failed: adw::StatusPage,
+    /// Das ⓘ-Panel rechts neben dem Foto, und die Teilung, die es ein- und
+    /// ausblendet.
+    info: Rc<InfoPanel>,
+    split: adw::OverlaySplitView,
     /// Position im Modell des Rasters.
     position: Cell<u32>,
 }
@@ -130,6 +147,12 @@ pub fn open(
         .build();
     header.pack_end(&fullscreen);
 
+    let info_toggle = gtk::ToggleButton::builder()
+        .icon_name("dialog-information-symbolic")
+        .tooltip_text("Info (I)")
+        .build();
+    header.pack_end(&info_toggle);
+
     let menu = gio::Menu::new();
     menu.append(Some("Export…"), Some("viewer.save"));
     menu.append(Some("Copy"), Some("viewer.copy"));
@@ -147,9 +170,45 @@ pub fn open(
         .build();
     header.pack_end(&zoom_label);
 
+    // Das Info-Panel als Seitenleiste rechts. Eine OverlaySplitView wie bei
+    // der Bibliothek: im breiten Fenster rückt das Foto beiseite — `ZoomView`
+    // passt sich über seine Zuteilung neu ein, Maßstab und Mittelpunkt
+    // bleiben —, im schmalen legt sich das Panel darüber.
+    let info = InfoPanel::new();
+    let split = adw::OverlaySplitView::builder()
+        .content(&stack)
+        .sidebar(&info.widget)
+        .sidebar_position(gtk::PackType::End)
+        .min_sidebar_width(260.0)
+        .max_sidebar_width(340.0)
+        .show_sidebar(INFO_OPEN.get())
+        .build();
+    split
+        .bind_property("show-sidebar", &info_toggle, "active")
+        .bidirectional()
+        .sync_create()
+        .build();
+    // Der Umbruch hängt an einer eigenen BreakpointBin, nicht am Fenster: die
+    // Seite wird bei jedem Öffnen neu gebaut, und ein Breakpoint am Fenster
+    // hielte die alte Teilung fest. Eine Mindestgröße verlangt die Bin; sie
+    // bleibt bewusst klein, sonst hielte sie das Fenster vom Schrumpfen ab.
+    let narrow = adw::Breakpoint::new(adw::BreakpointCondition::new_length(
+        adw::BreakpointConditionLengthType::MaxWidth,
+        INFO_OVERLAY_BELOW_SP,
+        adw::LengthUnit::Sp,
+    ));
+    narrow.add_setter(&split, "collapsed", Some(&true.to_value()));
+    let content = adw::BreakpointBin::builder()
+        .child(&split)
+        .width_request(360)
+        .height_request(200)
+        .vexpand(true)
+        .build();
+    content.add_breakpoint(narrow);
+
     let page = gtk::Box::new(gtk::Orientation::Vertical, 0);
     page.append(&header);
-    page.append(&stack);
+    page.append(&content);
     // Die Gruppe muss haengen, bevor die Seite ins Fenster kommt. Spaeter
     // eingehaengt, loest GTK die Aktionen zwar noch auf, das Menue erfaehrt
     // davon aber nichts und zeigt alle Eintraege ausgegraut. Die Aktionen
@@ -177,10 +236,23 @@ pub fn open(
         spinner,
         zoom_label,
         failed: failed_page,
+        info,
+        split: split.clone(),
         position: Cell::new(position),
     });
 
     connect_navigation(&viewer, &previous, &next);
+    split.connect_show_sidebar_notify({
+        let weak = Rc::downgrade(&viewer);
+        move |split| {
+            INFO_OPEN.set(split.shows_sidebar());
+            // Geschlossen wird nichts nachgeführt; beim Öffnen holt das Panel
+            // den Stand des gerade gezeigten Fotos.
+            if split.shows_sidebar() {
+                with(&weak, |viewer| viewer.refresh_info());
+            }
+        }
+    });
     // Der Maßstab steht nur im Kopf, solange hineingezoomt ist.
     picture.connect_changed({
         let label = viewer.zoom_label.clone();
@@ -228,6 +300,11 @@ impl Viewer {
         } else {
             self.show_image(path);
         }
+        // Erst jetzt gibt es EXIF. Ist das Panel zu, holt es beim Öffnen den
+        // Katalogstand — der Downloader hat das Original dort schon vermerkt.
+        if self.split.shows_sidebar() {
+            self.info.original_arrived(id, path);
+        }
     }
 
     /// Das Original ist nicht zu haben.
@@ -254,6 +331,7 @@ impl Viewer {
             return;
         };
         self.title.set_title(place);
+        self.info.set_place(id, place);
     }
 
     /// Sucht das gerade gezeigte Foto im Modell wieder.
@@ -342,6 +420,7 @@ impl Viewer {
     fn show_current(&self) {
         self.stop_video();
         self.picture.reset();
+        self.refresh_info();
 
         let Some(photo) = self.current() else {
             self.stack.set_visible_child_name("failed");
@@ -495,6 +574,45 @@ impl Viewer {
         self.video.set_media_stream(None::<&gtk::MediaStream>);
     }
 
+    /// Füllt das Info-Panel für das gezeigte Foto — nur, wenn es offen ist.
+    ///
+    /// Beim Blättern mit geschlossenem Panel kostete jedes Foto sonst eine
+    /// Katalogabfrage und das Lesen des Originals, das niemand sieht.
+    fn refresh_info(&self) {
+        if !self.split.shows_sidebar() {
+            return;
+        }
+        let Some(photo) = self.current().filter(|photo| !photo.is_placeholder()) else {
+            self.info.clear();
+            return;
+        };
+        // Die volle Katalogzeile: Maße, Dateigröße und der Pfad des Originals
+        // stehen nicht im `PhotoObject`.
+        let row = self.state.catalog.borrow().get(&photo.id());
+        let row = match row {
+            Ok(Some(row)) => row,
+            Ok(None) => {
+                self.info.clear();
+                return;
+            }
+            Err(error) => {
+                tracing::warn!(%error, "Katalogzeile für das Info-Panel nicht lesbar");
+                self.info.clear();
+                return;
+            }
+        };
+        let place = row
+            .record
+            .coordinates()
+            .and_then(|(lat, lon)| self.state.known_place(lat, lon));
+        self.info
+            .show(&row, &photo.captured_label(), place.as_deref());
+    }
+
+    fn toggle_info(&self) {
+        self.split.set_show_sidebar(!self.split.shows_sidebar());
+    }
+
     fn toggle_fullscreen(&self) {
         if self.window.is_fullscreen() {
             self.window.unfullscreen();
@@ -557,10 +675,14 @@ fn connect_keys(viewer: &Rc<Viewer>) {
                 gdk::Key::_0 | gdk::Key::KP_0 => viewer.picture.fit(),
                 gdk::Key::_1 | gdk::Key::KP_1 => viewer.picture.actual_size(None),
                 gdk::Key::f | gdk::Key::F11 => viewer.toggle_fullscreen(),
+                gdk::Key::i | gdk::Key::I => viewer.toggle_info(),
                 gdk::Key::Escape => {
-                    // Erst das Vollbild verlassen, dann zurueck ins Raster —
-                    // sonst waere das Foto weg, bevor man wieder etwas sieht.
-                    if viewer.window.is_fullscreen() {
+                    // Erst was über dem Foto liegt, dann das Vollbild, dann
+                    // zurueck ins Raster — sonst waere das Foto weg, bevor man
+                    // wieder etwas sieht.
+                    if viewer.split.is_collapsed() && viewer.split.shows_sidebar() {
+                        viewer.split.set_show_sidebar(false);
+                    } else if viewer.window.is_fullscreen() {
                         viewer.window.unfullscreen();
                     } else {
                         viewer.close();

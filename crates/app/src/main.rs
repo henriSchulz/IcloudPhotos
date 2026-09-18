@@ -3,8 +3,10 @@
 mod collections;
 mod demo;
 mod downloader;
+mod exif_info;
 mod export;
 mod geocode;
+mod info_panel;
 mod photo_object;
 mod sidebar;
 mod sync_manager;
