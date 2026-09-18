@@ -171,7 +171,7 @@ icloud-photos/
 ├── config.example.toml        # Vorlage für ~/.config/icloud-photos/config.toml
 ├── crates/
 │   ├── core/                  # Config, Foto-Modell — von allen anderen genutzt
-│   ├── app/                   # GTK4-UI: window (Raster), viewer, export
+│   ├── app/                   # GTK4-UI: window (Raster), viewer, info_panel, export
 │   ├── sync/                  # Sync-Orchestrator, spawnt Sidecar, füllt SQLite
 │   └── cache/                 # Katalog (SQLite), LRU-Eviction, Housekeeping
 ├── sidecar/
@@ -438,7 +438,8 @@ Drei Fallen dieser Bauweise:
 | Doppelklick | eingepasst ↔ 1:1 an der geklickten Stelle |
 | Ziehen, Touchpad-Scrollen | Ausschnitt verschieben (nur gezoomt) |
 | `F` / F11 | Vollbild |
-| Esc | Vollbild verlassen, sonst zurück zur Übersicht |
+| `I` | Info-Panel ein/aus |
+| Esc | übergelegtes Info-Panel schließen, sonst Vollbild verlassen, sonst zurück zur Übersicht |
 
 Gezoomt wird in einem eigenen Widget (`crates/app/src/zoom_view.rs`), nicht
 mehr über `GtkPicture` in einem `GtkScrolledWindow`. Dort stehen die
@@ -458,6 +459,31 @@ Solange das Original noch lädt, zeigt der Betrachter die Vorschau hochskaliert
 GStreamer-Rückfall als `GtkGstMediaFileBuiltin` mit, ein Media-Modul muss nicht
 installiert sein. Beim Blättern wird das Video angehalten, sonst spielte es im
 Hintergrund weiter.
+
+**Info-Panel** (`crates/app/src/info_panel.rs`, ⓘ in der Kopfzeile oder `I`)
+— rechts neben dem Foto, wie in Photos: Titel (Ortsname, sonst Dateiname),
+Aufnahmezeit, dann Details (Dateiname, Typ, Maße mit Megapixeln, Dateigröße),
+Kamera (Modell, Objektiv, Brennweite samt Kleinbild-Äquivalent, Blende,
+Belichtungszeit, ISO, ausgelöster Blitz) und Ort (Name, Koordinaten). Zeilen
+ohne Wert fehlen, ebenso ganze Gruppen. Es steckt in einer
+`AdwOverlaySplitView` (Seitenleiste rechts), die unter 720 sp über dem Foto
+liegt statt daneben. Der Umbruch hängt an einer eigenen `AdwBreakpointBin` in
+der Seite, nicht am Fenster — die Seite wird bei jedem Öffnen neu gebaut, ein
+Breakpoint am Fenster hielte die alte Teilung fest. Offen oder zu bleibt beim
+Blättern und über das Schließen des Betrachters hinweg (`INFO_OPEN`).
+
+**EXIF kommt aus dem Original**, nicht aus dem Katalog: iCloud liefert mit den
+Metadaten weder Kamera noch Belichtung, und die JPEG-Vorschau trägt kein EXIF.
+Gelesen wird die Datei im Full-Res-Cache mit `kamadak-exif` (reines Rust, kann
+JPEG und den HEIF-Container; der Test baut ein HEIC per `heif-enc` und liest es
+zurück). Die Formatierung liegt GTK-frei in `crates/app/src/exif_info.rs` und
+ist getestet. Gelesen wird in `gio::spawn_blocking`; eine Zählnummer verwirft
+Ergebnisse, die erst nach dem Weiterblättern eintreffen. Fehlt das Original
+noch, zeigt das Panel den Katalogstand und „Camera details appear when the
+original has loaded" und liest nach, sobald `Viewer::deliver` es bringt.
+Geschlossen arbeitet das Panel gar nicht — sonst kostete jedes Blättern eine
+Katalogabfrage und einen Dateizugriff, den niemand sieht. Videos zeigen nur
+den Katalogstand; ihre Metadaten stecken im Container und bräuchten GStreamer.
 
 **Raster** — Die Kachel ist nur das Bild: **kein Dateiname darunter**. Er sagt
 über ein Foto nichts, was man nicht sieht, kostet aber in jeder Reihe eine
@@ -636,7 +662,8 @@ Strg+J gibt es, weil `GtkGridView` die Tabulatortaste für seine Kacheln behält
 - [x] Favoriten — über das intelligente Album „Favorites", nicht über ein Feld
       am `PhotoAsset` (das hat keins). Siehe „Alben".
 - [x] Alben-Seitenleiste — siehe „Alben".
-- [ ] Suche und Info-Panel mit EXIF
+- [x] Info-Panel mit EXIF — siehe „Bedienung".
+- [ ] Suche
 - [ ] Alben ohne Titelbild: die Übersicht dekodiert ihre Titelbilder noch im
       UI-Thread (`Picture::set_filename`). Bei 160 Vorschauen à 30 KB unkritisch,
       bei tausend Alben nicht mehr.
