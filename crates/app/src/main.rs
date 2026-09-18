@@ -9,6 +9,7 @@ mod sync_manager;
 mod sync_task;
 mod viewer;
 mod window;
+mod zoom_view;
 
 use std::rc::Rc;
 

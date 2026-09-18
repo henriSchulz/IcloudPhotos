@@ -379,12 +379,26 @@ Drei Fallen dieser Bauweise:
 | ← → ↑ ↓ | ein Foto zurück/vor |
 | Bild ↑/↓ | zehn Fotos |
 | Pos1 / Ende | erstes / letztes Foto |
-| `+` `−` / Mausrad | zoomen, am Zeiger statt an der Bildmitte |
+| Mausrad, Strg + Touchpad-Scrollen | zoomen, am Zeiger |
+| Pinch auf dem Touchpad | zoomen und verschieben, den Fingern nach |
+| `+` `−` | zoomen, um die Fenstermitte |
 | `0` / `1` | einpassen / 1:1 |
-| Doppelklick | zwischen beiden wechseln |
-| Ziehen | Ausschnitt verschieben (nur gezoomt) |
+| Doppelklick | eingepasst ↔ 1:1 an der geklickten Stelle |
+| Ziehen, Touchpad-Scrollen | Ausschnitt verschieben (nur gezoomt) |
 | `F` / F11 | Vollbild |
 | Esc | Vollbild verlassen, sonst zurück zur Übersicht |
+
+Gezoomt wird in einem eigenen Widget (`crates/app/src/zoom_view.rs`), nicht
+mehr über `GtkPicture` in einem `GtkScrolledWindow`. Dort stehen die
+Scrollgrenzen erst nach der nächsten Zuteilung fest; der Ausschnitt wurde
+geraten und sprang, und im eingepassten Zustand rechnete der Anker die Ränder
+um das Bild nicht mit. `ZoomView` führt Maßstab (relativ zur Einpassung) und
+Mittelpunkt (normiert auf 0…1) selbst und zeichnet die Textur direkt. Beides
+überlebt eine Größenänderung und den Wechsel von der Vorschau aufs Original.
+Die Rechnung liegt GTK-frei in `View` und ist getestet. Das Touchpad
+unterscheidet sich über `EventControllerScroll::unit()`: Mausräder liefern
+Rasterungen und zoomen, das Touchpad liefert Pixel und verschiebt — früher
+zoomte jedes seiner Dutzenden Ereignisse pro Wischer um einen vollen Schritt.
 
 Solange das Original noch lädt, zeigt der Betrachter die Vorschau hochskaliert
 — eine unscharfe Fläche ist besser als eine leere. Videos (`item_type ==
