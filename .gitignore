@@ -16,3 +16,6 @@ cookies/
 *.sqlite
 *.sqlite-wal
 *.sqlite-shm
+
+# Arbeitskopien paralleler Claude-Code-Agents.
+/.claude/worktrees/
