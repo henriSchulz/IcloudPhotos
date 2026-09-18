@@ -10,6 +10,10 @@ LRU (least recently used), damit die App nie unbegrenzt Plattenplatz frisst.
 
 ## Ziele v1 (Scope)
 
+**v1.0.0 ist erreicht** (Tag `v1.0.0`, September 2026): Sync mit Delta über
+den Zone-Token, Raster, Betrachter mit Zoom und Info-Panel, Videos, Export,
+Alben samt Seitenleiste und Collections, Karte, Start über den Launcher.
+
 - [x] Read-only Zugriff auf iCloud Photos (kein Upload, kein Löschen in iCloud)
 - [x] Periodischer Metadaten-Sync (kein Bulk-Download aller Originale)
 - [x] Thumbnail-first UI, Full-Res on demand

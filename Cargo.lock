@@ -668,7 +668,7 @@ dependencies = [
 
 [[package]]
 name = "icloud-photos-app"
-version = "0.1.0"
+version = "1.0.0"
 dependencies = [
  "anyhow",
  "chrono",
@@ -689,7 +689,7 @@ dependencies = [
 
 [[package]]
 name = "icloud-photos-cache"
-version = "0.1.0"
+version = "1.0.0"
 dependencies = [
  "chrono",
  "icloud-photos-core",
@@ -702,7 +702,7 @@ dependencies = [
 
 [[package]]
 name = "icloud-photos-core"
-version = "0.1.0"
+version = "1.0.0"
 dependencies = [
  "chrono",
  "directories",
@@ -715,7 +715,7 @@ dependencies = [
 
 [[package]]
 name = "icloud-photos-sync"
-version = "0.1.0"
+version = "1.0.0"
 dependencies = [
  "chrono",
  "directories",
