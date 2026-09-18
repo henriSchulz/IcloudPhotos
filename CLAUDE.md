@@ -331,6 +331,20 @@ Ein abgebrochener Sync wird vom nächsten Lauf vervollständigt:
 - Ein abgebrochener Erstaufbau setzt bei `baseline_offset` fort, statt von
   vorn zu paginieren. Der Fortschritt wird alle 50 Assets festgehalten.
 
+Der Einstieg bei `baseline_offset` muss **serverseitig** sein
+(`photos_from` im Sidecar). `itertools.islice` über `photos.all` holt jede
+Seite davor und wirft sie weg — bei ~3 s je 100 Assets hing ein bei 8.700
+fortgesetzter Erstaufbau bei jedem Start viereinhalb Minuten, ohne ein Foto zu
+liefern; wer die App vorher schloss, kam nie weiter. `photos_from` baut die
+Schleife aus `PhotoAlbum.photos` mit anderem Startrang nach (`photos.all` läuft
+**absteigend**: Position 0 ist Rang `len − 1`) und fällt ohne die
+nicht-öffentlichen `_get_photos_at`/`_direction` auf `islice` zurück.
+
+Vorschauen lädt der Erstaufbau mit acht Threads (`THUMB_WORKERS`): einzeln
+~2 Assets/s, parallel ~12,5 — sonst dauerten 10.000 Fotos über eine Stunde.
+Ausgegeben wird nur aus dem Hauptthread und in Reihenfolge; `offset` erst,
+wenn alles davor samt Vorschau geschrieben ist.
+
 ## Bedienung (Phase 2)
 
 **Betrachter** (`crates/app/src/viewer.rs`) — keine eigene Fensterebene,

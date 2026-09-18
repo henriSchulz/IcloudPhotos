@@ -41,7 +41,9 @@ import struct
 import sys
 import time
 import zlib
+from collections import deque
 from collections.abc import Iterator
+from concurrent.futures import Future, ThreadPoolExecutor
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any
@@ -406,11 +408,7 @@ def iter_assets(
     Durchlauf nie.
     """
     emitted = 0
-    source = api.photos.all
-    if offset:
-        # Serverseitiger Versatz: ein abgebrochener Erstaufbau muss nicht die
-        # bereits erledigten Seiten erneut holen.
-        source = itertools.islice(source, offset, None)
+    source = photos_from(api.photos.all, offset) if offset else api.photos.all
     for asset in source:
         if since is not None and asset.added_date <= since:
             continue
@@ -421,9 +419,56 @@ def iter_assets(
             return
 
 
+def photos_from(album: Any, offset: int) -> Iterator[Any]:
+    """Die Assets von ``album`` ab Position ``offset`` — mit serverseitigem
+    Einstieg.
+
+    ``itertools.islice`` ueber ``album.photos`` sieht nur so aus, als finge es
+    bei ``offset`` an: es holt jede Seite davor und wirft sie weg. Bei ~3 s je
+    100 Assets hiess das fuer einen bei 8.700 abgebrochenen Erstaufbau rund
+    viereinhalb Minuten ohne ein einziges neues Foto — bei jedem Start. Wer die
+    App vorher schloss, kam nie weiter.
+
+    Nachgebaut ist die Schleife aus ``PhotoAlbum.photos``, nur mit anderem
+    Startrang. ``_get_photos_at`` und ``_direction`` sind nicht oeffentlich;
+    fehlen sie, bleibt der langsame, aber richtige Weg.
+    """
+    try:
+        fetch = album._get_photos_at
+        direction = album._direction
+        page_size = album.page_size
+        total = len(album)
+    except Exception as exc:  # noqa: BLE001 - nicht-oeffentliche API
+        log(f"Serverseitiger Einstieg nicht moeglich ({type(exc).__name__}: {exc})")
+        yield from itertools.islice(album, offset, None)
+        return
+
+    # `photos.all` laeuft absteigend: Position 0 ist der hoechste Rang.
+    descending = getattr(direction, "name", "") == "DESCENDING"
+    if offset >= total:
+        return
+    rank = total - 1 - offset if descending else offset
+    seen: set[str] = set()
+    while True:
+        received = 0
+        for asset in fetch(rank, direction, page_size):
+            received += 1
+            if asset.id in seen:
+                continue
+            seen.add(asset.id)
+            yield asset
+        if received < page_size // 2:
+            return
+        rank = rank - received if descending else rank + received
+
+
 # Alle so viele Assets meldet der Erstaufbau seinen Fortschritt, damit ein
 # Abbruch nicht den ganzen Durchlauf kostet.
 OFFSET_REPORT_EVERY = 50
+
+# So viele Vorschauen laden gleichzeitig. Gemessen: 1 → 3,4/s, 4 → 12/s,
+# 8 → 22/s; darueber bremst das Seitenholen (~33 Assets/s).
+THUMB_WORKERS = 8
 
 
 def zone_token(api: Any) -> str | None:
@@ -454,13 +499,29 @@ def run_baseline(
         log(f"Bestand nicht zaehlbar: {exc}")
 
     count = 0
-    for index, asset in enumerate(iter_assets(api, None, limit, offset=offset), start=offset):
-        emit(record_for(asset))
-        count += 1
-        if thumbs is not None:
-            emit(download_thumb(asset, thumbs))
-        if count % OFFSET_REPORT_EVERY == 0:
+    # Vorschauen laden parallel: einzeln kam der Erstaufbau auf ~2 Assets/s,
+    # eine Stunde fuer 10.000 Fotos. Ausgegeben wird trotzdem nur hier, in
+    # Reihenfolge — und `offset` erst, wenn alles davor samt Vorschau
+    # geschrieben ist. Ein Abbruch verliert so nichts, was schon als erledigt
+    # gemeldet wurde.
+    pending: deque[tuple[int, Future[dict[str, Any]] | None]] = deque()
+
+    def settle(index: int, thumb: Future[dict[str, Any]] | None) -> None:
+        if thumb is not None:
+            emit(thumb.result())
+        if (index + 1 - offset) % OFFSET_REPORT_EVERY == 0:
             emit({"type": "offset", "value": index + 1})
+
+    with ThreadPoolExecutor(max_workers=THUMB_WORKERS) as pool:
+        for index, asset in enumerate(iter_assets(api, None, limit, offset=offset), start=offset):
+            emit(record_for(asset))
+            count += 1
+            thumb = pool.submit(download_thumb, asset, thumbs) if thumbs is not None else None
+            pending.append((index, thumb))
+            while len(pending) > THUMB_WORKERS * 2:
+                settle(*pending.popleft())
+        while pending:
+            settle(*pending.popleft())
 
     # Ein durch --limit abgeschnittener Lauf ist kein vollstaendiger Abgleich.
     # Wuerde er sich so melden, uebernaehme die App den Zone-Token und sehe den
