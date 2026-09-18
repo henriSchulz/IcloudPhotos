@@ -38,7 +38,9 @@ pub struct Viewer {
     stack: gtk::Stack,
     picture: ZoomView,
     video: gtk::Video,
-    spinner: gtk::Spinner,
+    /// Kleine Ladeanzeige unten rechts, solange nur die Vorschau zu sehen
+    /// ist und das Original noch aus iCloud kommt.
+    spinner: gtk::Box,
     zoom_label: gtk::Label,
     /// Die Fehlerseite — sie bekommt je nach Ursache einen anderen Text.
     failed: adw::StatusPage,
@@ -70,7 +72,26 @@ pub fn open(
     let failed_page = failed.clone();
 
     let stack = gtk::Stack::new();
-    stack.add_named(&picture, Some("image"));
+
+    // Unten in der Ecke statt in der Kopfzeile: dort, wo man hinsieht, und
+    // ohne das Bild zu verdecken. Derselbe Grund wie das Video-Kennzeichen im
+    // Raster, damit sie auf hellen wie dunklen Fotos lesbar ist.
+    let spinner = gtk::Box::builder()
+        .css_classes(["photo-badge"])
+        .halign(gtk::Align::End)
+        .valign(gtk::Align::End)
+        .margin_end(12)
+        .margin_bottom(12)
+        .can_target(false)
+        .visible(false)
+        .build();
+    spinner.append(&gtk::Spinner::builder().spinning(true).build());
+
+    // Die Anzeige haengt nur an der Bildseite: Laedt ein Video oder ein Foto
+    // ohne Vorschau, zeigt die Ladeseite ihren eigenen, grossen Kreisel.
+    let image_page = gtk::Overlay::builder().child(&picture).build();
+    image_page.add_overlay(&spinner);
+    stack.add_named(&image_page, Some("image"));
     stack.add_named(&video, Some("video"));
     stack.add_named(&loading, Some("loading"));
     stack.add_named(&failed, Some("failed"));
@@ -102,9 +123,6 @@ pub fn open(
     navigation.append(&previous);
     navigation.append(&next);
     header.pack_start(&navigation);
-
-    let spinner = gtk::Spinner::builder().visible(false).build();
-    header.pack_start(&spinner);
 
     let fullscreen = gtk::Button::builder()
         .icon_name("view-fullscreen-symbolic")
