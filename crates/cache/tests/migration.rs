@@ -99,3 +99,24 @@ fn opening_twice_is_harmless() {
     let catalog = Catalog::open(&path).unwrap();
     assert_eq!(catalog.count().unwrap(), 2);
 }
+
+#[test]
+fn schema_8_forgets_place_names_in_the_local_language() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("catalog.sqlite");
+    let cell = icloud_photos_cache::place_cell(48.1372, 11.5756);
+
+    // Ein Katalog aus Schema 7 mit einem deutschen Ortsnamen.
+    Catalog::open(&path)
+        .unwrap()
+        .remember_place(&cell, Some("Marienplatz, München"), chrono::Utc::now())
+        .unwrap();
+    Connection::open(&path)
+        .unwrap()
+        .pragma_update(None, "user_version", 7)
+        .unwrap();
+
+    // Nach dem Aufstieg wird die Stelle neu nachgeschlagen — jetzt englisch.
+    let catalog = Catalog::open(&path).unwrap();
+    assert_eq!(catalog.place(&cell).unwrap(), None);
+}

@@ -160,7 +160,7 @@ impl Config {
             })?;
         }
         let text = toml::to_string_pretty(self).map_err(|error| {
-            ConfigError::Invalid(format!("Konfiguration nicht serialisierbar: {error}"))
+            ConfigError::Invalid(format!("Configuration not serializable: {error}"))
         })?;
         std::fs::write(path, text).map_err(|source| ConfigError::Read {
             path: path.to_path_buf(),
@@ -183,18 +183,18 @@ impl Config {
         let limit = self.cache.full_res_cache_limit_gb;
         if !limit.is_finite() || limit <= 0.0 {
             return Err(ConfigError::Invalid(format!(
-                "full_res_cache_limit_gb muss > 0 sein, ist {limit}"
+                "full_res_cache_limit_gb must be > 0, is {limit}"
             )));
         }
         let ratio = self.cache.eviction_target_ratio;
         if !ratio.is_finite() || ratio <= 0.0 || ratio > 1.0 {
             return Err(ConfigError::Invalid(format!(
-                "eviction_target_ratio muss in (0, 1] liegen, ist {ratio}"
+                "eviction_target_ratio must be in (0, 1], is {ratio}"
             )));
         }
         if self.icloud.sync_interval_minutes == 0 {
             return Err(ConfigError::Invalid(
-                "sync_interval_minutes muss > 0 sein".into(),
+                "sync_interval_minutes must be > 0".into(),
             ));
         }
         Ok(())

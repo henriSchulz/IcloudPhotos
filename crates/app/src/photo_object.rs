@@ -10,18 +10,18 @@ use icloud_photos_core::model::Photo;
 /// Lokalisierungsbibliothek fuer zwoelf Woerter waere unverhaeltnismaessig.
 pub fn month_name(month: u32) -> &'static str {
     const NAMES: [&str; 12] = [
-        "Januar",
-        "Februar",
-        "März",
+        "January",
+        "February",
+        "March",
         "April",
-        "Mai",
-        "Juni",
-        "Juli",
+        "May",
+        "June",
+        "July",
         "August",
         "September",
-        "Oktober",
+        "October",
         "November",
-        "Dezember",
+        "December",
     ];
     NAMES.get((month as usize).saturating_sub(1)).unwrap_or(&"")
 }
@@ -92,9 +92,9 @@ impl PhotoObject {
         *imp.month_label.borrow_mut() =
             format!("{} {}", month_name(captured.month()), captured.format("%Y"));
         *imp.captured_label.borrow_mut() = format!(
-            "{}. {} {}, {}",
-            captured.format("%-d"),
+            "{} {}, {} at {}",
             month_name(captured.month()),
+            captured.format("%-d"),
             captured.format("%Y"),
             captured.format("%H:%M")
         );

@@ -90,7 +90,7 @@ impl SyncManager {
         button_content.append(&button_spinner);
         let button = gtk::Button::builder()
             .child(&button_content)
-            .tooltip_text("Synchronisation (Strg+Umschalt+R)")
+            .tooltip_text("Sync (Ctrl+Shift+R)")
             .build();
 
         // --- Aktueller Lauf ----------------------------------------------
@@ -100,7 +100,7 @@ impl SyncManager {
             .hexpand(true)
             .wrap(true)
             .css_classes(["heading"])
-            .label("Bereit")
+            .label("Ready")
             .build();
         let detail = gtk::Label::builder()
             .xalign(1.0)
@@ -114,7 +114,7 @@ impl SyncManager {
         let bar = gtk::ProgressBar::builder().visible(false).build();
 
         let sync_now = gtk::Button::builder()
-            .label("Jetzt synchronisieren")
+            .label("Sync Now")
             .halign(gtk::Align::Center)
             .css_classes(["pill", "suggested-action"])
             .build();
@@ -138,15 +138,15 @@ impl SyncManager {
                 .css_classes(["property"])
                 .build()
         };
-        let photos_row = row("Fotos auf diesem Gerät");
-        let icloud_row = row("Fotos in iCloud");
-        icloud_row.set_subtitle("wird beim nächsten vollständigen Abgleich ermittelt");
-        let last_sync_row = row("Zuletzt abgeglichen");
-        let full_pass_row = row("Letzter vollständiger Abgleich");
-        let result_row = row("Ergebnis des letzten Laufs");
+        let photos_row = row("Photos on This Device");
+        let icloud_row = row("Photos in iCloud");
+        icloud_row.set_subtitle("determined on the next full sync");
+        let last_sync_row = row("Last Synced");
+        let full_pass_row = row("Last Full Sync");
+        let result_row = row("Last Result");
         result_row.set_visible(false);
 
-        let library = adw::PreferencesGroup::builder().title("Bibliothek").build();
+        let library = adw::PreferencesGroup::builder().title("Library").build();
         library.add(&photos_row);
         library.add(&icloud_row);
         library.add(&last_sync_row);
@@ -154,7 +154,7 @@ impl SyncManager {
         library.add(&result_row);
 
         let error_row = adw::ActionRow::builder()
-            .title("Letzter Lauf gescheitert")
+            .title("Last Sync Failed")
             .subtitle_selectable(true)
             .css_classes(["error"])
             .visible(false)
@@ -163,14 +163,14 @@ impl SyncManager {
         let problems = adw::PreferencesGroup::new();
         problems.add(&error_row);
 
-        let thumbs_row = row("Vorschaubilder für die Galerie");
-        let cache_row = row("Cache für Originale");
-        let account_row = row("Apple-ID");
+        let thumbs_row = row("Thumbnails");
+        let cache_row = row("Originals Cache");
+        let account_row = row("Apple Account");
         // Je ein Knopf, der den Ordner im Dateimanager oeffnet.
         let folder_button = || {
             gtk::Button::builder()
                 .icon_name("folder-open-symbolic")
-                .tooltip_text("Ordner öffnen")
+                .tooltip_text("Open Folder")
                 .valign(gtk::Align::Center)
                 .css_classes(["flat"])
                 .build()
@@ -181,7 +181,7 @@ impl SyncManager {
         cache_row.add_suffix(&open_originals);
 
         let details = adw::PreferencesGroup::builder()
-            .title("Konto und Speicher")
+            .title("Account and Storage")
             .build();
         details.add(&account_row);
         details.add(&thumbs_row);
@@ -213,7 +213,7 @@ impl SyncManager {
         toolbar.set_content(Some(&scroller));
 
         let dialog = adw::Dialog::builder()
-            .title("Synchronisation")
+            .title("Sync")
             .content_width(480)
             .child(&toolbar)
             .build();
@@ -301,16 +301,16 @@ impl SyncManager {
     pub fn show_overview(&self, overview: &Overview) {
         self.photos_row.set_subtitle(&thousands(overview.photos));
         self.last_sync_row
-            .set_subtitle(overview.last_sync.as_deref().unwrap_or("noch nie"));
+            .set_subtitle(overview.last_sync.as_deref().unwrap_or("never"));
         self.full_pass_row
-            .set_subtitle(overview.last_full_pass.as_deref().unwrap_or("noch nie"));
+            .set_subtitle(overview.last_full_pass.as_deref().unwrap_or("never"));
         self.cache_row.set_subtitle(&overview.cache);
         self.thumbs_row.set_subtitle(&overview.thumbnails);
         *self.thumbnail_dir.borrow_mut() = overview.thumbnail_dir.clone();
         *self.full_res_dir.borrow_mut() = overview.full_res_dir.clone();
         self.account_row
             .set_subtitle(if overview.apple_id.is_empty() {
-                "nicht angemeldet"
+                "not signed in"
             } else {
                 &overview.apple_id
             });
@@ -327,11 +327,11 @@ impl SyncManager {
             "emblem-synchronizing-symbolic"
         }));
         self.button.set_tooltip_text(Some(if running {
-            "Synchronisation läuft (Strg+Umschalt+R)"
+            "Syncing (Ctrl+Shift+R)"
         } else if failed {
-            "Letzte Synchronisation gescheitert (Strg+Umschalt+R)"
+            "Last Sync Failed (Ctrl+Shift+R)"
         } else {
-            "Synchronisation (Strg+Umschalt+R)"
+            "Sync (Ctrl+Shift+R)"
         }));
     }
 
@@ -357,11 +357,12 @@ impl SyncManager {
             // Ein fortgesetzter Erstaufbau sieht sonst aus wie einer, der
             // wieder von vorn anfängt.
             Some(offset) => {
-                self.title.set_label("Abgebrochenen Abgleich fortsetzen …");
-                self.detail.set_label(&format!("ab {}", thousands(offset)));
+                self.title.set_label("Resuming Interrupted Sync…");
+                self.detail
+                    .set_label(&format!("from {}", thousands(offset)));
             }
             None => {
-                self.title.set_label("Verbinde mit iCloud …");
+                self.title.set_label("Connecting to iCloud…");
                 self.detail.set_label("");
             }
         }
@@ -369,7 +370,7 @@ impl SyncManager {
 
     /// Die Anmeldung ist durch.
     pub fn authenticated(&self) {
-        self.title.set_label("Gleiche Bibliothek ab …");
+        self.title.set_label("Syncing Library…");
     }
 
     /// Der Gesamtbestand ist bekannt — ab jetzt kann der Balken etwas zeigen.
@@ -394,9 +395,9 @@ impl SyncManager {
         let expected = self.expected.get();
         if self.full_pass.get() && expected > 0 {
             self.title.set_label(if self.base.get() > 0 {
-                "Lade Fotos · Fortsetzung"
+                "Loading Photos · Resumed"
             } else {
-                "Lade Fotos"
+                "Loading Photos"
             });
             self.detail
                 .set_label(&format!("{} / {}", thousands(total), thousands(expected)));
@@ -405,7 +406,7 @@ impl SyncManager {
         } else {
             // Ohne Bezugsgroesse sagt ein Balkenstand nichts — ein wandernder
             // Balken immerhin, dass es weitergeht.
-            self.title.set_label("Gleiche Änderungen ab");
+            self.title.set_label("Syncing Changes");
             self.detail.set_label(&thousands(total));
             self.bar.pulse();
         }
@@ -418,7 +419,7 @@ impl SyncManager {
         self.base.set(0);
         self.full_pass.set(false);
         self.reached.set(0);
-        self.title.set_label("Hole fehlende Vorschauen");
+        self.title.set_label("Fetching Missing Thumbnails");
         self.detail
             .set_label(&format!("0 / {}", thousands(missing)));
         self.backfill_total.set(missing);
@@ -439,7 +440,7 @@ impl SyncManager {
     }
 
     pub fn deleting(&self, removed: u64) {
-        self.title.set_label("Entferne gelöschte Fotos");
+        self.title.set_label("Removing Deleted Photos");
         self.detail.set_label(&thousands(removed));
         self.bar.pulse();
     }
@@ -447,7 +448,7 @@ impl SyncManager {
     /// Der Lauf ist durch.
     pub fn finished(&self, message: &str) {
         self.set_running(false);
-        self.title.set_label("Auf dem neuesten Stand");
+        self.title.set_label("Up to Date");
         self.detail.set_label("");
         self.result_row.set_subtitle(message);
         self.result_row.set_visible(true);
@@ -494,7 +495,7 @@ pub fn thousands(value: u64) -> String {
     let mut out = String::with_capacity(digits.len() + digits.len() / 3);
     for (index, digit) in digits.chars().enumerate() {
         if index > 0 && (digits.len() - index).is_multiple_of(3) {
-            out.push('.');
+            out.push(',');
         }
         out.push(digit);
     }
@@ -510,8 +511,8 @@ mod tests {
         assert_eq!(thousands(0), "0");
         assert_eq!(thousands(7), "7");
         assert_eq!(thousands(999), "999");
-        assert_eq!(thousands(1_000), "1.000");
-        assert_eq!(thousands(19_624), "19.624");
-        assert_eq!(thousands(1_234_567), "1.234.567");
+        assert_eq!(thousands(1_000), "1,000");
+        assert_eq!(thousands(19_624), "19,624");
+        assert_eq!(thousands(1_234_567), "1,234,567");
     }
 }

@@ -10,14 +10,14 @@ pub use evict::{EvictionReport, enforce_limit};
 /// Fehler aus Katalog- und Cache-Operationen.
 #[derive(Debug, thiserror::Error)]
 pub enum CacheError {
-    #[error("Datenbankfehler")]
+    #[error("Database error")]
     Db(#[from] rusqlite::Error),
-    #[error("Dateisystemfehler bei {path}")]
+    #[error("File system error at {path}")]
     Io {
         path: std::path::PathBuf,
         #[source]
         source: std::io::Error,
     },
-    #[error("Ungültiger Zeitstempel in der Datenbank: {0:?}")]
+    #[error("Invalid timestamp in the database: {0:?}")]
     Timestamp(String),
 }

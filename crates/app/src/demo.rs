@@ -63,7 +63,7 @@ pub fn seed(catalog: &Catalog, config: &Config) -> anyhow::Result<()> {
 /// Schreibt ein einfarbiges PNG und gibt seine Größe in Bytes zurück.
 fn write_swatch(path: &Path, size: i32, index: usize) -> anyhow::Result<u64> {
     let pixbuf = Pixbuf::new(Colorspace::Rgb, false, 8, size, size)
-        .ok_or_else(|| anyhow::anyhow!("Pixbuf konnte nicht angelegt werden"))?;
+        .ok_or_else(|| anyhow::anyhow!("Could not create a pixbuf"))?;
     pixbuf.fill(color_for(index));
     pixbuf.savev(path, "png", &[])?;
     Ok(std::fs::metadata(path)?.len())

@@ -88,7 +88,7 @@ pub fn spawn(
             Ok(runtime) => runtime,
             Err(error) => {
                 let _ = tx.send(SyncMessage::Finished(Err(format!(
-                    "Tokio-Runtime konnte nicht starten: {error}"
+                    "Could not start the Tokio runtime: {error}"
                 ))));
                 return;
             }
@@ -99,7 +99,7 @@ pub fn spawn(
                 Ok(catalog) => catalog,
                 Err(error) => {
                     let _ = tx.send(SyncMessage::Finished(Err(format!(
-                        "Katalog konnte nicht geöffnet werden: {error}"
+                        "Could not open the library database: {error}"
                     ))));
                     return;
                 }
@@ -115,7 +115,7 @@ pub fn spawn(
                 Ok(state) => state,
                 Err(error) => {
                     let _ = tx.send(SyncMessage::Finished(Err(format!(
-                        "Sync-Zustand nicht lesbar: {error}"
+                        "Could not read the sync state: {error}"
                     ))));
                     return;
                 }

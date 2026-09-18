@@ -716,8 +716,8 @@ pub fn build(app: &adw::Application, state: Rc<AppState>) {
 
     let empty = adw::StatusPage::builder()
         .icon_name("image-x-generic-symbolic")
-        .title("Noch keine Fotos")
-        .description("Starte einen Sync, um den Katalog zu füllen.")
+        .title("No Photos Yet")
+        .description("Start a sync to fill your library.")
         .build();
 
     let stack = gtk::Stack::new();
@@ -900,10 +900,10 @@ pub fn build(app: &adw::Application, state: Rc<AppState>) {
 /// Das Passwort geht nie in die Konfiguration — es wird nur bis zur ersten
 /// Verwendung im Speicher gehalten und danach vom Sidecar im Keyring abgelegt.
 fn build_login_page(state: &Rc<AppState>, trigger: Rc<dyn Fn()>) -> gtk::Widget {
-    let username = adw::EntryRow::builder().title("Apple-ID").build();
+    let username = adw::EntryRow::builder().title("Apple Account").build();
     username.set_text(&state.config.borrow().icloud.username);
 
-    let password = adw::PasswordEntryRow::builder().title("Passwort").build();
+    let password = adw::PasswordEntryRow::builder().title("Password").build();
 
     let fields = gtk::ListBox::builder()
         .selection_mode(gtk::SelectionMode::None)
@@ -916,9 +916,8 @@ fn build_login_page(state: &Rc<AppState>, trigger: Rc<dyn Fn()>) -> gtk::Widget 
     // auf eine Zeile und die Einrueckung bleibt als Leerzeichenkette im Text.
     let hint = gtk::Label::builder()
         .label(concat!(
-            "Das Passwort wird im System-Schlüsselbund gespeichert, nicht in einer Datei. ",
-            "Bei aktivierter Zwei-Faktor-Authentifizierung fragt die App gleich danach ",
-            "nach dem Code."
+            "Your password is stored in the system keyring, never in a file. ",
+            "If two-factor authentication is on, the app asks for the code next."
         ))
         .wrap(true)
         .max_width_chars(46)
@@ -934,7 +933,7 @@ fn build_login_page(state: &Rc<AppState>, trigger: Rc<dyn Fn()>) -> gtk::Widget 
         .build();
 
     let submit = gtk::Button::builder()
-        .label("Anmelden")
+        .label("Sign In")
         .css_classes(["suggested-action", "pill"])
         .halign(gtk::Align::Center)
         .build();
@@ -950,7 +949,7 @@ fn build_login_page(state: &Rc<AppState>, trigger: Rc<dyn Fn()>) -> gtk::Widget 
     // das Formular gesperrt ist.
     let spinner = gtk::Spinner::builder().spinning(true).build();
     let busy_label = gtk::Label::builder()
-        .label("Anmeldung läuft …")
+        .label("Signing In…")
         .css_classes(["dim-label"])
         .build();
     let busy = gtk::Box::new(gtk::Orientation::Horizontal, 10);
@@ -979,8 +978,8 @@ fn build_login_page(state: &Rc<AppState>, trigger: Rc<dyn Fn()>) -> gtk::Widget 
 
     let page = adw::StatusPage::builder()
         .icon_name("avatar-default-symbolic")
-        .title("Bei iCloud anmelden")
-        .description("Nur Lesezugriff — die App lädt keine Fotos hoch und löscht nichts.")
+        .title("Sign In to iCloud")
+        .description("Read-only — this app never uploads or deletes anything.")
         .child(&clamp)
         .build();
 
@@ -992,19 +991,19 @@ fn build_login_page(state: &Rc<AppState>, trigger: Rc<dyn Fn()>) -> gtk::Widget 
         move || {
             let id = username.text().trim().to_string();
             if id.is_empty() {
-                error.set_label("Bitte eine Apple-ID eingeben.");
+                error.set_label("Enter your Apple Account.");
                 error.set_visible(true);
                 return;
             }
             let secret = password.text().to_string();
             if secret.is_empty() {
-                error.set_label("Bitte das Passwort eingeben.");
+                error.set_label("Enter your password.");
                 error.set_visible(true);
                 return;
             }
 
             if let Err(message) = state.set_username(&id) {
-                error.set_label(&format!("Konfiguration nicht speicherbar: {message}"));
+                error.set_label(&format!("Could not save the configuration: {message}"));
                 error.set_visible(true);
                 return;
             }
@@ -1107,8 +1106,8 @@ fn start_downloader(
                 DownloadMessage::PasswordRequired { responder } => {
                     match ask_secret(
                         &window,
-                        "Passwort für iCloud",
-                        "Im Schlüsselbund liegt kein Passwort für diese Apple-ID.",
+                        "iCloud Password",
+                        "There is no password for this Apple Account in the keyring.",
                         SecretKind::Password,
                     )
                     .await
@@ -1126,8 +1125,8 @@ fn start_downloader(
                 DownloadMessage::TwoFactorRequired { responder } => {
                     match ask_secret(
                         &window,
-                        "Zwei-Faktor-Authentifizierung",
-                        "Apple hat einen Bestätigungscode an deine Geräte geschickt.",
+                        "Two-Factor Authentication",
+                        "Apple sent a verification code to your devices.",
                         SecretKind::TwoFactor,
                     )
                     .await
@@ -1419,7 +1418,7 @@ fn update_status(state: &Rc<AppState>, status: &gtk::Label, stack: &gtk::Stack) 
     status.set_label(&format!(
         "{} {}",
         thousands(total),
-        if total == 1 { "Foto" } else { "Fotos" }
+        if total == 1 { "Photo" } else { "Photos" }
     ));
 
     if let Some(manager) = state.sync_manager.borrow().as_ref() {
@@ -1434,10 +1433,10 @@ fn update_status(state: &Rc<AppState>, status: &gtk::Label, stack: &gtk::Stack) 
             last_full_pass: sync_state
                 .and_then(|s| s.last_baseline_at)
                 .map(|then| since(then, now)),
-            cache: format!("{} von {}", human_bytes(cached), human_bytes(limit)),
+            cache: format!("{} of {}", human_bytes(cached), human_bytes(limit)),
             thumbnails: {
                 let (bytes, count) = state.catalog.borrow().thumbnail_usage().unwrap_or((0, 0));
-                format!("{} · {} Vorschauen", human_bytes(bytes), thousands(count))
+                format!("{} · {} thumbnails", human_bytes(bytes), thousands(count))
             },
             thumbnail_dir: state.config.borrow().paths.thumbnail_dir.clone(),
             full_res_dir: state.config.borrow().paths.full_res_dir.clone(),
@@ -1456,13 +1455,13 @@ fn since(then: chrono::DateTime<chrono::Utc>, now: chrono::DateTime<chrono::Utc>
     match minutes {
         // Auch eine Uhr, die kurz rueckwaerts lief, soll etwas Sinnvolles
         // ergeben.
-        i64::MIN..=0 => "gerade aktualisiert".to_string(),
-        1 => "vor 1 Minute".to_string(),
-        2..=59 => format!("vor {minutes} Minuten"),
-        60..=119 => "vor 1 Stunde".to_string(),
-        120..=1439 => format!("vor {} Stunden", minutes / 60),
-        1440..=2879 => "vor 1 Tag".to_string(),
-        _ => format!("vor {} Tagen", minutes / 1440),
+        i64::MIN..=0 => "just now".to_string(),
+        1 => "1 minute ago".to_string(),
+        2..=59 => format!("{minutes} minutes ago"),
+        60..=119 => "1 hour ago".to_string(),
+        120..=1439 => format!("{} hours ago", minutes / 60),
+        1440..=2879 => "1 day ago".to_string(),
+        _ => format!("{} days ago", minutes / 1440),
     }
 }
 
@@ -1473,9 +1472,9 @@ fn outcome(summary: &SyncSummary) -> String {
         // fehlende Vorschauen kann trotzdem gearbeitet haben, und das war bei
         // einer grossen Bibliothek die halbe Minute davor.
         return match summary.thumbnails {
-            0 => "Bibliothek unverändert".to_string(),
+            0 => "Library unchanged".to_string(),
             count => format!(
-                "Bibliothek unverändert · {} Vorschauen geholt",
+                "Library unchanged · {} thumbnails fetched",
                 thousands(count)
             ),
         };
@@ -1483,18 +1482,18 @@ fn outcome(summary: &SyncSummary) -> String {
 
     let mut parts = Vec::new();
     if summary.stored > 0 {
-        parts.push(format!("{} Fotos", thousands(summary.stored)));
+        parts.push(format!("{} photos", thousands(summary.stored)));
     }
     if summary.thumbnails > 0 {
-        parts.push(format!("{} Vorschauen", thousands(summary.thumbnails)));
+        parts.push(format!("{} thumbnails", thousands(summary.thumbnails)));
     }
     if summary.deleted > 0 {
-        parts.push(format!("{} entfernt", thousands(summary.deleted)));
+        parts.push(format!("{} removed", thousands(summary.deleted)));
     }
     if parts.is_empty() {
-        return "Abgleich fertig · nichts Neues".to_string();
+        return "Sync complete · nothing new".to_string();
     }
-    format!("Abgleich fertig · {}", parts.join(", "))
+    format!("Sync complete · {}", parts.join(", "))
 }
 
 fn human_bytes(bytes: u64) -> String {
@@ -1586,8 +1585,8 @@ fn start_sync(
                 SyncMessage::PasswordRequired { responder } => {
                     match ask_secret(
                         &window,
-                        "Passwort für iCloud",
-                        "Im Schlüsselbund liegt kein Passwort für diese Apple-ID.",
+                        "iCloud Password",
+                        "There is no password for this Apple Account in the keyring.",
                         SecretKind::Password,
                     )
                     .await
@@ -1601,13 +1600,13 @@ fn start_sync(
                 SyncMessage::CredentialsRejected { message } => {
                     tracing::warn!(%message, "Anmeldung abgelehnt");
                     state.reset_credentials();
-                    state.login_error("Apple hat diese Zugangsdaten abgelehnt.");
-                    manager.failed("Anmeldung fehlgeschlagen", &message);
+                    state.login_error("Apple rejected these credentials.");
+                    manager.failed("Sign-in failed", &message);
                     update_status(&state, &status, &stack);
                     show_error(
                         &window,
-                        "Anmeldung fehlgeschlagen",
-                        &format!("Apple hat die Anmeldung abgelehnt: {message}"),
+                        "Sign-In Failed",
+                        &format!("Apple rejected the sign-in: {message}"),
                     );
                 }
                 SyncMessage::TermsRequired(request) => {
@@ -1617,8 +1616,8 @@ fn start_sync(
                 SyncMessage::TwoFactorRequired { responder } => {
                     let code = ask_secret(
                         &window,
-                        "Zwei-Faktor-Authentifizierung",
-                        "Apple hat einen Bestätigungscode an deine Geräte geschickt.",
+                        "Two-Factor Authentication",
+                        "Apple sent a verification code to your devices.",
                         SecretKind::TwoFactor,
                     )
                     .await;
@@ -1652,9 +1651,9 @@ fn start_sync(
                     // muss die Maske wieder bedienbar sein, sonst haengt der
                     // Nutzer in einem gesperrten Formular fest.
                     if !state.authenticated.get() {
-                        state.login_error("Anmeldung nicht abgeschlossen. Bitte erneut versuchen.");
+                        state.login_error("Sign-in did not complete. Please try again.");
                     }
-                    manager.failed("Abgleich fehlgeschlagen", &error);
+                    manager.failed("Sync failed", &error);
                     // Was bis zum Abbruch ankam, soll stehen bleiben — nur die
                     // Skelette fuer den Rest nicht.
                     state.syncing.set(false);
@@ -1662,7 +1661,7 @@ fn start_sync(
                     // Kein Dialog mitten ins Betrachten: ein Hinweis, der
                     // von selbst verschwindet, und die Einzelheiten im Manager.
                     let toast = adw::Toast::builder()
-                        .title("Synchronisation fehlgeschlagen")
+                        .title("Sync failed")
                         .button_label("Details")
                         .action_name("photos.sync-manager")
                         .build();
@@ -1701,7 +1700,7 @@ async fn ask_secret(
             .build()
             .upcast(),
         SecretKind::TwoFactor => gtk::Entry::builder()
-            .placeholder_text("6-stelliger Code")
+            .placeholder_text("6-digit code")
             .input_purpose(gtk::InputPurpose::Digits)
             .max_length(6)
             .activates_default(true)
@@ -1716,8 +1715,8 @@ async fn ask_secret(
         .default_response("ok")
         .close_response("cancel")
         .build();
-    dialog.add_response("cancel", "Abbrechen");
-    dialog.add_response("ok", "Bestätigen");
+    dialog.add_response("cancel", "Cancel");
+    dialog.add_response("ok", "Verify");
     dialog.set_response_appearance("ok", adw::ResponseAppearance::Suggested);
 
     let response = dialog.choose_future(Some(parent)).await;
@@ -1744,19 +1743,19 @@ async fn ask_secret(
 /// Deshalb kein Haken im Hintergrund, sondern eine Entscheidung mit Verweis
 /// auf den Text — und Ablehnen als Vorgabe beim Schliessen.
 async fn ask_terms(parent: &adw::ApplicationWindow, url: &str) -> bool {
-    let link = gtk::LinkButton::with_label(url, "Nutzungsbedingungen lesen");
+    let link = gtk::LinkButton::with_label(url, "Read the Terms and Conditions");
     let dialog = adw::AlertDialog::builder()
-        .heading("Neue iCloud-Nutzungsbedingungen")
+        .heading("New iCloud Terms and Conditions")
         .body(
-            "Apple hat die iCloud-Nutzungsbedingungen geändert. Ohne Zustimmung \
-             lässt iCloud keine Anmeldung zu.\n\nDie Zustimmung gilt für dein \
-             Apple-Konto, genauso als hättest du sie auf icloud.com gegeben.",
+            "Apple has changed the iCloud Terms and Conditions. iCloud won't let \
+             you sign in until you agree.\n\nAgreeing applies to your whole \
+             Apple Account, just as if you had agreed on icloud.com.",
         )
         .extra_child(&link)
         .close_response("decline")
         .build();
-    dialog.add_response("decline", "Ablehnen");
-    dialog.add_response("accept", "Akzeptieren");
+    dialog.add_response("decline", "Decline");
+    dialog.add_response("accept", "Agree");
     dialog.set_response_appearance("accept", adw::ResponseAppearance::Suggested);
     dialog.choose_future(Some(parent)).await == "accept"
 }
@@ -1842,7 +1841,7 @@ fn build_jump_button(
     let popover = gtk::Popover::builder().child(&scroller).build();
     let button = gtk::MenuButton::builder()
         .icon_name("x-office-calendar-symbolic")
-        .tooltip_text("Zu einem Monat springen (Strg+J)")
+        .tooltip_text("Jump to a Month (Ctrl+J)")
         .popover(&popover)
         .build();
 
@@ -1953,17 +1952,17 @@ fn build_selection_actions(
 ) -> gio::SimpleActionGroup {
     let save = gtk::Button::builder()
         .icon_name("document-save-symbolic")
-        .tooltip_text("Auswahl sichern …")
+        .tooltip_text("Export Selection…")
         .sensitive(false)
         .build();
     let copy = gtk::Button::builder()
         .icon_name("edit-copy-symbolic")
-        .tooltip_text("Auswahl kopieren")
+        .tooltip_text("Copy Selection")
         .sensitive(false)
         .build();
     let open = gtk::Button::builder()
         .icon_name("document-open-symbolic")
-        .tooltip_text("Mit Standardanwendung öffnen")
+        .tooltip_text("Open in Default App")
         .sensitive(false)
         .build();
 
@@ -2099,17 +2098,17 @@ async fn ask_format(
 
     let dialog = adw::AlertDialog::builder()
         .heading(if count == 1 {
-            "Foto sichern".to_string()
+            "Export Photo".to_string()
         } else {
-            format!("{} Fotos sichern", thousands(count as u64))
+            format!("Export {} Photos", thousands(count as u64))
         })
-        .body("In welchem Format? Videos bleiben immer im Original.")
+        .body("Which format? Videos are always exported as originals.")
         .extra_child(&list)
         .default_response("choose")
         .close_response("cancel")
         .build();
-    dialog.add_response("cancel", "Abbrechen");
-    dialog.add_response("choose", "Ordner wählen …");
+    dialog.add_response("cancel", "Cancel");
+    dialog.add_response("choose", "Choose Folder…");
     dialog.set_response_appearance("choose", adw::ResponseAppearance::Suggested);
 
     if dialog.choose_future(Some(parent)).await != "choose" {
@@ -2133,7 +2132,7 @@ fn start_action(
         return;
     }
     if state.job.borrow().is_some() {
-        toasts.add_toast(adw::Toast::new("Es läuft bereits ein Auftrag."));
+        toasts.add_toast(adw::Toast::new("Another task is already running."));
         return;
     }
 
@@ -2153,8 +2152,8 @@ fn start_action(
                 state.save_format.set(format);
 
                 let dialog = gtk::FileDialog::builder()
-                    .title("Fotos sichern")
-                    .accept_label("Hierhin sichern")
+                    .title("Export Photos")
+                    .accept_label("Export Here")
                     .build();
                 let Ok(folder) = dialog.select_folder_future(Some(&window)).await else {
                     return;
@@ -2224,7 +2223,7 @@ fn advance_job(
         Some(job) => {
             let (ready, total) = job.progress();
             if !job.is_done() {
-                status.set_label(&format!("{} … {ready} / {total}", job.action.verb()));
+                status.set_label(&format!("{}… {ready} / {total}", job.action.verb()));
             }
             job.is_done()
         }
@@ -2247,14 +2246,14 @@ fn advance_job(
         let format = *format;
         let files = job.ready().to_vec();
         let missing = job.failed();
-        status.set_label(&format!("Sichere {} …", format.label()));
+        status.set_label(&format!("Exporting as {}…", format.label()));
         let status = status.clone();
         let toasts = toasts.clone();
         glib::spawn_future_local(async move {
             let saved = gio::spawn_blocking(move || export::save_into(&dir, &files, format))
                 .await
                 .unwrap_or_else(|_| export::Saved {
-                    errors: vec!["Sichern abgebrochen".to_string()],
+                    errors: vec!["Export aborted".to_string()],
                     ..Default::default()
                 });
             for error in &saved.errors {
@@ -2274,17 +2273,17 @@ fn advance_job(
 /// „3 Fotos gesichert · 1 Video im Original · 2 nicht"
 fn saved_message(saved: &export::Saved, missing: usize) -> String {
     let mut message = match saved.saved {
-        1 => "1 Foto gesichert".to_string(),
-        other => format!("{other} Fotos gesichert"),
+        1 => "1 photo exported".to_string(),
+        other => format!("{other} photos exported"),
     };
     match saved.kept_as_video {
         0 => {}
-        1 => message.push_str(" · 1 Video im Original"),
-        other => message.push_str(&format!(" · {other} Videos im Original")),
+        1 => message.push_str(" · 1 video as original"),
+        other => message.push_str(&format!(" · {other} videos as originals")),
     }
     let failed = missing + saved.errors.len();
     if failed > 0 {
-        message.push_str(&format!(" · {failed} nicht"));
+        message.push_str(&format!(" · {failed} failed"));
     }
     message
 }
@@ -2293,14 +2292,14 @@ fn saved_message(saved: &export::Saved, missing: usize) -> String {
 fn finish_job(window: &adw::ApplicationWindow, job: &export::Job) -> String {
     let files = job.ready();
     if files.is_empty() {
-        return "Kein Original verfügbar.".to_string();
+        return "No originals available.".to_string();
     }
     let missing = job.failed();
 
     match &job.action {
         // Laeuft in `advance_job` im Hilfsthread; hier nur, falls es
         // nichts zu sichern gab.
-        export::Action::SaveTo(..) => format!("Nichts gesichert · {missing} nicht verfügbar"),
+        export::Action::SaveTo(..) => format!("Nothing exported · {missing} unavailable"),
         export::Action::Clipboard => {
             let paths: Vec<gio::File> = files
                 .iter()
@@ -2314,8 +2313,8 @@ fn finish_job(window: &adw::ApplicationWindow, job: &export::Job) -> String {
                     |error| tracing::warn!(%error, "Zwischenablage nicht beschreibbar"),
                 );
             match files.len() {
-                1 => "1 Foto kopiert".to_string(),
-                other => format!("{other} Fotos kopiert"),
+                1 => "1 photo copied".to_string(),
+                other => format!("{other} photos copied"),
             }
         }
         export::Action::Open => {
@@ -2326,7 +2325,7 @@ fn finish_job(window: &adw::ApplicationWindow, job: &export::Job) -> String {
                     tracing::warn!(%error, "Öffnen fehlgeschlagen");
                 }
             });
-            "Wird geöffnet …".to_string()
+            "Opening…".to_string()
         }
     }
 }
@@ -2446,20 +2445,17 @@ mod tests {
             .with_timezone(&chrono::Utc);
         let ago = |minutes: i64| since(now - chrono::TimeDelta::minutes(minutes), now);
 
-        assert_eq!(ago(0), "gerade aktualisiert");
-        assert_eq!(ago(1), "vor 1 Minute");
-        assert_eq!(ago(3), "vor 3 Minuten");
-        assert_eq!(ago(59), "vor 59 Minuten");
-        assert_eq!(ago(60), "vor 1 Stunde");
-        assert_eq!(ago(150), "vor 2 Stunden");
-        assert_eq!(ago(1_440), "vor 1 Tag");
-        assert_eq!(ago(4_320), "vor 3 Tagen");
+        assert_eq!(ago(0), "just now");
+        assert_eq!(ago(1), "1 minute ago");
+        assert_eq!(ago(3), "3 minutes ago");
+        assert_eq!(ago(59), "59 minutes ago");
+        assert_eq!(ago(60), "1 hour ago");
+        assert_eq!(ago(150), "2 hours ago");
+        assert_eq!(ago(1_440), "1 day ago");
+        assert_eq!(ago(4_320), "3 days ago");
 
         // Eine rueckwaerts gestellte Uhr darf keine negative Angabe ergeben.
-        assert_eq!(
-            since(now + chrono::TimeDelta::minutes(5), now),
-            "gerade aktualisiert"
-        );
+        assert_eq!(since(now + chrono::TimeDelta::minutes(5), now), "just now");
     }
 
     #[test]
@@ -2468,25 +2464,25 @@ mod tests {
             unchanged: true,
             ..Default::default()
         };
-        assert_eq!(outcome(&summary), "Bibliothek unverändert");
+        assert_eq!(outcome(&summary), "Library unchanged");
 
         // Nachgeholte Vorschauen sind Arbeit, auch wenn sich sonst nichts tat.
         summary.thumbnails = 300;
         assert_eq!(
             outcome(&summary),
-            "Bibliothek unverändert · 300 Vorschauen geholt"
+            "Library unchanged · 300 thumbnails fetched"
         );
         summary.thumbnails = 0;
 
         summary.unchanged = false;
-        assert_eq!(outcome(&summary), "Abgleich fertig · nichts Neues");
+        assert_eq!(outcome(&summary), "Sync complete · nothing new");
 
         summary.stored = 1_234;
         summary.thumbnails = 12;
         summary.deleted = 2;
         assert_eq!(
             outcome(&summary),
-            "Abgleich fertig · 1.234 Fotos, 12 Vorschauen, 2 entfernt"
+            "Sync complete · 1,234 photos, 12 thumbnails, 2 removed"
         );
     }
 

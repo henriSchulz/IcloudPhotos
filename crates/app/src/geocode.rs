@@ -28,7 +28,7 @@ const MIN_INTERVAL: Duration = Duration::from_secs(1);
 const USER_AGENT: &str = concat!(
     "icloud-photos/",
     env!("CARGO_PKG_VERSION"),
-    " (persoenlicher iCloud-Photos-Client fuer Linux)"
+    " (personal iCloud Photos client for Linux)"
 );
 
 /// Zoomstufe der Rückwärtssuche: Straße und Ortsteil, nicht das einzelne Haus.
@@ -144,7 +144,8 @@ pub fn spawn(db_path: PathBuf) -> (Geocoder, mpsc::UnboundedReceiver<Resolved>) 
 fn lookup(agent: &ureq::Agent, lat: f64, lon: f64) -> Result<Option<String>, ureq::Error> {
     let url = format!(
         "https://nominatim.openstreetmap.org/reverse\
-         ?format=jsonv2&zoom={ZOOM}&addressdetails=1&lat={lat}&lon={lon}"
+         ?format=jsonv2&zoom={ZOOM}&addressdetails=1&accept-language=en\
+         &lat={lat}&lon={lon}"
     );
     let body: serde_json::Value = agent.get(&url).call()?.body_mut().read_json()?;
     Ok(place_name(&body))

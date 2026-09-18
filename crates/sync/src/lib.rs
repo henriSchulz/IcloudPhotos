@@ -14,32 +14,32 @@ pub use sidecar::{
 /// Fehler eines Sync-Laufs.
 #[derive(Debug, thiserror::Error)]
 pub enum SyncError {
-    #[error("Sidecar konnte nicht gestartet werden: {command}")]
+    #[error("Could not start the sidecar: {command}")]
     Spawn {
         command: String,
         #[source]
         source: std::io::Error,
     },
-    #[error("Sidecar-Kommunikation fehlgeschlagen")]
+    #[error("Communication with the sidecar failed")]
     Io(#[from] std::io::Error),
-    #[error("Sidecar gab eine unlesbare Zeile aus: {line}")]
+    #[error("The sidecar sent an unreadable line: {line}")]
     Protocol {
         line: String,
         #[source]
         source: serde_json::Error,
     },
-    #[error("Sidecar meldet Fehler ({kind}): {message}")]
+    #[error("The sidecar reported an error ({kind}): {message}")]
     Sidecar { kind: String, message: String },
-    #[error("Anmeldung abgelehnt: {message}")]
+    #[error("Sign-in rejected: {message}")]
     Credentials { message: String },
-    #[error("Sidecar endete mit Status {0}, ohne 'done' zu melden")]
+    #[error("The sidecar exited with status {0} without reporting 'done'")]
     UnexpectedExit(String),
-    #[error("2FA-Code wurde nicht bereitgestellt")]
+    #[error("No two-factor code was provided")]
     TwoFactorAborted,
-    #[error("Passwort wurde nicht bereitgestellt")]
+    #[error("No password was provided")]
     PasswordAborted,
-    #[error("Die geänderten iCloud-Nutzungsbedingungen wurden nicht akzeptiert")]
+    #[error("The updated iCloud Terms and Conditions were not accepted")]
     TermsDeclined,
-    #[error("Katalog konnte nicht geschrieben werden")]
+    #[error("Could not write to the library database")]
     Catalog(#[from] icloud_photos_cache::CacheError),
 }

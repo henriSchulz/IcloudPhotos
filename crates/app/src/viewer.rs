@@ -60,14 +60,14 @@ pub fn open(
     let video = gtk::Video::builder().autoplay(true).build();
 
     let loading = adw::StatusPage::builder()
-        .title("Original wird geladen …")
-        .description("Die Vorschau liegt lokal, das Original kommt aus iCloud.")
+        .title("Loading Original…")
+        .description("The preview is stored locally; the original is coming from iCloud.")
         .child(&gtk::Spinner::builder().spinning(true).build())
         .build();
 
     let failed = adw::StatusPage::builder()
         .icon_name("dialog-warning-symbolic")
-        .title("Original nicht verfügbar")
+        .title("Original Unavailable")
         .build();
     let failed_page = failed.clone();
 
@@ -106,17 +106,17 @@ pub fn open(
 
     let back = gtk::Button::builder()
         .icon_name("go-previous-symbolic")
-        .tooltip_text("Zurück zur Übersicht (Esc)")
+        .tooltip_text("Back to Library (Esc)")
         .build();
     header.pack_start(&back);
 
     let previous = gtk::Button::builder()
         .icon_name("go-up-symbolic")
-        .tooltip_text("Vorheriges Foto (←)")
+        .tooltip_text("Previous Photo (←)")
         .build();
     let next = gtk::Button::builder()
         .icon_name("go-down-symbolic")
-        .tooltip_text("Nächstes Foto (→)")
+        .tooltip_text("Next Photo (→)")
         .build();
     let navigation = gtk::Box::new(gtk::Orientation::Horizontal, 0);
     navigation.add_css_class("linked");
@@ -126,18 +126,18 @@ pub fn open(
 
     let fullscreen = gtk::Button::builder()
         .icon_name("view-fullscreen-symbolic")
-        .tooltip_text("Vollbild (F)")
+        .tooltip_text("Full Screen (F)")
         .build();
     header.pack_end(&fullscreen);
 
     let menu = gio::Menu::new();
-    menu.append(Some("Sichern unter …"), Some("viewer.save"));
-    menu.append(Some("Kopieren"), Some("viewer.copy"));
-    menu.append(Some("Öffnen mit …"), Some("viewer.open"));
+    menu.append(Some("Export…"), Some("viewer.save"));
+    menu.append(Some("Copy"), Some("viewer.copy"));
+    menu.append(Some("Open With…"), Some("viewer.open"));
     let menu_button = gtk::MenuButton::builder()
         .icon_name("view-more-symbolic")
         .menu_model(&menu)
-        .tooltip_text("Aktionen")
+        .tooltip_text("Actions")
         .build();
     header.pack_end(&menu_button);
 
@@ -240,7 +240,7 @@ impl Viewer {
         // nur nicht in voller Auflösung.
         if self.stack.visible_child_name().as_deref() != Some("image") {
             self.failed
-                .set_description(Some("Das Original kam nicht aus iCloud."));
+                .set_description(Some("The original could not be downloaded from iCloud."));
             self.stack.set_visible_child_name("failed");
         }
     }
@@ -452,13 +452,13 @@ impl Viewer {
             .map(|ext| ext.to_string_lossy().to_lowercase())
             .is_some_and(|ext| matches!(ext.as_str(), "heic" | "heif" | "avif"));
 
-        self.failed.set_title("Original nicht verfügbar");
+        self.failed.set_title("Original Unavailable");
         self.failed.set_description(Some(if heic {
-            "Das Original liegt lokal, lässt sich aber nicht anzeigen. \
-             Für HEIC-Dateien braucht gdk-pixbuf die Bibliothek libheif \
-             (Paket »libheif«)."
+            "The original is stored locally but cannot be displayed. \
+             gdk-pixbuf needs the libheif library for HEIC files \
+             (package “libheif”)."
         } else {
-            "Das Original ließ sich nicht laden."
+            "The original could not be loaded."
         }));
         self.stack.set_visible_child_name("failed");
     }
@@ -614,16 +614,16 @@ fn video_failure(message: &str) -> (&'static str, &'static str) {
         .any(|needle| lower.contains(needle));
     if missing_plugin {
         (
-            "Video lässt sich nicht abspielen",
-            "Das Video liegt lokal, aber dem System fehlen die Bausteine, um \
-             iPhone-Videos abzuspielen. Installiere:\n\n\
+            "Video Can’t Be Played",
+            "The video is stored locally, but your system is missing the \
+             components needed to play iPhone videos. Install:\n\n\
              sudo pacman -S gst-plugins-good gst-libav gst-plugin-va\n\n\
-             Danach die App neu starten.",
+             Then restart the app.",
         )
     } else {
         (
-            "Video lässt sich nicht abspielen",
-            "Die Datei ließ sich nicht abspielen. Einzelheiten stehen im Log.",
+            "Video Can’t Be Played",
+            "The file could not be played. See the log for details.",
         )
     }
 }

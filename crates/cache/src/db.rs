@@ -8,7 +8,7 @@ use rusqlite::{Connection, OptionalExtension, Row, params, params_from_iter};
 
 use crate::CacheError;
 
-const SCHEMA_VERSION: i32 = 7;
+const SCHEMA_VERSION: i32 = 8;
 
 /// Sortierschlüssel der Bibliothek: der Aufnahmezeitpunkt, ersatzweise das
 /// Hinzufügedatum.
@@ -127,6 +127,13 @@ impl Catalog {
             self.add_column("photos", "lat REAL")?; // Schema 6
             self.add_column("photos", "lon REAL")?; // Schema 6
             self.add_column("sync_state", "baseline_gap INTEGER NOT NULL DEFAULT 0")?; // Schema 7
+        }
+        // Schema 8: Ortsnamen kommen jetzt englisch. Die gemerkten stammen aus
+        // Anfragen ohne Sprachwunsch und stehen in der Landessprache
+        // („München"); sie werden einmal verworfen und beim nächsten Öffnen
+        // eines Fotos neu nachgeschlagen.
+        if (1..8).contains(&version) {
+            self.conn.execute("DELETE FROM places", [])?;
         }
 
         self.conn

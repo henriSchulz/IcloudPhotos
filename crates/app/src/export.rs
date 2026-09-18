@@ -41,10 +41,10 @@ impl Format {
 
     pub fn description(self) -> &'static str {
         match self {
-            Format::Original => "Unverändert, wie in iCloud abgelegt",
-            Format::Jpeg => "Öffnet überall, verlustbehaftet",
-            Format::Png => "Verlustfrei, aber große Dateien",
-            Format::Heic => "Klein und hochwertig, nicht überall lesbar",
+            Format::Original => "Unmodified, as stored in iCloud",
+            Format::Jpeg => "Opens everywhere, lossy",
+            Format::Png => "Lossless, but large files",
+            Format::Heic => "Small and high quality, not supported everywhere",
         }
     }
 
@@ -97,9 +97,9 @@ impl Action {
     /// Verb für die Fortschrittsanzeige.
     pub fn verb(&self) -> &'static str {
         match self {
-            Action::SaveTo(..) => "Sichere",
-            Action::Clipboard => "Kopiere",
-            Action::Open => "Öffne",
+            Action::SaveTo(..) => "Exporting",
+            Action::Clipboard => "Copying",
+            Action::Open => "Opening",
         }
     }
 }
@@ -293,7 +293,7 @@ fn convert_file(source: &Path, kind: Kind, target: &Path, format: Format) -> Res
             };
             result.map_err(|error| error.to_string())
         }
-        _ => Err("nicht umwandelbar".to_string()),
+        _ => Err("cannot convert".to_string()),
     }
 }
 
@@ -301,7 +301,7 @@ fn run(command: &mut std::process::Command) -> Result<(), String> {
     let program = command.get_program().to_string_lossy().into_owned();
     let output = command.output().map_err(|error| {
         if error.kind() == std::io::ErrorKind::NotFound {
-            format!("{program} fehlt — Paket libheif installieren")
+            format!("{program} is missing — install the libheif package")
         } else {
             format!("{program}: {error}")
         }

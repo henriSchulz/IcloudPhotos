@@ -421,14 +421,14 @@ bleibt die letzte Angabe stehen, statt zu verschwinden.
 
 **Sync-Manager** (`crates/app/src/sync_manager.rs`) — Bibliothek und
 Synchronisation sind getrennt. In der Kopfzeile der Bibliothek steht nur, wie
-viele Fotos da sind (`1.234 Fotos`), und ein Knopf, der den Manager öffnet
+viele Fotos da sind (`1,234 Photos`), und ein Knopf, der den Manager öffnet
 (Strg+Umschalt+R). Der Knopf zeigt ein Drehsymbol, solange ein Lauf arbeitet,
 und ein Warnzeichen, wenn der letzte gescheitert ist und noch niemand
 hineingesehen hat.
 
 Im Manager (ein `AdwDialog`, kein zweites Fenster — unter Hyprland landete das
 als Kachel neben der App) stehen Phase und Balken des laufenden Laufs,
-„Jetzt synchronisieren", der letzte Fehler, Bestand lokal und in iCloud, die
+„Sync Now", der letzte Fehler, Bestand lokal und in iCloud, die
 Zeitpunkte des letzten und des letzten vollständigen Abgleichs, Apple-ID sowie
 die Belegung von Vorschauen und Originalen — je mit einem Knopf, der den Ordner
 im Dateimanager öffnet (`gtk::FileLauncher`; ein noch fehlender Ordner wird
@@ -478,7 +478,7 @@ Drei Dinge, an denen die Fortschrittsanzeige im Manager sonst lügt:
 - **Ein fortgesetzter Erstaufbau muss als solcher erkennbar sein.** Der Balken
   bekommt den `baseline_offset` als Sockel (`SyncMessage::Started.resuming`),
   sonst fängt er bei null an, obwohl der halbe Katalog schon steht. Der Titel
-  sagt dann „Lade Fotos · Fortsetzung".
+  sagt dann „Loading Photos · Resumed".
 - **Metadaten und Vorschauen zählen dieselben Assets**, nur unterschiedlich
   fein: `Progress` kommt alle 256 Datensätze (`BATCH_SIZE`), `Thumbnails` pro
   Bild. Beide speisen denselben Zähler, und der höhere Stand gewinnt — sonst
@@ -491,7 +491,7 @@ Der Nachlauf für fehlende Vorschauen ist eine eigene Phase
 (`SyncMessage::BackfillStarted`) mit eigener Bezugsgröße — seine bis zu 500
 Bilder haben mit dem Bibliotheksbestand nichts zu tun.
 
-„Zuletzt abgeglichen" im Manager liest `sync_state.last_sync_at` (Schema 5) — `last_baseline_at` taugt nicht, das
+„Last Synced" im Manager liest `sync_state.last_sync_at` (Schema 5) — `last_baseline_at` taugt nicht, das
 steht nur nach einem vollständigen Durchlauf, und den gibt es alle 24 Stunden
 einmal.
 
@@ -558,7 +558,7 @@ Strg+J gibt es, weil `GtkGridView` die Tabulatortaste für seine Kacheln behält
       Fotos ohne Vorschau und noch nicht synchronisierte Plätze erscheinen als
       Skelett-Kacheln, sodass das Raster von Anfang an seine spätere Form hat.
       Der Sidecar meldet dafür den Gesamtbestand (`library_count`) gleich zu
-      Beginn eines Erstaufbaus — daher auch die Anzeige „1.234 / 19.624".
+      Beginn eines Erstaufbaus — daher auch die Anzeige „1,234 / 19,624".
 - [x] **Inkrementeller Sync über den CloudKit-Zone-Token** (siehe eigener
       Abschnitt). Löst auch Löschungen, die über `added_date` prinzipiell
       unsichtbar sind.
@@ -677,6 +677,13 @@ Ein isolierter Lauf braucht eine eigene `config.toml` mit gesetzten `[paths]`
 Verzeichnisse schreibt.
 
 ## Konventionen für Claude Code
+
+- **Die Oberfläche ist englisch**, Code-Kommentare, Logs (`tracing`) und diese
+  Datei bleiben deutsch. Zahlen mit Komma als Tausendertrenner (`thousands`),
+  Datumsangaben englisch („September 18, 2026 at 14:03"), Ortsnamen per
+  `accept-language=en` von Nominatim. Fehlermeldungen, die bis in die
+  Oberfläche durchreichen — `SyncError`, `ConfigError`, `CacheError` und die
+  `message`-Felder des Sidecars —, sind ebenfalls englisch.
 
 - Rust: `rustfmt` + `clippy -- -D warnings` vor jedem Commit
 - Python-Sidecar: `ruff` für Linting

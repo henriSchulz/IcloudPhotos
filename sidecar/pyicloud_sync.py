@@ -75,7 +75,7 @@ def emit(payload: dict[str, Any]) -> None:
             {
                 "type": "error",
                 "kind": "protocol",
-                "message": f"Nachricht nicht serialisierbar: {exc}",
+                "message": f"Message not serializable: {exc}",
             },
             separators=(",", ":"),
         )
@@ -164,7 +164,7 @@ def confirm_terms() -> None:
             {
                 "type": "error",
                 "kind": "terms",
-                "message": "Nutzungsbedingungen nicht akzeptiert",
+                "message": "Terms and Conditions not accepted",
             }
         )
         sys.exit(EXIT_AUTH)
@@ -187,7 +187,7 @@ def authenticate(username: str, cookie_dir: str | None):
         emit({"type": "password_required", "username": username})
         password = read_secret()
         if not password:
-            emit({"type": "error", "kind": "auth", "message": "Kein Passwort erhalten"})
+            emit({"type": "error", "kind": "auth", "message": "No password received"})
             sys.exit(EXIT_AUTH)
 
     try:
@@ -204,7 +204,7 @@ def authenticate(username: str, cookie_dir: str | None):
     except PyiCloudFailedLoginException as exc:
         # Eigene Fehlerart, damit die App gezielt erneut nach dem Passwort
         # fragen kann statt den Sync als kaputt zu melden.
-        emit({"type": "error", "kind": "credentials", "message": str(exc) or "Anmeldung abgelehnt"})
+        emit({"type": "error", "kind": "credentials", "message": str(exc) or "Sign-in rejected"})
         sys.exit(EXIT_AUTH)
 
     # Erst nach erfolgreicher Anmeldung speichern — sonst landet ein Tippfehler
@@ -220,11 +220,11 @@ def authenticate(username: str, cookie_dir: str | None):
         emit({"type": "auth_required", "method": "2fa"})
         code = read_secret().strip()
         if not code:
-            emit({"type": "error", "kind": "auth", "message": "Kein 2FA-Code erhalten"})
+            emit({"type": "error", "kind": "auth", "message": "No two-factor code received"})
             sys.exit(EXIT_AUTH)
         try:
             if not api.validate_2fa_code(code):
-                emit({"type": "error", "kind": "auth", "message": "2FA-Code abgelehnt"})
+                emit({"type": "error", "kind": "auth", "message": "Two-factor code rejected"})
                 sys.exit(EXIT_AUTH)
             # Ohne trust_session laeuft die Sitzung nach Stunden ab und jeder
             # Sync fragt erneut nach einem Code.
@@ -244,7 +244,7 @@ def authenticate(username: str, cookie_dir: str | None):
             {
                 "type": "error",
                 "kind": "auth",
-                "message": "Konto nutzt 2SA (alte Zwei-Schritt-Pruefung), nicht unterstuetzt",
+                "message": "Legacy two-step verification (2SA) is not supported",
             }
         )
         sys.exit(EXIT_AUTH)
@@ -383,7 +383,7 @@ def download_thumb(asset: Any, directory: Path) -> dict[str, Any]:
         return {"type": "thumb_failed", "id": asset.id, "message": f"{type(exc).__name__}: {exc}"}
 
     if not data:
-        return {"type": "thumb_failed", "id": asset.id, "message": "keine Vorschau verfuegbar"}
+        return {"type": "thumb_failed", "id": asset.id, "message": "no thumbnail available"}
 
     # Erst vollstaendig schreiben, dann umbenennen: ein Abbruch hinterlaesst
     # sonst eine halbe Datei, die spaeter als gueltiger Cache-Treffer gilt.
@@ -582,7 +582,7 @@ def run_changes(api: Any, thumbs: Path | None, since_token: str) -> int:
                     "type": "change_unresolved",
                     "id": record_name,
                     "record_type": event.record_type,
-                    "message": "kein Asset",
+                    "message": "no asset",
                 }
             )
             continue
@@ -677,7 +677,7 @@ def download_original(asset: Any, dest: Path) -> dict[str, Any]:
         return original_failed(asset.id, f"{type(exc).__name__}: {exc}")
 
     if not data:
-        return original_failed(asset.id, "kein Original verfuegbar", kind="missing")
+        return original_failed(asset.id, "no original available", kind="missing")
 
     dest.parent.mkdir(parents=True, exist_ok=True)
     # Wie bei den Vorschauen: erst vollstaendig schreiben, dann umbenennen.
@@ -793,14 +793,14 @@ def run_serve(username: str, cookie_dir: str | None) -> int:
         try:
             command = json.loads(line)
         except json.JSONDecodeError as exc:
-            emit({"type": "error", "kind": "protocol", "message": f"unlesbarer Befehl: {exc}"})
+            emit({"type": "error", "kind": "protocol", "message": f"unreadable command: {exc}"})
             continue
 
         name = command.get("cmd")
         if name == "quit":
             break
         if name != "original":
-            emit({"type": "error", "kind": "protocol", "message": f"unbekannter Befehl: {name}"})
+            emit({"type": "error", "kind": "protocol", "message": f"unknown command: {name}"})
             continue
 
         asset_id = command.get("id")
@@ -816,7 +816,7 @@ def run_serve(username: str, cookie_dir: str | None) -> int:
             continue
 
         if asset is None:
-            emit(original_failed(asset_id, "Asset nicht gefunden", kind="missing"))
+            emit(original_failed(asset_id, "Asset not found", kind="missing"))
             continue
 
         emit(download_original(asset, Path(dest)))
@@ -835,7 +835,7 @@ def run_fake_serve(count: int, needs_password: bool, needs_terms: bool = False) 
     if needs_password:
         emit({"type": "password_required", "username": "fake@example.com"})
         if read_secret() != FAKE_PASSWORD:
-            emit({"type": "error", "kind": "credentials", "message": "Anmeldung abgelehnt"})
+            emit({"type": "error", "kind": "credentials", "message": "Sign-in rejected"})
             return EXIT_AUTH
     if needs_terms:
         confirm_terms()
@@ -859,7 +859,7 @@ def run_fake_serve(count: int, needs_password: bool, needs_terms: bool = False) 
             marker = dest.parent / ".flaky-seen"
             if not marker.exists():
                 marker.write_text("1")
-                emit(original_failed(asset_id, "Sitzung abgelaufen (nachgestellt)"))
+                emit(original_failed(asset_id, "Session expired (simulated)"))
                 continue
             dest.write_bytes(fake_png(320, 1))
             emit(
@@ -873,11 +873,11 @@ def run_fake_serve(count: int, needs_password: bool, needs_terms: bool = False) 
             continue
 
         if not asset_id.startswith("fake-"):
-            emit(original_failed(asset_id, "Asset nicht gefunden", kind="missing"))
+            emit(original_failed(asset_id, "Asset not found", kind="missing"))
             continue
         number = int(asset_id.removeprefix("fake-"))
         if number >= count:
-            emit(original_failed(asset_id, "Asset nicht gefunden", kind="missing"))
+            emit(original_failed(asset_id, "Asset not found", kind="missing"))
             continue
 
         dest.parent.mkdir(parents=True, exist_ok=True)
@@ -922,7 +922,7 @@ def run_fetch_thumbs(username: str, cookie_dir: str | None, thumbs: Path) -> int
             )
             continue
         if asset is None:
-            emit({"type": "thumb_failed", "id": asset_id, "message": "Asset nicht gefunden"})
+            emit({"type": "thumb_failed", "id": asset_id, "message": "Asset not found"})
             continue
         emit(download_thumb(asset, thumbs))
         count += 1
@@ -1049,14 +1049,14 @@ def run_fake(
     if needs_password:
         emit({"type": "password_required", "username": "fake@example.com"})
         if read_secret() != FAKE_PASSWORD:
-            emit({"type": "error", "kind": "credentials", "message": "Anmeldung abgelehnt"})
+            emit({"type": "error", "kind": "credentials", "message": "Sign-in rejected"})
             return EXIT_AUTH
     if needs_terms:
         confirm_terms()
     if needs_2fa:
         emit({"type": "auth_required", "method": "2fa"})
         if read_secret().strip() != FAKE_2FA_CODE:
-            emit({"type": "error", "kind": "auth", "message": "2FA-Code abgelehnt"})
+            emit({"type": "error", "kind": "auth", "message": "Two-factor code rejected"})
             return EXIT_AUTH
     emit({"type": "auth_ok", "trusted": True})
     if thumbs is not None:
