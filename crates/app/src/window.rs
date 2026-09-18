@@ -154,6 +154,10 @@ struct LoginWidgets {
 
 impl AppState {
     pub fn new(config: Config, config_path: PathBuf, catalog: Catalog) -> Rc<Self> {
+        // Der Stand, gegen den `sync_model` Zuwachs misst. Mit 0 hielte der
+        // erste Abgleich den ganzen Katalog fuer neu und laede ihn komplett ins
+        // Modell — und jeder weitere Abgleich danach ebenso.
+        let known = catalog.count().unwrap_or(0);
         Rc::new(Self {
             config: RefCell::new(config),
             config_path,
@@ -167,7 +171,7 @@ impl AppState {
             exhausted: Cell::new(false),
             syncing: Cell::new(false),
             expected_total: Cell::new(0),
-            last_seen_count: Cell::new(0),
+            last_seen_count: Cell::new(known),
             model_dirty: Cell::new(false),
             downloader: RefCell::new(None),
             geocoder: RefCell::new(None),
@@ -811,7 +815,12 @@ pub fn build(app: &adw::Application, state: Rc<AppState>) {
         let status = status.clone();
         let stack = stack.clone();
         move || {
-            if state.syncing.get() && state.model_dirty.get() {
+            // Solange der Betrachter offen ist, sieht niemand das Raster. Ein
+            // Umbau blockierte dann nur den Hauptthread, und ein laufendes
+            // Video stockte bei jedem. `model_dirty` bleibt stehen, der
+            // naechste Takt nach dem Schliessen holt es nach.
+            let viewing = state.viewer.borrow().is_some();
+            if state.syncing.get() && state.model_dirty.get() && !viewing {
                 state.refresh_live();
                 update_status(&state, &status, &stack);
             }

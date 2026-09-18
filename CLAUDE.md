@@ -430,6 +430,15 @@ während Fotos einlaufen. Drei Regeln:
   weiter unten liest, bekommt deshalb nur Vorschauen; der Umbau wartet, bis er
   wieder oben ist oder der Sync endet. Wer oben steht, bleibt oben
   (`scroll_to(0)`) und sieht die neuen Fotos einlaufen.
+- **Bei offenem Betrachter wird gar nicht umgebaut.** Das Raster sieht dann
+  niemand, ein Umbau hielte nur den Hauptthread an — und ein laufendes Video
+  stockte bei jedem Takt. `model_dirty` bleibt stehen und wird nach dem
+  Schließen nachgeholt.
+
+`last_seen_count` startet mit dem Katalogbestand, nicht mit 0. Sonst hielt der
+erste `sync_model` jedes Foto für neu, lud den ganzen Katalog ins Modell
+(gemessen: 8.935 Zeilen, 200–600 ms im Hauptthread) und jeder weitere Abgleich
+danach ebenso.
 
 Vorschauen werden in einem Hilfsthread dekodiert (`gio::spawn_blocking`) und
 die letzten 200 im Speicher gehalten (~140 MB bei 360×480). Eine Kachel merkt
@@ -582,6 +591,13 @@ schwarze Fläche mit totem Abspielknopf zu zeigen.
 ```
 sudo pacman -S --needed gst-plugins-good gst-libav gst-plugin-va
 ```
+
+Die App setzt **`GSK_RENDERER=gl`**, wenn der Nutzer nichts vorgibt
+(`prefer_gl_renderer` in `main.rs`). iPhone-Videos sind meist 4K-HDR; der
+VA-Decoder liefert sie als P010-DMABuf, und der Vulkan-Renderer — GTKs Vorgabe
+— importiert die nicht direkt. Gemessen an einem Tiger Lake (Iris Xe): 4K-HDR
+mit Vulkan ~6 Bilder/s, mit GL die vollen 30. 1080p (NV12) läuft mit beiden
+flüssig, deshalb fällt es nur bei den großen Videos auf.
 
 Die saubere Lösung wäre `glycin` als eigene Abhängigkeit statt des Umwegs über
 den Pixbuf-Loader — das würde zugleich das Dekodieren aus dem UI-Thread holen.

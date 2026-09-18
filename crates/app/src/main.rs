@@ -22,6 +22,8 @@ const APP_ID: &str = "de.henri.IcloudPhotos";
 const HOUSEKEEPING_INTERVAL: std::time::Duration = std::time::Duration::from_secs(10 * 60);
 
 fn main() -> anyhow::Result<()> {
+    prefer_gl_renderer();
+
     tracing_subscriber::fmt()
         .with_env_filter(
             tracing_subscriber::EnvFilter::try_from_default_env().unwrap_or_else(|_| "info".into()),
@@ -82,6 +84,20 @@ fn main() -> anyhow::Result<()> {
     // GTK soll `--demo` nicht als eigenes Argument deuten.
     app.run_with_args::<&str>(&[]);
     Ok(())
+}
+
+/// Wählt den GL-Renderer, sofern der Nutzer nichts anderes vorgibt.
+///
+/// iPhones filmen in 4K-HDR, der Hardware-Decoder liefert dafür P010-DMABufs.
+/// Der Vulkan-Renderer (Vorgabe seit GTK 4.16) kann die hier nicht direkt
+/// importieren und nimmt einen Umweg, der an einem Tiger-Lake-Rechner nur
+/// ~6 statt 30 Bilder pro Sekunde auf den Schirm bringt. Der GL-Renderer
+/// importiert sie ohne Kopie. 1080p-Videos (NV12) laufen mit beiden flüssig.
+fn prefer_gl_renderer() {
+    if std::env::var_os("GSK_RENDERER").is_none() {
+        // SAFETY: erster Schritt in `main`, es läuft noch kein zweiter Thread.
+        unsafe { std::env::set_var("GSK_RENDERER", "gl") };
+    }
 }
 
 fn schedule_housekeeping(state: Rc<window::AppState>) {
