@@ -6,15 +6,17 @@ use std::rc::Rc;
 
 use adw::prelude::*;
 use gtk::{gdk, gio, glib};
-use icloud_photos_cache::Catalog;
+use icloud_photos_cache::{Catalog, Scope};
 use icloud_photos_core::Config;
 use icloud_photos_core::model::Photo;
 use std::path::PathBuf;
 
+use crate::collections::{Collections, Pick};
 use crate::downloader::{self, DownloadMessage, Downloader};
 use crate::export;
 use crate::geocode::{self, Geocoder};
 use crate::photo_object::PhotoObject;
+use crate::sidebar::{Sidebar, Target, display_name};
 use crate::sync_manager::{Overview, SyncManager, thousands};
 use crate::sync_task::{self, SyncMessage};
 use crate::viewer::{self, Viewer};
@@ -93,6 +95,10 @@ pub struct AppState {
     /// Bedienelemente der Anmeldemaske, um sie waehrend der Anmeldung zu
     /// sperren und Fehler dort anzuzeigen.
     login: RefCell<Option<LoginWidgets>>,
+    /// Welcher Ausschnitt im Raster steht: die ganze Bibliothek oder ein Album.
+    scope: RefCell<Scope>,
+    /// Statt des Rasters steht die Übersicht „Collections" im Fenster.
+    showing_collections: Cell<bool>,
     loaded: Cell<u64>,
     exhausted: Cell<bool>,
     syncing: Cell<bool>,
@@ -120,6 +126,10 @@ pub struct AppState {
     scroll: RefCell<Option<gtk::Adjustment>>,
     /// Alles ueber die Synchronisation — getrennt von der Bibliothek.
     sync_manager: RefCell<Option<Rc<SyncManager>>>,
+    /// Seitenleiste und Album-Übersicht — beide lesen die Alben aus dem
+    /// Katalog und müssen nach einem Album-Sync neu lesen.
+    sidebar: RefCell<Option<Rc<Sidebar>>>,
+    collections: RefCell<Option<Rc<Collections>>>,
     /// Das zuletzt gewaehlte Format beim Sichern.
     save_format: Cell<export::Format>,
     /// Ein laufender Sicherungs-, Kopier- oder Oeffnen-Auftrag.
@@ -167,6 +177,8 @@ impl AppState {
             authenticated: Cell::new(false),
             authenticating: Cell::new(false),
             login: RefCell::new(None),
+            scope: RefCell::new(Scope::Library),
+            showing_collections: Cell::new(false),
             loaded: Cell::new(0),
             exhausted: Cell::new(false),
             syncing: Cell::new(false),
@@ -180,6 +192,8 @@ impl AppState {
             grid: RefCell::new(None),
             scroll: RefCell::new(None),
             sync_manager: RefCell::new(None),
+            sidebar: RefCell::new(None),
+            collections: RefCell::new(None),
             save_format: Cell::new(export::Format::Original),
             job: RefCell::new(None),
             actions: RefCell::new(None),
@@ -195,13 +209,56 @@ impl AppState {
             .map_err(|error| error.to_string())
     }
 
+    /// Wechselt den Ausschnitt des Rasters — Bibliothek oder ein Album.
+    ///
+    /// Das Modell wird dabei neu gefüllt, nicht abgeglichen: ein anderes Album
+    /// hat mit dem bisherigen Inhalt nichts gemein, ein Diff wäre nur teurer.
+    fn set_scope(&self, scope: Scope) {
+        if *self.scope.borrow() == scope {
+            return;
+        }
+        let count = self.catalog.borrow().count_in(&scope).unwrap_or(0);
+        *self.scope.borrow_mut() = scope;
+        self.model.remove_all();
+        self.loaded.set(0);
+        self.exhausted.set(false);
+        self.model_dirty.set(false);
+        self.last_seen_count.set(count);
+        self.load_next_page();
+        if let Some(adjustment) = self.scroll.borrow().as_ref() {
+            adjustment.set_value(0.0);
+        }
+    }
+
+    /// Liest die Alben neu — nach einem Album-Sync und nach jedem Lauf, weil
+    /// sich mit neuen Fotos auch die Zahlen in den Alben ändern.
+    fn refresh_albums(&self) {
+        let albums = match self.catalog.borrow().albums() {
+            Ok(albums) => albums,
+            Err(error) => {
+                tracing::error!(%error, "Alben nicht lesbar");
+                return;
+            }
+        };
+        if let Some(collections) = self.collections.borrow().as_ref() {
+            collections.set_albums(albums.clone());
+        }
+        // Zuletzt: verschwindet das gewählte Album, wählt die Seitenleiste
+        // die Bibliothek und ruft dabei zurück in diesen Zustand.
+        let sidebar = self.sidebar.borrow().clone();
+        if let Some(sidebar) = sidebar {
+            sidebar.set_albums(albums);
+        }
+    }
+
     /// Lädt die nächste Seite in das Modell. Gibt zurück, ob etwas dazukam.
     fn load_next_page(&self) -> bool {
         if self.exhausted.get() {
             return false;
         }
         let offset = self.loaded.get();
-        let photos = match self.catalog.borrow().page(offset, PAGE_SIZE) {
+        let scope = self.scope.borrow().clone();
+        let photos = match self.catalog.borrow().page_in(&scope, offset, PAGE_SIZE) {
             Ok(photos) => photos,
             Err(error) => {
                 tracing::error!(%error, "Katalogseite konnte nicht gelesen werden");
@@ -265,6 +322,9 @@ impl AppState {
     fn current_page(&self, total: u64) -> &'static str {
         if !self.authenticated.get() && total == 0 {
             return "login";
+        }
+        if self.showing_collections.get() {
+            return "collections";
         }
         // Waehrend eines laufenden Syncs zeigt das Grid Skelette — "Noch keine
         // Fotos" waere dann schlicht falsch.
@@ -430,7 +490,8 @@ impl AppState {
     /// Vorschau am vorhandenen Objekt gesetzt. Alles andere bleibt dasselbe
     /// Objekt, und GTK haelt den Blick auf dem Foto, das gerade oben steht.
     fn sync_model(&self) {
-        let total = self.catalog.borrow().count().unwrap_or(0);
+        let scope = self.scope.borrow().clone();
+        let total = self.catalog.borrow().count_in(&scope).unwrap_or(0);
         let open = self.viewer_id();
         let was_at_top = self.at_top();
 
@@ -441,7 +502,7 @@ impl AppState {
         self.last_seen_count.set(total);
         self.model_dirty.set(false);
 
-        let photos = match self.catalog.borrow().page(0, want) {
+        let photos = match self.catalog.borrow().page_in(&scope, 0, want) {
             Ok(photos) => photos,
             Err(error) => {
                 tracing::error!(%error, "Katalog nicht lesbar");
@@ -509,7 +570,8 @@ impl AppState {
             return;
         }
         let window = self.loaded.get().max(PAGE_SIZE);
-        let photos = match self.catalog.borrow().page(0, window) {
+        let scope = self.scope.borrow().clone();
+        let photos = match self.catalog.borrow().page_in(&scope, 0, window) {
             Ok(photos) => photos,
             Err(error) => {
                 tracing::error!(%error, "Katalog nicht lesbar");
@@ -521,7 +583,9 @@ impl AppState {
 
     /// Skelette fuer Fotos, die der Sync noch nicht geliefert hat.
     fn placeholders(&self, have: u64, shown: u64) -> Vec<PhotoObject> {
-        if !self.syncing.get() {
+        // Skelette stehen fuer Fotos der Bibliothek, die noch kommen. In einem
+        // Album weiss niemand, wie viele davon hinein gehoeren.
+        if !self.syncing.get() || *self.scope.borrow() != Scope::Library {
             return Vec::new();
         }
         let expected = self.expected_total.get();
@@ -644,6 +708,14 @@ pub fn build(app: &adw::Application, state: Rc<AppState>) {
     *state.sync_manager.borrow_mut() = Some(manager.clone());
 
     let header = adw::HeaderBar::new();
+    // Ganz links, wie in Photos. Verbunden wird er, sobald es die
+    // Seitenleiste gibt.
+    let sidebar_toggle = gtk::ToggleButton::builder()
+        .icon_name("sidebar-show-symbolic")
+        .tooltip_text("Show Sidebar (F9)")
+        .active(true)
+        .build();
+    header.pack_start(&sidebar_toggle);
     header.pack_start(manager.button());
     header.pack_end(&status);
 
@@ -720,20 +792,121 @@ pub fn build(app: &adw::Application, state: Rc<AppState>) {
         .description("Start a sync to fill your library.")
         .build();
 
+    let collections = Collections::new();
+    *state.collections.borrow_mut() = Some(collections.clone());
+
     let stack = gtk::Stack::new();
     stack.add_named(&photos, Some("grid"));
     stack.add_named(&empty, Some("empty"));
+    stack.add_named(&collections.widget, Some("collections"));
 
     let library = gtk::Box::new(gtk::Orientation::Vertical, 0);
     library.append(&header);
     library.append(&stack);
+
+    // Aufbau wie in Photos: links die Seitenleiste, rechts was sie gewählt
+    // hat. Eine OverlaySplitView und keine NavigationSplitView: nur sie lässt
+    // sich auch im breiten Fenster ausblenden. Auf schmalen Fenstern legt sie
+    // sich über den Inhalt, statt ihn zu verdrängen.
+    let sidebar = Sidebar::new();
+    *state.sidebar.borrow_mut() = Some(sidebar.clone());
+    let sidebar_view = adw::ToolbarView::new();
+    sidebar_view.add_top_bar(
+        &adw::HeaderBar::builder()
+            .title_widget(&adw::WindowTitle::new("iCloud Photos", ""))
+            .build(),
+    );
+    sidebar_view.set_content(Some(&sidebar.widget));
+    let split = adw::OverlaySplitView::builder()
+        .sidebar(&sidebar_view)
+        .content(&library)
+        .min_sidebar_width(200.0)
+        .max_sidebar_width(280.0)
+        .build();
+    let narrow = adw::Breakpoint::new(adw::BreakpointCondition::new_length(
+        adw::BreakpointConditionLengthType::MaxWidth,
+        600.0,
+        adw::LengthUnit::Sp,
+    ));
+    narrow.add_setter(&split, "collapsed", Some(&true.to_value()));
+    window.add_breakpoint(narrow);
+
+    // Ein- und ausblenden, per Knopf und mit F9 wie in GNOME üblich.
+    let title = adw::WindowTitle::new("Library", "");
+    header.set_title_widget(Some(&title));
+    split
+        .bind_property("show-sidebar", &sidebar_toggle, "active")
+        .bidirectional()
+        .sync_create()
+        .build();
 
     // Die beiden Ebenen des Fensters. Ein geöffnetes Foto ist keine zweite
     // Fensterebene, sondern diese Seite — auf einem Kachel-Compositor landete
     // ein eigenes Fenster sonst als Kachel neben der App statt über ihr.
     let screens = gtk::Stack::new();
     screens.set_transition_type(gtk::StackTransitionType::Crossfade);
-    screens.add_named(&library, Some(viewer::LIBRARY_PAGE));
+    screens.add_named(&split, Some(viewer::LIBRARY_PAGE));
+
+    sidebar.connect_select({
+        let state = state.clone();
+        let status = status.clone();
+        let stack = stack.clone();
+        let title = title.clone();
+        let split = split.clone();
+        let empty = empty.clone();
+        move |target| {
+            let name = match target {
+                Target::Library => "Library".to_string(),
+                Target::Collections => "Collections".to_string(),
+                Target::Album(id) => state
+                    .sidebar
+                    .borrow()
+                    .as_ref()
+                    .and_then(|sidebar| {
+                        sidebar
+                            .albums()
+                            .iter()
+                            .find(|album| &album.id == id)
+                            .map(display_name)
+                    })
+                    .unwrap_or_default(),
+            };
+            title.set_title(&name);
+            state
+                .showing_collections
+                .set(*target == Target::Collections);
+            match target {
+                Target::Library => state.set_scope(Scope::Library),
+                Target::Album(id) => state.set_scope(Scope::Album(id.clone())),
+                Target::Collections => {
+                    if let Some(collections) = state.collections.borrow().as_ref() {
+                        collections.open_folder(None);
+                    }
+                }
+            }
+            if matches!(target, Target::Album(_)) {
+                empty.set_title("No Photos in This Album");
+                empty.set_description(Some("Photos you add to it in iCloud appear here."));
+            } else {
+                empty.set_title("No Photos Yet");
+                empty.set_description(Some("Start a sync to fill your library."));
+            }
+            update_status(&state, &status, &stack);
+            // Eingeklappt liegt die Seitenleiste über dem Inhalt; nach der
+            // Wahl soll man sehen, was man gewählt hat.
+            if split.is_collapsed() {
+                split.set_show_sidebar(false);
+            }
+        }
+    });
+    collections.connect_pick({
+        let sidebar = sidebar.clone();
+        move |pick| match pick {
+            Pick::Album(id) => sidebar.select(&Target::Album(id)),
+            Pick::Folder(id) => sidebar.expand(&id),
+        }
+    });
+    state.refresh_albums();
 
     // Rückmeldungen zu Sichern und Kopieren gehören nicht in einen Dialog, den
     // man wegklicken muss.
@@ -760,6 +933,14 @@ pub fn build(app: &adw::Application, state: Rc<AppState>) {
     });
     group.add_action(&show_jump);
     app.set_accels_for_action("photos.jump", &["<Control>j"]);
+
+    let toggle_sidebar = gio::SimpleAction::new("toggle-sidebar", None);
+    toggle_sidebar.connect_activate({
+        let split = split.clone();
+        move |_, _| split.set_show_sidebar(!split.shows_sidebar())
+    });
+    group.add_action(&toggle_sidebar);
+    app.set_accels_for_action("photos.toggle-sidebar", &["F9"]);
 
     window.insert_action_group("photos", Some(&group));
 
@@ -1409,16 +1590,28 @@ fn chrono_now() -> chrono::DateTime<chrono::Utc> {
 
 fn update_status(state: &Rc<AppState>, status: &gtk::Label, stack: &gtk::Stack) {
     let total = state.catalog.borrow().count().unwrap_or(0);
+    let scope = state.scope.borrow().clone();
+    let shown = if scope == Scope::Library {
+        total
+    } else {
+        state.catalog.borrow().count_in(&scope).unwrap_or(0)
+    };
 
-    // Bis zur abgeschlossenen Anmeldung bleibt die Maske stehen.
-    stack.set_visible_child_name(state.current_page(total));
+    // Bis zur abgeschlossenen Anmeldung bleibt die Maske stehen. Ein leeres
+    // Album ist leer, nicht "noch nicht synchronisiert".
+    let page = match state.current_page(total) {
+        "grid" if shown == 0 && !state.syncing.get() => "empty",
+        page => page,
+    };
+    stack.set_visible_child_name(page);
 
     // In der Bibliothek steht nur, wie viele Fotos da sind. Alles Weitere
-    // gehoert in den Sync-Manager.
+    // gehoert in den Sync-Manager. Die Übersicht zählt keine Fotos.
+    status.set_visible(!state.showing_collections.get());
     status.set_label(&format!(
         "{} {}",
-        thousands(total),
-        if total == 1 { "Photo" } else { "Photos" }
+        thousands(shown),
+        if shown == 1 { "Photo" } else { "Photos" }
     ));
 
     if let Some(manager) = state.sync_manager.borrow().as_ref() {
@@ -1552,6 +1745,15 @@ fn start_sync(
                         manager.progress(stored);
                     }
                 }
+                SyncMessage::AlbumsStarted => {
+                    manager.albums();
+                }
+                SyncMessage::AlbumsProgress { done, total } => {
+                    manager.albums_loaded(done, total);
+                }
+                SyncMessage::AlbumsChanged => {
+                    state.refresh_albums();
+                }
                 SyncMessage::BackfillStarted { missing } => {
                     backfilling = true;
                     manager.backfill(missing);
@@ -1643,6 +1845,11 @@ fn start_sync(
                     // Vor dem Nachziehen: sonst blieben die Skelette stehen.
                     state.syncing.set(false);
                     state.sync_model();
+                    // Neue oder geloeschte Fotos aendern auch die Zahlen in den
+                    // Alben — auch wenn die Alben selbst gleich blieben.
+                    if summary.stored > 0 || summary.deleted > 0 {
+                        state.refresh_albums();
+                    }
                     update_status(&state, &status, &stack);
                 }
                 SyncMessage::Finished(Err(error)) => {
@@ -1879,7 +2086,8 @@ fn build_jump_button(
             while let Some(row) = list.first_child() {
                 list.remove(&row);
             }
-            let groups = match state.catalog.borrow().month_groups() {
+            let scope = state.scope.borrow().clone();
+            let groups = match state.catalog.borrow().month_groups_in(&scope) {
                 Ok(groups) => groups,
                 Err(error) => {
                     tracing::error!(%error, "Monatsliste nicht lesbar");

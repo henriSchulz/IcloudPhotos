@@ -888,3 +888,50 @@ fn membership_tombstones_are_not_deletions() {
         "der Filter wird nicht angewendet"
     );
 }
+
+#[tokio::test]
+async fn an_album_run_fills_albums_without_touching_the_sync_state() {
+    let python = python_or_skip!();
+    let mut catalog = Catalog::open_in_memory().unwrap();
+    run_sync(&mut catalog, &options(&python, 40), &Prompts::default())
+        .await
+        .unwrap();
+    let before = catalog.sync_state().unwrap();
+
+    let mut albums = options(&python, 40);
+    albums.albums = true;
+    let (events, mut received) = mpsc::unbounded_channel();
+    let summary = run_sync(&mut catalog, &albums, &Prompts::events_only(events))
+        .await
+        .unwrap();
+    assert_eq!(summary.albums, Some(5));
+
+    let listed = catalog.albums().unwrap();
+    let names: Vec<_> = listed.iter().map(|a| a.name.as_str()).collect();
+    assert_eq!(names, ["Favorites", "Videos", "Trips", "Summer", "Food"]);
+    let summer = listed.iter().find(|a| a.name == "Summer").unwrap();
+    assert_eq!(summer.parent.as_deref(), Some("fake-folder-trips"));
+    assert_eq!(summer.count, 20);
+
+    // Ein Album-Lauf ist kein Abgleich der Bibliothek.
+    assert_eq!(catalog.sync_state().unwrap(), before);
+
+    // Fortschritt je Album, gegen die Zahl der Alben mit Fotos (ohne Ordner).
+    let mut last = None;
+    while let Ok(event) = received.try_recv() {
+        if let SyncEvent::Albums { done, total } = event {
+            last = Some((done, total));
+        }
+    }
+    assert_eq!(last, Some((4, 4)));
+
+    // Zweiter Lauf mit den gemerkten Größen: nichts hat sich geändert, also
+    // holt der Sidecar keine Mitglieder neu — und der Katalog behält sie.
+    albums.known_album_sizes = catalog.album_sizes().unwrap();
+    assert_eq!(albums.known_album_sizes.len(), 4);
+    run_sync(&mut catalog, &albums, &Prompts::default())
+        .await
+        .unwrap();
+    let again = catalog.albums().unwrap();
+    assert_eq!(again, listed);
+}

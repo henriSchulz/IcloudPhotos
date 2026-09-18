@@ -132,9 +132,65 @@ impl Photo {
     }
 }
 
+/// Art eines Albums, wie iCloud sie kennt.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum AlbumKind {
+    /// Von iCloud selbst gepflegt: Favorites, Videos, Screenshots …
+    Smart,
+    /// Vom Nutzer angelegt.
+    Album,
+    /// Ein Ordner — enthält Alben und Ordner, selbst aber keine Fotos.
+    Folder,
+}
+
+impl AlbumKind {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Smart => "smart",
+            Self::Album => "album",
+            Self::Folder => "folder",
+        }
+    }
+
+    pub fn parse(raw: &str) -> Option<Self> {
+        match raw {
+            "smart" => Some(Self::Smart),
+            "album" => Some(Self::Album),
+            "folder" => Some(Self::Folder),
+            _ => None,
+        }
+    }
+}
+
+/// Ein Album aus iCloud, so wie der Sidecar es meldet.
+///
+/// Intelligente Alben tragen ihren englischen Namen als ID („Favorites"),
+/// eigene Alben die CloudKit-Record-ID. `position` ist die Reihenfolge, in der
+/// iCloud sie liefert — die Reihenfolge der Seitenleiste.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AlbumRecord {
+    pub id: String,
+    pub name: String,
+    pub kind: AlbumKind,
+    #[serde(default)]
+    pub parent: Option<String>,
+    #[serde(default)]
+    pub position: u64,
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn parses_an_album_line() {
+        let line =
+            r#"{"id":"Favorites","name":"Favorites","kind":"smart","parent":null,"position":3}"#;
+        let album: AlbumRecord = serde_json::from_str(line).unwrap();
+        assert_eq!(album.kind, AlbumKind::Smart);
+        assert_eq!(album.parent, None);
+    }
 
     #[test]
     fn parses_sidecar_line() {

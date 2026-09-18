@@ -4,8 +4,9 @@ use std::path::PathBuf;
 use std::process::Stdio;
 
 use chrono::{DateTime, Utc};
+use icloud_photos_cache::AlbumContent;
 use icloud_photos_cache::Catalog;
-use icloud_photos_core::model::PhotoRecord;
+use icloud_photos_core::model::{AlbumKind, AlbumRecord, PhotoRecord};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::process::Command;
 use tokio::sync::{mpsc, oneshot};
@@ -49,6 +50,12 @@ pub struct SidecarOptions {
     pub thumbnail_dir: Option<PathBuf>,
     /// Statt eines Syncs nur Vorschauen fuer diese IDs nachladen.
     pub fetch_thumbnails_for: Vec<String>,
+    /// Statt eines Syncs die Alben samt Mitgliedern laden.
+    pub albums: bool,
+    /// Größe jedes Albums beim letzten Laden. Stimmt sie noch, holt der
+    /// Sidecar die Mitglieder nicht neu — bei rund 39.000 Zugehörigkeiten der
+    /// Unterschied zwischen fünf Minuten und ein paar Sekunden.
+    pub known_album_sizes: std::collections::HashMap<String, u64>,
     /// Testmodus: so viele synthetische Datensätze statt echter iCloud-Zugriffe.
     pub fake: Option<u64>,
     /// Testmodus: den 2FA-Dialog durchspielen.
@@ -82,6 +89,8 @@ impl SidecarOptions {
             force_baseline: false,
             thumbnail_dir: None,
             fetch_thumbnails_for: Vec::new(),
+            albums: false,
+            known_album_sizes: std::collections::HashMap::new(),
             fake: None,
             fake_two_factor: false,
             fake_password: false,
@@ -117,6 +126,9 @@ impl SidecarOptions {
         if let Some(limit) = self.limit {
             args.push("--limit".into());
             args.push(limit.to_string());
+        }
+        if self.albums {
+            args.push("--albums".into());
         }
         if let Some(count) = self.fake {
             args.push("--fake".into());
@@ -209,6 +221,8 @@ pub struct SyncSummary {
     pub library_count: Option<u64>,
     /// Neuer Cursor für den nächsten Delta-Sync.
     pub cursor: Option<DateTime<Utc>>,
+    /// So viele Alben wurden übernommen — nur bei einem Album-Lauf.
+    pub albums: Option<u64>,
 }
 
 /// Kanal, über den die UI nach einem Geheimnis gefragt wird — Passwort oder
@@ -324,6 +338,10 @@ pub async fn run_sync(
 
     let mut summary = SyncSummary::default();
     let mut batch: Vec<PhotoRecord> = Vec::with_capacity(BATCH_SIZE);
+    // Alben werden gesammelt und erst bei `albums_done` auf einmal übernommen:
+    // ein abgebrochener Lauf soll den alten Stand nicht halb überschreiben.
+    let mut albums: Vec<AlbumRecord> = Vec::new();
+    let mut contents: Vec<AlbumContent> = Vec::new();
     let mut saw_done = false;
     let mut failure: Option<SyncError> = None;
 
@@ -472,6 +490,14 @@ pub async fn run_sync(
                 // Erst jetzt die IDs schicken. Vorher waere die erste Zeile als
                 // 2FA-Code verschluckt worden, denn der Sidecar liest beides
                 // von stdin.
+                if options.albums {
+                    let known = serde_json::to_string(&options.known_album_sizes)
+                        .unwrap_or_else(|_| "{}".to_string());
+                    stdin.write_all(known.as_bytes()).await?;
+                    stdin.write_all(b"\n").await?;
+                    stdin.flush().await?;
+                    stdin.shutdown().await?;
+                }
                 if options.is_thumbnail_backfill() {
                     let payload = options.fetch_thumbnails_for.join("\n");
                     stdin.write_all(payload.as_bytes()).await?;
@@ -480,6 +506,24 @@ pub async fn run_sync(
                     // EOF beendet die Leseschleife des Sidecars.
                     stdin.shutdown().await?;
                 }
+            }
+            SidecarMessage::Album(album) => {
+                albums.push(album);
+            }
+            SidecarMessage::AlbumMembers { id, size, members } => {
+                contents.push(AlbumContent { id, size, members });
+                album_progress(events, &albums, contents.len());
+            }
+            SidecarMessage::AlbumUnchanged { id } => {
+                let members = catalog.album_member_ids(&id)?;
+                let size = options.known_album_sizes.get(&id).copied();
+                contents.push(AlbumContent { id, size, members });
+                album_progress(events, &albums, contents.len());
+            }
+            SidecarMessage::AlbumsDone { count } => {
+                catalog.replace_albums(&albums, &contents)?;
+                tracing::info!(count, "Alben uebernommen");
+                summary.albums = Some(count);
             }
             SidecarMessage::Done { count, cursor } => {
                 summary.reported = count;
@@ -533,8 +577,8 @@ pub async fn run_sync(
     }
 
     // Ein reiner Nachlade-Lauf fuer Vorschauen ist kein Abgleich und sagt
-    // ueber den Stand der Bibliothek nichts aus.
-    if options.is_thumbnail_backfill() {
+    // ueber den Stand der Bibliothek nichts aus — ein Album-Lauf ebenso wenig.
+    if options.is_thumbnail_backfill() || options.albums {
         return Ok(summary);
     }
 
@@ -625,6 +669,26 @@ fn flush(catalog: &mut Catalog, batch: &mut Vec<PhotoRecord>) -> Result<u64, Syn
     let written = batch.len() as u64;
     batch.clear();
     Ok(written)
+}
+
+/// Meldet, wie viele Alben geladen sind — gezählt gegen die mit Fotos, denn
+/// Ordner kommen nie als Inhalt.
+fn album_progress(
+    events: &Option<mpsc::UnboundedSender<SyncEvent>>,
+    albums: &[AlbumRecord],
+    done: usize,
+) {
+    let total = albums
+        .iter()
+        .filter(|album| album.kind != AlbumKind::Folder)
+        .count() as u64;
+    emit(
+        events,
+        SyncEvent::Albums {
+            done: done as u64,
+            total,
+        },
+    );
 }
 
 fn emit(events: &Option<mpsc::UnboundedSender<SyncEvent>>, event: SyncEvent) {

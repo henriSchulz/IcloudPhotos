@@ -7,8 +7,9 @@ use icloud_photos_core::model::{Photo, PhotoRecord};
 use rusqlite::{Connection, OptionalExtension, Row, params, params_from_iter};
 
 use crate::CacheError;
+use crate::albums::Scope;
 
-const SCHEMA_VERSION: i32 = 8;
+const SCHEMA_VERSION: i32 = 9;
 
 /// Sortierschlüssel der Bibliothek: der Aufnahmezeitpunkt, ersatzweise das
 /// Hinzufügedatum.
@@ -21,7 +22,7 @@ const SORT_KEY: &str = "COALESCE(asset_date, added_date)";
 
 /// Der lokale Foto-Katalog.
 pub struct Catalog {
-    conn: Connection,
+    pub(crate) conn: Connection,
 }
 
 impl Catalog {
@@ -101,7 +102,8 @@ impl Catalog {
                 baseline_offset  INTEGER NOT NULL DEFAULT 0,
                 last_baseline_at TEXT,
                 last_sync_at     TEXT,
-                baseline_gap     INTEGER NOT NULL DEFAULT 0
+                baseline_gap     INTEGER NOT NULL DEFAULT 0,
+                albums_token     TEXT
             );
             INSERT OR IGNORE INTO sync_state (id) VALUES (1);
 
@@ -115,6 +117,25 @@ impl Catalog {
                 name         TEXT,
                 looked_up_at TEXT NOT NULL
             );
+
+            -- Alben aus iCloud (Schema 9). Ordner stehen mit drin, damit die
+            -- Seitenleiste den Baum nachbauen kann; sie selbst haben keine
+            -- Fotos. `position` ist die Reihenfolge, in der iCloud liefert.
+            CREATE TABLE IF NOT EXISTS albums (
+                id        TEXT PRIMARY KEY,
+                name      TEXT NOT NULL,
+                kind      TEXT NOT NULL,
+                parent_id TEXT,
+                position  INTEGER NOT NULL,
+                -- Groesse laut iCloud beim letzten Laden. Stimmt sie beim
+                -- naechsten Mal, werden die Mitglieder nicht neu geholt.
+                size      INTEGER
+            );
+            CREATE TABLE IF NOT EXISTS album_photos (
+                album_id TEXT NOT NULL,
+                photo_id TEXT NOT NULL,
+                PRIMARY KEY (album_id, photo_id)
+            ) WITHOUT ROWID;
             "#,
         )?;
         // Bestandskataloge nachziehen. `CREATE TABLE IF NOT EXISTS` oben legt
@@ -127,6 +148,7 @@ impl Catalog {
             self.add_column("photos", "lat REAL")?; // Schema 6
             self.add_column("photos", "lon REAL")?; // Schema 6
             self.add_column("sync_state", "baseline_gap INTEGER NOT NULL DEFAULT 0")?; // Schema 7
+            self.add_column("sync_state", "albums_token TEXT")?; // Schema 9
         }
         // Schema 8: Ortsnamen kommen jetzt englisch. Die gemerkten stammen aus
         // Anfragen ohne Sprachwunsch und stehen in der Landessprache
@@ -188,25 +210,52 @@ impl Catalog {
     }
 
     pub fn count(&self) -> Result<u64, CacheError> {
-        let count: i64 = self
-            .conn
-            .query_row("SELECT COUNT(*) FROM photos", [], |row| row.get(0))?;
+        self.count_in(&Scope::Library)
+    }
+
+    /// Wie viele Fotos ein Ausschnitt der Bibliothek hat.
+    pub fn count_in(&self, scope: &Scope) -> Result<u64, CacheError> {
+        let (source, album) = scope.source(1);
+        let sql = format!("SELECT COUNT(*) FROM {source}");
+        let count: i64 = match album {
+            Some(album) => self
+                .conn
+                .query_row(&sql, params![album], |row| row.get(0))?,
+            None => self.conn.query_row(&sql, [], |row| row.get(0))?,
+        };
         Ok(from_sql_bytes(count))
     }
 
     /// Eine Seite des Katalogs, zuletzt aufgenommene zuerst — für die
     /// virtualisierte Grid-View.
     pub fn page(&self, offset: u64, limit: u64) -> Result<Vec<Photo>, CacheError> {
+        self.page_in(&Scope::Library, offset, limit)
+    }
+
+    /// Eine Seite eines Ausschnitts, in derselben Reihenfolge wie
+    /// [`Catalog::page`].
+    pub fn page_in(
+        &self,
+        scope: &Scope,
+        offset: u64,
+        limit: u64,
+    ) -> Result<Vec<Photo>, CacheError> {
+        let (source, album) = scope.source(3);
         let mut stmt = self.conn.prepare(&format!(
-            "SELECT * FROM photos ORDER BY {SORT_KEY} DESC, id DESC LIMIT ?1 OFFSET ?2"
+            "SELECT photos.* FROM {source} ORDER BY {SORT_KEY} DESC, photos.id DESC \
+             LIMIT ?1 OFFSET ?2"
         ))?;
-        let rows = stmt.query_map(
-            params![to_sql_bytes(limit), to_sql_bytes(offset)],
-            row_to_photo,
-        )?;
-        rows.collect::<Result<Vec<_>, _>>()?
-            .into_iter()
-            .collect::<Result<Vec<_>, _>>()
+        let limit = to_sql_bytes(limit);
+        let offset = to_sql_bytes(offset);
+        let rows = match album {
+            Some(album) => stmt
+                .query_map(params![limit, offset, album], row_to_photo)?
+                .collect::<Result<Vec<_>, _>>()?,
+            None => stmt
+                .query_map(params![limit, offset], row_to_photo)?
+                .collect::<Result<Vec<_>, _>>()?,
+        };
+        rows.into_iter().collect::<Result<Vec<_>, _>>()
     }
 
     /// Die Monate der Bibliothek, neueste zuerst, mit Anzahl und Position im
@@ -216,17 +265,25 @@ impl Catalog {
     /// Reihenfolge, die [`Catalog::page`] liefert — damit kann die Ansicht
     /// direkt dorthin springen.
     pub fn month_groups(&self) -> Result<Vec<DateGroup>, CacheError> {
+        self.month_groups_in(&Scope::Library)
+    }
+
+    /// Die Monate eines Ausschnitts, wie [`Catalog::month_groups`].
+    pub fn month_groups_in(&self, scope: &Scope) -> Result<Vec<DateGroup>, CacheError> {
+        let (source, album) = scope.source(1);
         let mut stmt = self.conn.prepare(&format!(
             r#"
             SELECT substr({SORT_KEY}, 1, 7) AS month, COUNT(*)
-              FROM photos
+              FROM {source}
              GROUP BY month
              ORDER BY month DESC
             "#
         ))?;
-        let rows = stmt.query_map([], |row| {
-            Ok((row.get::<_, String>(0)?, from_sql_bytes(row.get(1)?)))
-        })?;
+        let read = |row: &Row<'_>| Ok((row.get::<_, String>(0)?, from_sql_bytes(row.get(1)?)));
+        let rows: Vec<rusqlite::Result<(String, u64)>> = match album {
+            Some(album) => stmt.query_map(params![album], read)?.collect(),
+            None => stmt.query_map([], read)?.collect(),
+        };
 
         // Die Position ergibt sich aus der Summe aller neueren Monate. Das in
         // SQL zu rechnen wäre eine Fensterfunktion für nichts — die Liste ist
@@ -365,29 +422,24 @@ impl Catalog {
 
     /// Der gespeicherte Sync-Zustand.
     pub fn sync_state(&self) -> Result<SyncState, CacheError> {
-        let (token, done, offset, baseline_at, sync_at, gap): (
-            Option<String>,
-            i64,
-            i64,
-            Option<String>,
-            Option<String>,
-            i64,
-        ) = self.conn.query_row(
-            "SELECT zone_sync_token, baseline_done, baseline_offset, last_baseline_at,
-                    last_sync_at, baseline_gap
+        let (token, done, offset, baseline_at, sync_at, gap, albums_token): SyncStateRow =
+            self.conn.query_row(
+                "SELECT zone_sync_token, baseline_done, baseline_offset, last_baseline_at,
+                    last_sync_at, baseline_gap, albums_token
                FROM sync_state WHERE id = 1",
-            [],
-            |row| {
-                Ok((
-                    row.get(0)?,
-                    row.get(1)?,
-                    row.get(2)?,
-                    row.get(3)?,
-                    row.get(4)?,
-                    row.get(5)?,
-                ))
-            },
-        )?;
+                [],
+                |row| {
+                    Ok((
+                        row.get(0)?,
+                        row.get(1)?,
+                        row.get(2)?,
+                        row.get(3)?,
+                        row.get(4)?,
+                        row.get(5)?,
+                        row.get(6)?,
+                    ))
+                },
+            )?;
         Ok(SyncState {
             zone_token: token,
             baseline_done: done != 0,
@@ -395,6 +447,7 @@ impl Catalog {
             last_baseline_at: baseline_at.as_deref().map(decode_ts).transpose()?,
             last_sync_at: sync_at.as_deref().map(decode_ts).transpose()?,
             baseline_gap: from_sql_bytes(gap),
+            albums_token,
         })
     }
 
@@ -454,6 +507,17 @@ impl Catalog {
         self.conn.execute(
             "UPDATE sync_state SET last_sync_at = ?1 WHERE id = 1",
             params![encode_ts(now)],
+        )?;
+        Ok(())
+    }
+
+    /// Vermerkt den Zone-Token, zu dem die Alben zuletzt vollständig geladen
+    /// wurden. Stimmt er mit dem aktuellen überein, hat sich an keinem Album
+    /// etwas getan.
+    pub fn set_albums_token(&self, token: Option<&str>) -> Result<(), CacheError> {
+        self.conn.execute(
+            "UPDATE sync_state SET albums_token = ?1 WHERE id = 1",
+            params![token],
         )?;
         Ok(())
     }
@@ -569,6 +633,17 @@ impl Catalog {
     }
 }
 
+/// Die Spalten von `sync_state`, so wie SQLite sie liefert.
+type SyncStateRow = (
+    Option<String>,
+    i64,
+    i64,
+    Option<String>,
+    Option<String>,
+    i64,
+    Option<String>,
+);
+
 /// Wie weit der Sync ist.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct SyncState {
@@ -584,6 +659,8 @@ pub struct SyncState {
     pub last_sync_at: Option<DateTime<Utc>>,
     /// Wie viele Assets nach dem letzten vollständigen Durchlauf fehlten.
     pub baseline_gap: u64,
+    /// Zone-Token, zu dem die Alben zuletzt vollständig geladen wurden.
+    pub albums_token: Option<String>,
 }
 
 /// Der Schlüssel, unter dem ein Ortsname gemerkt wird.
@@ -653,11 +730,11 @@ fn upsert_params(record: &PhotoRecord) -> Vec<Box<dyn rusqlite::ToSql>> {
 
 /// SQLite kennt nur vorzeichenbehaftete 64-Bit-Integer. Dateigrößen jenseits
 /// von `i64::MAX` gibt es nicht, deshalb ist die Sättigung hier folgenlos.
-fn to_sql_bytes(value: u64) -> i64 {
+pub(crate) fn to_sql_bytes(value: u64) -> i64 {
     i64::try_from(value).unwrap_or(i64::MAX)
 }
 
-fn from_sql_bytes(value: i64) -> u64 {
+pub(crate) fn from_sql_bytes(value: i64) -> u64 {
     u64::try_from(value).unwrap_or(0)
 }
 

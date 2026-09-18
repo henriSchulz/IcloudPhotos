@@ -31,6 +31,16 @@ pub enum SyncMessage {
     BackfillStarted {
         missing: u64,
     },
+    /// Die Alben werden neu geladen — nur, wenn sich seit dem letzten Mal
+    /// etwas an der Bibliothek getan hat.
+    AlbumsStarted,
+    /// So viele Alben sind geladen, von so vielen.
+    AlbumsProgress {
+        done: u64,
+        total: u64,
+    },
+    /// Die Alben im Katalog sind ersetzt; die Seitenleiste soll neu lesen.
+    AlbumsChanged,
     Progress {
         stored: u64,
     },
@@ -167,6 +177,9 @@ pub fn spawn(
                                 Some(SyncEvent::Deleted { removed }) => {
                                     let _ = tx.send(SyncMessage::Deleted { removed });
                                 }
+                                Some(SyncEvent::Albums { done, total }) => {
+                                    let _ = tx.send(SyncMessage::AlbumsProgress { done, total });
+                                }
                                 Some(_) => {}
                                 None => break,
                             },
@@ -228,6 +241,22 @@ pub fn spawn(
                 }
             }
 
+            // Alben nach den Fotos: ihre Mitglieder sollen im Katalog schon
+            // stehen. Ein gescheiterter Album-Lauf laesst den alten Stand
+            // stehen und ist kein gescheiterter Sync.
+            if let Ok(summary) = &mut result {
+                match sync_albums(&mut catalog, &options, &prompts, &tx).await {
+                    Ok(Some(count)) => {
+                        summary.albums = Some(count);
+                        let _ = tx.send(SyncMessage::AlbumsChanged);
+                    }
+                    Ok(None) => {}
+                    Err(error) => {
+                        tracing::warn!(%error, "Alben konnten nicht geladen werden");
+                    }
+                }
+            }
+
             forwarder.abort();
 
             // Abgelehnte Zugangsdaten sind kein technischer Fehler, sondern ein
@@ -274,6 +303,43 @@ fn apply_sync_state(options: &mut SidecarOptions, state: &icloud_photos_cache::S
     } else {
         options.since_token = state.zone_token.clone();
     }
+}
+
+/// Laedt die Alben neu, sofern sich die Bibliothek seit dem letzten Mal
+/// geaendert hat. Gibt die Zahl der Alben zurueck, oder `None`, wenn nichts zu
+/// tun war.
+///
+/// Massstab ist der Zone-Token: er aendert sich mit jeder Aenderung in der
+/// Foto-Zone, auch mit einer neuen Album-Zugehoerigkeit. Stimmt er mit dem
+/// Stand der letzten Album-Runde ueberein, kostet dieser Schritt nichts. Ohne
+/// Token — der Erstaufbau laeuft noch — wird gewartet, sonst fehlten den
+/// Alben die meisten Fotos.
+async fn sync_albums(
+    catalog: &mut Catalog,
+    base: &SidecarOptions,
+    prompts: &Prompts,
+    tx: &mpsc::UnboundedSender<SyncMessage>,
+) -> Result<Option<u64>, icloud_photos_sync::SyncError> {
+    let state = catalog.sync_state()?;
+    let Some(token) = state.zone_token else {
+        return Ok(None);
+    };
+    if state.albums_token.as_deref() == Some(token.as_str()) {
+        return Ok(None);
+    }
+    tracing::info!("lade Alben");
+    let _ = tx.send(SyncMessage::AlbumsStarted);
+
+    let mut options = base.clone();
+    options.albums = true;
+    options.known_album_sizes = catalog.album_sizes()?;
+    options.fetch_thumbnails_for = Vec::new();
+    options.since_token = None;
+    options.force_baseline = false;
+    options.offset = 0;
+    let summary = run_sync(catalog, &options, prompts).await?;
+    catalog.set_albums_token(Some(&token))?;
+    Ok(summary.albums)
 }
 
 /// Holt fehlende Vorschauen nach. Gibt `Ok(default)` zurueck, wenn nichts fehlt.

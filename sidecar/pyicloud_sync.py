@@ -22,6 +22,10 @@ Das Protokoll ist zeilenweises JSON; jede Zeile hat ein Feld ``type``:
     {"type": "thumb_failed", "id": ..., "message": "..."}
     {"type": "done", "count": 1234, "cursor": "2026-01-02T03:04:05+00:00"}
     {"type": "error", "kind": "auth", "message": "..."}
+    {"type": "album", "id": ..., "name": ..., "kind": "smart"|"album"|"folder", "parent": ...}
+    {"type": "album_members", "id": ..., "size": 3, "members": ["...", ...]}
+    {"type": "album_unchanged", "id": ...}      Groesse wie zuletzt, Mitglieder bleiben
+    {"type": "albums_done", "count": 158}
 
 stdout gehoert ausschliesslich dem Protokoll. Alles Menschenlesbare geht nach
 stderr, sonst zerreisst es den Parser auf der Rust-Seite.
@@ -43,7 +47,7 @@ import time
 import zlib
 from collections import deque
 from collections.abc import Iterator
-from concurrent.futures import Future, ThreadPoolExecutor
+from concurrent.futures import Future, ThreadPoolExecutor, as_completed
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any
@@ -721,8 +725,12 @@ class AssetResolver:
     Album-Weg weiterhin als Rueckfall.
     """
 
-    def __init__(self, api: Any) -> None:
+    def __init__(self, api: Any, album_fallback: bool = True) -> None:
         self._api = api
+        # Fuer ein einzelnes geoeffnetes Foto ist der langsame Weg besser als
+        # keiner. Fuer einen Stapel nicht: jeder Fehlschlag kostete dort einen
+        # Durchlauf der ganzen Bibliothek.
+        self._album_fallback = album_fallback
         self._album: Any = None
         self._fast: Any = None
         try:
@@ -738,6 +746,8 @@ class AssetResolver:
             log(f"Direkter Record-Zugriff nicht verfuegbar, nutze Album: {exc}")
 
     def _album_lookup(self, asset_id: str) -> Any:
+        if not self._album_fallback:
+            return None
         if self._album is None:
             self._album = self._api.photos.all
         return self._album.get(asset_id)
@@ -903,7 +913,11 @@ def run_fetch_thumbs(username: str, cookie_dir: str | None, thumbs: Path) -> int
     """
     api = authenticate(username, cookie_dir)
     thumbs.mkdir(parents=True, exist_ok=True)
-    album = api.photos.all
+    # Nicht `photos.all.get`: findet dessen Abfrage ein Asset nicht, laeuft es
+    # die ganze Bibliothek durch — gemessen gut zehn Minuten je fehlender
+    # Vorschau. Ein Nachlauf fuer 13 Fotos hing so ueber zwei Stunden und hielt
+    # alles dahinter auf, auch das Laden der Alben.
+    resolver = AssetResolver(api, album_fallback=False)
 
     count = 0
     for line in sys.stdin:
@@ -911,7 +925,7 @@ def run_fetch_thumbs(username: str, cookie_dir: str | None, thumbs: Path) -> int
         if not asset_id:
             continue
         try:
-            asset = album.get(asset_id)
+            asset = resolver.get(asset_id)
         except Exception as exc:  # noqa: BLE001 - fremde API
             emit(
                 {
@@ -928,6 +942,101 @@ def run_fetch_thumbs(username: str, cookie_dir: str | None, thumbs: Path) -> int
         count += 1
 
     emit({"type": "done", "count": count, "cursor": None})
+    return EXIT_OK
+
+
+# --------------------------------------------------------------------------
+# Alben
+# --------------------------------------------------------------------------
+
+# Intelligente Alben, die nicht in die Seitenleiste gehoeren: "Library" ist die
+# Bibliothek selbst, und versteckte oder geloeschte Fotos stehen nicht im
+# Katalog — ihre Alben blieben leer.
+SKIPPED_SMART_ALBUMS = {"Library", "Hidden", "Recently Deleted"}
+
+# So viele Alben werden gleichzeitig durchgegangen. Jedes kostet ~3 s je 100
+# Fotos; bei rund 25.000 Zugehoerigkeiten waeren das einzeln zwoelf Minuten.
+ALBUM_WORKERS = 6
+
+
+def album_kind(album: Any) -> str:
+    """Art eines Albums anhand seiner Klasse in pyicloud."""
+    name = type(album).__name__
+    if name == "SmartPhotoAlbum":
+        return "smart"
+    if name == "PhotoAlbumFolder":
+        return "folder"
+    return "album"
+
+
+def album_content(album: Any, known: dict[str, int]) -> dict[str, Any]:
+    """Die Protokollzeile fuer ein Album: seine Mitglieder, oder nur der Hinweis,
+    dass es sich nicht veraendert hat.
+
+    Die Groesse kostet eine Anfrage, die Mitglieder eine je 100 Fotos. Stimmt
+    die Groesse mit dem letzten Stand, bleiben die gemerkten Mitglieder
+    gueltig — an der echten Bibliothek der Unterschied zwischen fuenf Minuten
+    und ein paar Sekunden.
+    """
+    size = len(album)
+    if known.get(album.id) == size:
+        return {"type": "album_unchanged", "id": album.id}
+    members = [asset.id for asset in album.photos]
+    return {"type": "album_members", "id": album.id, "size": size, "members": members}
+
+
+def read_known_sizes() -> dict[str, int]:
+    """Groessen vom letzten Mal — eine JSON-Zeile auf stdin, nach der Anmeldung."""
+    line = sys.stdin.readline().strip()
+    if not line:
+        return {}
+    try:
+        known = json.loads(line)
+    except ValueError:
+        log("Bekannte Album-Groessen unlesbar — alle Alben werden neu geladen")
+        return {}
+    return {str(key): int(value) for key, value in known.items()}
+
+
+def run_albums(username: str, cookie_dir: str | None) -> int:
+    """Meldet alle Alben mit ihren Mitgliedern.
+
+    Ausgabe: je Album eine ``album``-Zeile in der Reihenfolge, in der iCloud
+    sie liefert, danach je Album mit Fotos eine ``album_members``-Zeile, zum
+    Schluss ``albums_done``. Erst diese Zeile erlaubt der App, ihren Stand zu
+    ersetzen — ein abgebrochener Lauf laesst den alten unangetastet.
+    """
+    api = authenticate(username, cookie_dir)
+    known = read_known_sizes()
+    albums = [
+        album
+        for album in api.photos.albums
+        if not (album_kind(album) == "smart" and album.name in SKIPPED_SMART_ALBUMS)
+    ]
+
+    for position, album in enumerate(albums):
+        emit(
+            {
+                "type": "album",
+                "id": album.id,
+                "name": album.name,
+                "kind": album_kind(album),
+                # Nicht oeffentlich, aber die einzige Stelle, an der pyicloud
+                # den Ordner eines Albums fuehrt.
+                "parent": getattr(album, "_parent_id", None),
+                "position": position,
+            }
+        )
+
+    # Ordner haben selbst keine Fotos — eine Abfrage waere verschenkt.
+    with_photos = [album for album in albums if album_kind(album) != "folder"]
+    with ThreadPoolExecutor(max_workers=ALBUM_WORKERS) as pool:
+        futures = [pool.submit(album_content, album, known) for album in with_photos]
+        for future in as_completed(futures):
+            emit(future.result())
+
+    emit({"type": "albums_done", "count": len(albums)})
+    emit({"type": "done", "count": len(albums), "cursor": None})
     return EXIT_OK
 
 
@@ -1015,6 +1124,49 @@ def fake_record(index: int) -> dict[str, Any]:
         "lat": round(48.137 + (index % 7) * 0.002, 6) if located else None,
         "lon": round(11.575 + (index % 5) * 0.002, 6) if located else None,
     }
+
+
+def run_fake_albums(count: int) -> int:
+    """Alben fuer den Testmodus: je ein intelligentes Album, ein Ordner mit
+    einem Album darin und ein Album auf oberster Ebene."""
+    emit({"type": "auth_ok", "trusted": True})
+    known = read_known_sizes()
+    ids = [f"fake-{index:05d}" for index in range(count)]
+    albums = [
+        ("Favorites", "Favorites", "smart", None, ids[::5]),
+        ("Videos", "Videos", "smart", None, [i for n, i in enumerate(ids) if n % 9 == 8]),
+        ("fake-folder-trips", "Trips", "folder", None, None),
+        ("fake-album-summer", "Summer", "album", "fake-folder-trips", ids[:20]),
+        ("fake-album-food", "Food", "album", None, ids[20:32]),
+    ]
+    for position, (album_id, name, kind, parent, _) in enumerate(albums):
+        emit(
+            {
+                "type": "album",
+                "id": album_id,
+                "name": name,
+                "kind": kind,
+                "parent": parent,
+                "position": position,
+            }
+        )
+    for album_id, _, _, _, members in albums:
+        if members is None:
+            continue
+        if known.get(album_id) == len(members):
+            emit({"type": "album_unchanged", "id": album_id})
+        else:
+            emit(
+                {
+                    "type": "album_members",
+                    "id": album_id,
+                    "size": len(members),
+                    "members": members,
+                }
+            )
+    emit({"type": "albums_done", "count": len(albums)})
+    emit({"type": "done", "count": len(albums), "cursor": None})
+    return EXIT_OK
 
 
 def fake_thumb(index: int, thumbs: Path) -> dict[str, Any]:
@@ -1127,7 +1279,31 @@ def run_fake(
     return EXIT_OK
 
 
+def die_with_parent() -> None:
+    """Endet mit der App, statt sie zu ueberleben.
+
+    Die App beendet ihre Sidecars beim Aufraeumen. Wird sie aber einfach
+    geschlossen, laeuft dieses Aufraeumen nicht mehr — ein Sidecar, der gerade
+    in einer langen Anfrage steckte, lief dann verwaist weiter, einmal ueber
+    eine halbe Stunde. ``PR_SET_PDEATHSIG`` laesst den Kernel ihm SIGTERM
+    schicken, sobald die App weg ist.
+    """
+    try:
+        import ctypes
+        import signal
+
+        pr_set_pdeathsig = 1
+        libc = ctypes.CDLL("libc.so.6", use_errno=True)
+        libc.prctl(pr_set_pdeathsig, signal.SIGTERM)
+    except (OSError, AttributeError):  # pragma: no cover - nicht Linux
+        return
+    # War die App schon weg, bevor das griff, kommt kein Signal mehr.
+    if os.getppid() == 1:
+        sys.exit(EXIT_PIPE)
+
+
 def main(argv: list[str] | None = None) -> int:
+    die_with_parent()
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--username", help="Apple-ID")
     parser.add_argument("--cookie-dir", help="Verzeichnis fuer die Session-Cookies")
@@ -1194,6 +1370,11 @@ def main(argv: list[str] | None = None) -> int:
         help="Nur Vorschauen nachladen; Asset-IDs kommen zeilenweise ueber stdin",
     )
     parser.add_argument(
+        "--albums",
+        action="store_true",
+        help="Nur Alben und ihre Mitglieder melden",
+    )
+    parser.add_argument(
         "--serve",
         action="store_true",
         help="Dauerhaft laufen und Befehle von stdin beantworten (Originale auf Abruf)",
@@ -1203,6 +1384,8 @@ def main(argv: list[str] | None = None) -> int:
     thumbs = Path(args.thumbs).expanduser() if args.thumbs else None
 
     if args.fake is not None:
+        if args.albums:
+            return run_fake_albums(args.fake)
         if args.serve:
             return run_fake_serve(args.fake, args.fake_password, args.fake_terms)
         return run_fake(
@@ -1227,6 +1410,8 @@ def main(argv: list[str] | None = None) -> int:
     try:
         if args.serve:
             return run_serve(args.username, args.cookie_dir)
+        if args.albums:
+            return run_albums(args.username, args.cookie_dir)
         if args.fetch_thumbs:
             assert thumbs is not None
             return run_fetch_thumbs(args.username, args.cookie_dir, thumbs)

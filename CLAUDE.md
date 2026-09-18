@@ -199,6 +199,10 @@ Protokoll, alles Menschenlesbare geht nach stderr.
 {"type": "thumb_failed", "id": "...", "message": "..."}
 {"type": "done", "count": 1234, "cursor": "2026-01-02T03:04:05+00:00"}
 {"type": "error", "kind": "auth", "message": "..."}
+{"type": "album", "id": "...", "name": "...", "kind": "smart|album|folder", "parent": "...", "position": 3}
+{"type": "album_members", "id": "...", "size": 49, "members": ["...", ...]}
+{"type": "album_unchanged", "id": "..."}
+{"type": "albums_done", "count": 155}
 ```
 
 Im Serve-Modus (`--serve`) kommen Befehle als JSON-Zeilen über stdin:
@@ -209,6 +213,12 @@ nicht oder es hat kein Original — ein zweiter Anlauf wäre vergeblich. Alles
 andere ist `error`: Netzfehler, Ausnahme im Lookup, abgelaufene Sitzung. Die
 App wirft dann die Sitzung weg und meldet sich neu an. Ohne diese
 Unterscheidung kostete jedes fehlende Asset eine überflüssige Neuanmeldung.
+
+Der Sidecar setzt beim Start `PR_SET_PDEATHSIG`: Wird die App geschlossen,
+ohne aufzuräumen, schickt der Kernel ihm SIGTERM. Vorher lief ein Sidecar, der
+gerade in einer langen Anfrage steckte, verwaist weiter. Das Signal hängt am
+*Thread*, der ihn gestartet hat — beide Sidecar-Arten starten aus eigenen,
+langlebigen Threads (Sync bzw. Downloader), das passt.
 
 Bricht die Leitung ab — die App wurde geschlossen, ein Sync abgebrochen, der
 Sidecar nach einem Fehler beendet —, endet der Lauf still mit Exit-Code 3
@@ -295,6 +305,48 @@ fehlt, ist eine verpasste Änderung und erzwingt einen neuen Durchlauf — die
 bekannte Lücke selbst nicht mehr. Nur ein Delta-Lauf darf das auslösen: ein
 abgeschnittener Durchlauf hat schlicht noch nicht alles gesehen und verwürfe
 sonst seinen eigenen Fortschritt.
+
+## Alben
+
+`--albums` meldet alle Alben aus `api.photos.albums`: die intelligenten
+(Favorites, Videos, Live, Panoramas, Screenshots, Slo-mo, Time-lapse, Bursts —
+ohne Library, Hidden und Recently Deleted, deren Fotos nicht im Katalog
+stehen), die eigenen Alben und die Ordner, samt `parent`. Danach je Album
+seine Mitglieder. Der Katalog hält sie in `albums` und `album_photos`
+(Schema 9) und ersetzt beide erst bei `albums_done` in einer Transaktion — ein
+abgebrochener Lauf lässt den alten Stand ganz stehen.
+
+An der echten Bibliothek: 155 Alben, knapp 39.000 Zugehörigkeiten, **knapp
+fünf Minuten** mit sechs parallelen Alben (`ALBUM_WORKERS`). Das darf nicht
+bei jedem Sync anfallen:
+
+- Der Album-Lauf hängt am Zone-Token (`sync_state.albums_token`). Stimmt er
+  mit dem Stand der letzten Album-Runde, kostet er nichts. Ohne Token (der
+  Erstaufbau läuft noch) wartet er, sonst fehlten den Alben die Fotos.
+- Der Token ändert sich aber mit **jedem** neuen Foto. Deshalb schickt die App
+  nach `auth_ok` die gemerkten Größen (`albums.size`) als JSON-Zeile. Der
+  Sidecar fragt je Album nur `len()` ab (eine Anfrage) und meldet bei gleicher
+  Größe `album_unchanged` — die App übernimmt dann die gespeicherten
+  Mitglieder. Ein Tausch bei gleicher Größe fällt so durch; das ist der Preis.
+
+Die Seitenleiste steckt in einer `AdwOverlaySplitView`, nicht in einer
+`NavigationSplitView` — nur jene lässt sich auch im breiten Fenster
+ausblenden (Knopf ganz links in der Kopfzeile, F9). Unter 600 sp legt sie sich
+über den Inhalt und schließt nach einer Wahl von selbst.
+
+Die Seitenleiste (`crates/app/src/sidebar.rs`) ist aufgebaut wie in Photos:
+Library, Collections, dann „Pinned" (Favorites, Videos), „Albums" als Baum
+mit auf- und zuklappbaren Ordnern und „Media Types". Leere intelligente Alben
+fehlen. Ordner zeigen nichts selbst, sie klappen nur auf. „Collections"
+(`crates/app/src/collections.rs`) ist eine Übersicht aus Karten mit Titelbild
+(neueste Vorschau des Albums) und Anzahl; ein Ordner öffnet sich dort mit
+Zurück-Knopf.
+
+Ein gewähltes Album ist ein `Scope` des Katalogs: `page_in`, `count_in` und
+`month_groups_in` hängen dann einen Join auf `album_photos` an. Die Bibliothek
+bekommt bewusst keinen — nur so liest SQLite ihre Seiten direkt aus
+`idx_photos_capture`. Skelette gibt es nur in der Bibliothek; in einem Album
+weiß niemand, wie viele Fotos noch hinein gehören.
 
 ## Full-Res-Download: warum nicht `PhotoAlbum.get`
 
@@ -545,7 +597,10 @@ Strg+J gibt es, weil `GtkGridView` die Tabulatortaste für seine Kacheln behält
       wird über `.part` + `rename`, damit ein Abbruch keine halbe Datei als
       gültigen Treffer hinterlässt.
       `--fetch-thumbs` holt Vorschauen für IDs von stdin nach — nötig, weil der
-      Delta-Sync ältere Assets nicht erneut sieht. Die App hängt diesen
+      Delta-Sync ältere Assets nicht erneut sieht. Aufgelöst wird über
+      `AssetResolver` **ohne** Album-Rückfall: `photos.all.get` läuft bei
+      jedem nicht gefundenen Asset die ganze Bibliothek durch, und ein
+      Nachlauf für 13 Fotos hing so über zwei Stunden — samt allem dahinter. Die App hängt diesen
       Durchgang automatisch an jeden Sync an (max. 500 pro Lauf).
 - [x] **Full-Res-Download auf Abruf.** Der Sidecar hat dafür einen dauerhaft
       laufenden `--serve`-Modus: Prozessstart plus Anmeldung kosten Sekunden
@@ -578,11 +633,13 @@ Strg+J gibt es, weil `GtkGridView` die Tabulatortaste für seine Kacheln behält
       den Download abwarten kann — ein Zug darf die Oberfläche nicht blockieren,
       und ein noch nicht geladenes Original hat keinen Pfad, den man mitgeben
       könnte.
-- [ ] Favoriten. `PhotoAsset` aus `timlaing/pyicloud` hat dafür **keine**
-      Eigenschaft (`added_date`, `asset_date`, `dimensions`, `filename`, `id`,
-      `is_live_photo`, `item_type`, `master_id`, `resources`, `size`,
-      `versions`) — es bräuchte den Rohzugriff auf das CloudKit-Feld.
-- [ ] Alben-Seitenleiste (`api.photos.albums`), Suche und Info-Panel mit EXIF
+- [x] Favoriten — über das intelligente Album „Favorites", nicht über ein Feld
+      am `PhotoAsset` (das hat keins). Siehe „Alben".
+- [x] Alben-Seitenleiste — siehe „Alben".
+- [ ] Suche und Info-Panel mit EXIF
+- [ ] Alben ohne Titelbild: die Übersicht dekodiert ihre Titelbilder noch im
+      UI-Thread (`Picture::set_filename`). Bei 160 Vorschauen à 30 KB unkritisch,
+      bei tausend Alben nicht mehr.
 - [x] Vorschauen im Hintergrund dekodieren — siehe „Raster während eines
       Syncs".
 - [ ] `GListModel`-Implementierung für paginierte SQLite-Queries.

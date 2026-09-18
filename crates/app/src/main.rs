@@ -1,10 +1,12 @@
 //! iCloud Photos — nativer Client für Omarchy.
 
+mod collections;
 mod demo;
 mod downloader;
 mod export;
 mod geocode;
 mod photo_object;
+mod sidebar;
 mod sync_manager;
 mod sync_task;
 mod viewer;

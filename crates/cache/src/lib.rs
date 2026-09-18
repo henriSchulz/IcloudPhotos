@@ -1,9 +1,11 @@
 //! Lokaler Foto-Katalog (SQLite) sowie Thumbnail- und Full-Res-Cache-Verwaltung.
 
+pub mod albums;
 pub mod db;
 pub mod evict;
 pub mod housekeeping;
 
+pub use albums::{Album, AlbumContent, Scope};
 pub use db::{Catalog, DateGroup, SyncState, place_cell};
 pub use evict::{EvictionReport, enforce_limit};
 

@@ -1,7 +1,7 @@
 //! Das NDJSON-Protokoll zwischen Sidecar und App.
 
 use chrono::{DateTime, Utc};
-use icloud_photos_core::model::PhotoRecord;
+use icloud_photos_core::model::{AlbumRecord, PhotoRecord};
 use serde::Deserialize;
 
 /// Eine Zeile, die der Sidecar auf stdout schreibt.
@@ -77,6 +77,25 @@ pub enum SidecarMessage {
         id: String,
         message: String,
     },
+    /// Ein Album — intelligent, eigenes oder Ordner.
+    Album(AlbumRecord),
+    /// Die Asset-IDs eines Albums, samt seiner Größe laut iCloud.
+    AlbumMembers {
+        id: String,
+        #[serde(default)]
+        size: Option<u64>,
+        #[serde(default)]
+        members: Vec<String>,
+    },
+    /// Das Album hat dieselbe Größe wie beim letzten Mal; seine Mitglieder
+    /// wurden nicht neu geholt.
+    AlbumUnchanged {
+        id: String,
+    },
+    /// Alle Alben sind gemeldet. Erst jetzt darf der Katalog ersetzt werden.
+    AlbumsDone {
+        count: u64,
+    },
     Done {
         count: u64,
         #[serde(default)]
@@ -120,6 +139,11 @@ pub enum SyncEvent {
     /// So viele in iCloud geloeschte Fotos wurden ausgetragen.
     Deleted {
         removed: u64,
+    },
+    /// So viele Alben sind vollständig geladen, von so vielen mit Fotos.
+    Albums {
+        done: u64,
+        total: u64,
     },
 }
 

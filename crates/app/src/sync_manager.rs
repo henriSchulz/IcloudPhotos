@@ -439,6 +439,28 @@ impl SyncManager {
         }
     }
 
+    /// Die Alben werden geladen. Ihre Zahl steht erst mit dem ersten Album
+    /// fest, bis dahin laeuft der Balken nur.
+    pub fn albums(&self) {
+        self.expected.set(0);
+        self.base.set(0);
+        self.full_pass.set(false);
+        self.reached.set(0);
+        self.title.set_label("Loading Albums");
+        self.detail.set_label("");
+        self.bar.pulse();
+    }
+
+    /// Fortschritt beim Laden der Alben.
+    pub fn albums_loaded(&self, done: u64, total: u64) {
+        self.detail
+            .set_label(&format!("{} / {}", thousands(done), thousands(total)));
+        if total > 0 {
+            self.bar
+                .set_fraction((done as f64 / total as f64).clamp(0.0, 1.0));
+        }
+    }
+
     pub fn deleting(&self, removed: u64) {
         self.title.set_label("Removing Deleted Photos");
         self.detail.set_label(&thousands(removed));
