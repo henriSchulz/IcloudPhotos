@@ -17,6 +17,23 @@ const ORIGINAL_PX: i32 = 1400;
 /// So viele Demo-Fotos bekommen auch ein „Original" im Full-Res-Cache.
 const ORIGINALS: usize = 12;
 
+/// Aufnahmeort eines Demo-Fotos: zwei von dreien liegen in einer von vier
+/// Städten, leicht gestreut, damit die Karte Gruppen verschiedener Größe zeigt.
+fn demo_location(index: usize) -> Option<(f64, f64)> {
+    const CITIES: [(f64, f64); 4] = [
+        (48.137, 11.575), // München
+        (52.520, 13.405), // Berlin
+        (41.390, 2.170),  // Barcelona
+        (35.680, 139.77), // Tokio
+    ];
+    if index % 3 == 2 {
+        return None;
+    }
+    let (lat, lon) = CITIES[index % CITIES.len()];
+    let jitter = |salt: usize| ((index * 7919 + salt) % 100) as f64 / 100.0 - 0.5;
+    Some((lat + jitter(13) * 0.05, lon + jitter(71) * 0.05))
+}
+
 pub fn seed(catalog: &Catalog, config: &Config) -> anyhow::Result<()> {
     if catalog.count()? > 0 {
         tracing::info!("Katalog ist nicht leer, Demo-Daten werden übersprungen");
@@ -29,6 +46,7 @@ pub fn seed(catalog: &Catalog, config: &Config) -> anyhow::Result<()> {
     for index in 0..DEMO_PHOTOS {
         let id = format!("demo-{index:04}");
         let added = base + TimeDelta::days(index as i64);
+        let (lat, lon) = demo_location(index).unzip();
 
         catalog.upsert_record(&PhotoRecord {
             id: id.clone(),
@@ -39,8 +57,8 @@ pub fn seed(catalog: &Catalog, config: &Config) -> anyhow::Result<()> {
             checksum: None,
             width: Some(ORIGINAL_PX as u32),
             height: Some(ORIGINAL_PX as u32),
-            lat: None,
-            lon: None,
+            lat,
+            lon,
             item_type: Some("image".into()),
         })?;
 

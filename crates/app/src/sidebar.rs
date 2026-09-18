@@ -1,7 +1,7 @@
 //! Die Seitenleiste — aufgebaut wie in Apple Photos.
 //!
 //! Oben stehen Library und Collections, darunter drei Abschnitte: „Pinned" mit
-//! Favorites und Videos, „Albums" mit den eigenen Alben samt Ordnern und
+//! Favorites, Map und Videos, „Albums" mit den eigenen Alben samt Ordnern und
 //! „Media Types" mit den übrigen intelligenten Alben. Leere intelligente Alben
 //! fehlen, wie in Photos.
 //!
@@ -23,6 +23,7 @@ use crate::sync_manager::thousands;
 pub enum Target {
     Library,
     Collections,
+    Map,
     Album(String),
 }
 
@@ -281,12 +282,21 @@ impl Sidebar {
 
         let albums = self.albums.borrow().clone();
 
-        let pinned = pinned(&albums);
-        if !pinned.is_empty() {
-            self.list.append(&heading("Pinned"));
-            for album in pinned {
-                self.push_album(album, 0);
-            }
+        // Die Karte steht immer da, wie in Photos zwischen Favorites und
+        // Videos. Ohne Fotos mit Ort zeigt sie, warum sie leer ist.
+        self.list.append(&heading("Pinned"));
+        let (favorites, rest): (Vec<&Album>, Vec<&Album>) = pinned(&albums)
+            .into_iter()
+            .partition(|album| album.id == "Favorites");
+        for album in favorites {
+            self.push_album(album, 0);
+        }
+        self.push(
+            entry("mark-location-symbolic", "Map", None, 0),
+            Row::Target(Target::Map),
+        );
+        for album in rest {
+            self.push_album(album, 0);
         }
 
         if !children(&albums, None).is_empty() {

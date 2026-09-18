@@ -13,6 +13,7 @@ icloud-photos-cache.workspace = true
 icloud-photos-core.workspace = true
 icloud-photos-sync.workspace = true
 serde_json = "1.0.151"
+shumate = { version = "0.8.1", package = "libshumate", features = ["v1_6"] }
 tokio = { version = "1.53.1", features = ["rt-multi-thread", "macros", "sync", "time"] }
 tracing = "0.1.44"
 tracing-subscriber = { version = "0.3.23", features = ["env-filter"] }

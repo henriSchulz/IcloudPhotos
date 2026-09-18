@@ -677,6 +677,7 @@ dependencies = [
  "icloud-photos-core",
  "icloud-photos-sync",
  "libadwaita",
+ "libshumate",
  "serde_json",
  "tempfile",
  "tokio",
@@ -692,6 +693,7 @@ dependencies = [
  "chrono",
  "icloud-photos-core",
  "rusqlite",
+ "serde_json",
  "tempfile",
  "thiserror",
  "tracing",
@@ -907,6 +909,36 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "8d8f1ea3f21fd3405dcaf6c9b5c1630af9afc422d9073ea39c5f6d6c772e08ed"
 dependencies = [
  "libc",
+]
+
+[[package]]
+name = "libshumate"
+version = "0.8.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "0e12e125102e45d029d3433a341608d81a2cf5e4aba8fe11f150310550b4072b"
+dependencies = [
+ "gdk-pixbuf",
+ "gdk4",
+ "gio",
+ "glib",
+ "gtk4",
+ "libshumate-sys",
+]
+
+[[package]]
+name = "libshumate-sys"
+version = "0.8.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "139011b1db5dce6f52ae88a30a5bc46157d6a7b048a0c39e7e7d1550737701a6"
+dependencies = [
+ "gdk-pixbuf-sys",
+ "gdk4-sys",
+ "gio-sys",
+ "glib-sys",
+ "gobject-sys",
+ "gtk4-sys",
+ "libc",
+ "system-deps 7.0.8",
 ]
 
 [[package]]

@@ -5,8 +5,10 @@
 //! Zugehörigkeit. Ein Album-Sync ersetzt beide vollständig — siehe
 //! [`Catalog::replace_albums`].
 
+use std::borrow::Cow;
 use std::collections::HashMap;
 use std::path::PathBuf;
+use std::sync::Arc;
 
 use icloud_photos_core::model::{AlbumKind, AlbumRecord};
 use rusqlite::params;
@@ -22,6 +24,8 @@ pub enum Scope {
     Library,
     /// Nur die Fotos eines Albums — auch eines intelligenten wie Favorites.
     Album(String),
+    /// Genau diese Fotos — etwa die einer Stelle auf der Karte.
+    Photos(Arc<[String]>),
 }
 
 impl Scope {
@@ -29,7 +33,16 @@ impl Scope {
     ///
     /// Die Bibliothek bekommt bewusst keinen Join und kein `WHERE`: nur so
     /// liest SQLite die Seiten direkt aus `idx_photos_capture`.
-    pub(crate) fn source(&self, placeholder: usize) -> (String, Option<&str>) {
+    ///
+    /// Eine feste Auswahl geht als JSON-Liste in einen einzigen Platzhalter —
+    /// es bleibt bei einem Parameter, egal wie viele Fotos es sind. Das `+`
+    /// vor `photos.id` ist Absicht: es sperrt den Primärschlüssel für diese
+    /// Bedingung. SQLite läuft dann in Rasterreihenfolge durch
+    /// `idx_photos_capture`, prüft jede Zeile gegen die Liste und hört nach
+    /// einer Seite auf. Ohne das holt es jede ID einzeln und sortiert
+    /// hinterher — an der echten Bibliothek bei 10.651 Fotos rund 190 ms pro
+    /// Seite statt rund 10 ms.
+    pub(crate) fn source(&self, placeholder: usize) -> (String, Option<Cow<'_, str>>) {
         match self {
             Self::Library => ("photos".to_string(), None),
             Self::Album(id) => (
@@ -37,10 +50,19 @@ impl Scope {
                     "photos JOIN album_photos ON album_photos.photo_id = photos.id \
                      WHERE album_photos.album_id = ?{placeholder}"
                 ),
-                Some(id.as_str()),
+                Some(Cow::Borrowed(id.as_str())),
+            ),
+            Self::Photos(ids) => (
+                format!("photos WHERE +photos.id IN (SELECT value FROM json_each(?{placeholder}))"),
+                Some(Cow::Owned(json_list(ids))),
             ),
         }
     }
+}
+
+/// IDs als JSON-Array für `json_each`.
+fn json_list(ids: &[String]) -> String {
+    serde_json::to_string(ids).unwrap_or_else(|_| "[]".to_string())
 }
 
 /// Was in einem Album liegt, wie der Album-Sync es übergibt.
