@@ -15,6 +15,7 @@ use crate::collections::{Collections, Pick};
 use crate::downloader::{self, DownloadMessage, Downloader};
 use crate::export;
 use crate::geocode::{self, Geocoder};
+use crate::map_view::{self, MapView};
 use crate::photo_object::PhotoObject;
 use crate::sidebar::{Sidebar, Target, display_name};
 use crate::sync_manager::{Overview, SyncManager, thousands};
@@ -97,8 +98,9 @@ pub struct AppState {
     login: RefCell<Option<LoginWidgets>>,
     /// Welcher Ausschnitt im Raster steht: die ganze Bibliothek oder ein Album.
     scope: RefCell<Scope>,
-    /// Statt des Rasters steht die Übersicht „Collections" im Fenster.
-    showing_collections: Cell<bool>,
+    /// Was rechts neben der Seitenleiste steht: das Raster oder eine der
+    /// Übersichten.
+    content: Cell<Content>,
     loaded: Cell<u64>,
     exhausted: Cell<bool>,
     syncing: Cell<bool>,
@@ -130,6 +132,10 @@ pub struct AppState {
     /// Katalog und müssen nach einem Album-Sync neu lesen.
     sidebar: RefCell<Option<Rc<Sidebar>>>,
     collections: RefCell<Option<Rc<Collections>>>,
+    map_view: RefCell<Option<Rc<MapView>>>,
+    /// Ein Ortsname für den Titel eines Kartenausschnitts ist angefragt:
+    /// Anfrage-ID und der Titel, in den er gehört.
+    map_title: RefCell<Option<(String, adw::WindowTitle)>>,
     /// Das zuletzt gewaehlte Format beim Sichern.
     save_format: Cell<export::Format>,
     /// Ein laufender Sicherungs-, Kopier- oder Oeffnen-Auftrag.
@@ -137,6 +143,17 @@ pub struct AppState {
     /// Loest Sichern, Kopieren und Oeffnen aus. Vom Hauptfenster eingehaengt,
     /// weil nur dort Dialog und Fortschrittsanzeige sitzen.
     actions: RefCell<Option<ActionHandler>>,
+}
+
+/// Was statt der Anmeldung im Inhaltsbereich steht.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Content {
+    /// Das Raster — Bibliothek, Album oder ein Ort von der Karte.
+    Grid,
+    /// Die Übersicht „Collections".
+    Collections,
+    /// Die Karte.
+    Map,
 }
 
 /// Die Stelle, die Sichern, Kopieren und Oeffnen ausfuehrt.
@@ -178,7 +195,7 @@ impl AppState {
             authenticating: Cell::new(false),
             login: RefCell::new(None),
             scope: RefCell::new(Scope::Library),
-            showing_collections: Cell::new(false),
+            content: Cell::new(Content::Grid),
             loaded: Cell::new(0),
             exhausted: Cell::new(false),
             syncing: Cell::new(false),
@@ -194,6 +211,8 @@ impl AppState {
             sync_manager: RefCell::new(None),
             sidebar: RefCell::new(None),
             collections: RefCell::new(None),
+            map_view: RefCell::new(None),
+            map_title: RefCell::new(None),
             save_format: Cell::new(export::Format::Original),
             job: RefCell::new(None),
             actions: RefCell::new(None),
@@ -248,6 +267,23 @@ impl AppState {
         let sidebar = self.sidebar.borrow().clone();
         if let Some(sidebar) = sidebar {
             sidebar.set_albums(albums);
+        }
+    }
+
+    /// Liest die Fotos mit Ort neu und zeigt sie auf der Karte.
+    ///
+    /// Nur wenn die Karte zu sehen ist; sonst holt ihr nächstes Öffnen das
+    /// ohnehin nach.
+    fn refresh_map(&self) {
+        if self.content.get() != Content::Map {
+            return;
+        }
+        let Some(map) = self.map_view.borrow().clone() else {
+            return;
+        };
+        match self.catalog.borrow().located_photos() {
+            Ok(photos) => map.show(photos),
+            Err(error) => tracing::error!(%error, "Fotos mit Ort nicht lesbar"),
         }
     }
 
@@ -323,8 +359,10 @@ impl AppState {
         if !self.authenticated.get() && total == 0 {
             return "login";
         }
-        if self.showing_collections.get() {
-            return "collections";
+        match self.content.get() {
+            Content::Collections => return "collections",
+            Content::Map => return "map",
+            Content::Grid => {}
         }
         // Waehrend eines laufenden Syncs zeigt das Grid Skelette — "Noch keine
         // Fotos" waere dann schlicht falsch.
@@ -716,6 +754,14 @@ pub fn build(app: &adw::Application, state: Rc<AppState>) {
         .active(true)
         .build();
     header.pack_start(&sidebar_toggle);
+    // Aus dem Raster eines Orts zurück zur Karte, dort wo man sie verlassen
+    // hat. Nur dann sichtbar — die Seitenleiste bleibt dabei auf „Map".
+    let back_to_map = gtk::Button::builder()
+        .icon_name("go-previous-symbolic")
+        .tooltip_text("Back to Map")
+        .visible(false)
+        .build();
+    header.pack_start(&back_to_map);
     header.pack_start(manager.button());
     header.pack_end(&status);
 
@@ -794,11 +840,14 @@ pub fn build(app: &adw::Application, state: Rc<AppState>) {
 
     let collections = Collections::new();
     *state.collections.borrow_mut() = Some(collections.clone());
+    let map_view = MapView::new();
+    *state.map_view.borrow_mut() = Some(map_view.clone());
 
     let stack = gtk::Stack::new();
     stack.add_named(&photos, Some("grid"));
     stack.add_named(&empty, Some("empty"));
     stack.add_named(&collections.widget, Some("collections"));
+    stack.add_named(&map_view.widget, Some("map"));
 
     let library = gtk::Box::new(gtk::Orientation::Vertical, 0);
     library.append(&header);
@@ -854,10 +903,12 @@ pub fn build(app: &adw::Application, state: Rc<AppState>) {
         let title = title.clone();
         let split = split.clone();
         let empty = empty.clone();
+        let back_to_map = back_to_map.clone();
         move |target| {
             let name = match target {
                 Target::Library => "Library".to_string(),
                 Target::Collections => "Collections".to_string(),
+                Target::Map => "Map".to_string(),
                 Target::Album(id) => state
                     .sidebar
                     .borrow()
@@ -872,9 +923,13 @@ pub fn build(app: &adw::Application, state: Rc<AppState>) {
                     .unwrap_or_default(),
             };
             title.set_title(&name);
-            state
-                .showing_collections
-                .set(*target == Target::Collections);
+            back_to_map.set_visible(false);
+            state.map_title.borrow_mut().take();
+            state.content.set(match target {
+                Target::Collections => Content::Collections,
+                Target::Map => Content::Map,
+                Target::Library | Target::Album(_) => Content::Grid,
+            });
             match target {
                 Target::Library => state.set_scope(Scope::Library),
                 Target::Album(id) => state.set_scope(Scope::Album(id.clone())),
@@ -883,6 +938,7 @@ pub fn build(app: &adw::Application, state: Rc<AppState>) {
                         collections.open_folder(None);
                     }
                 }
+                Target::Map => state.refresh_map(),
             }
             if matches!(target, Target::Album(_)) {
                 empty.set_title("No Photos in This Album");
@@ -907,6 +963,20 @@ pub fn build(app: &adw::Application, state: Rc<AppState>) {
         }
     });
     state.refresh_albums();
+
+    map_view.connect_pick({
+        let state = state.clone();
+        let status = status.clone();
+        let stack = stack.clone();
+        let title = title.clone();
+        let back_to_map = back_to_map.clone();
+        let grid = grid.clone();
+        move |pick| show_place(&state, &status, &stack, &title, &back_to_map, &grid, pick)
+    });
+    back_to_map.connect_clicked({
+        let sidebar = sidebar.clone();
+        move |_| sidebar.select(&Target::Map)
+    });
 
     // Rückmeldungen zu Sichern und Kopieren gehören nicht in einen Dialog, den
     // man wegklicken muss.
@@ -1244,8 +1314,56 @@ fn start_geocoder(state: &Rc<AppState>) {
             if let Some(viewer) = viewer {
                 viewer.deliver_place(&resolved.id, resolved.place.as_deref());
             }
+            let pending = state.map_title.borrow().clone();
+            if let (Some((wanted, title)), Some(place)) = (pending, resolved.place.as_deref())
+                && wanted == resolved.id
+            {
+                title.set_title(place);
+            }
         }
     });
+}
+
+/// Zeigt die Fotos einer Stelle der Karte im Raster.
+///
+/// Der Titel ist der Ortsname, falls der schon im Katalog liegt. Sonst wird
+/// er für genau diese eine Stelle nachgeschlagen — nie für alle Gruppen der
+/// Karte: Nominatim erlaubt eine Anfrage pro Sekunde, und jede verrät einen
+/// Ort, an dem jemand war.
+fn show_place(
+    state: &Rc<AppState>,
+    status: &gtk::Label,
+    stack: &gtk::Stack,
+    title: &adw::WindowTitle,
+    back_to_map: &gtk::Button,
+    grid: &gtk::GridView,
+    pick: map_view::Pick,
+) {
+    let count = pick.ids.len() as u64;
+    let (anchor, lat, lon) = pick.anchor;
+    state.content.set(Content::Grid);
+    state.set_scope(Scope::Photos(pick.ids));
+    match state.known_place(lat, lon) {
+        Some(place) => {
+            state.map_title.borrow_mut().take();
+            title.set_title(&place);
+        }
+        None => {
+            title.set_title(&format!(
+                "{} {}",
+                thousands(count),
+                if count == 1 { "Photo" } else { "Photos" }
+            ));
+            // Eigene ID, damit der Betrachter die Antwort nicht für sein
+            // Foto hält.
+            let request = format!("map:{anchor}");
+            *state.map_title.borrow_mut() = Some((request.clone(), title.clone()));
+            state.request_place(&request, lat, lon);
+        }
+    }
+    back_to_map.set_visible(true);
+    update_status(state, status, stack);
+    grid.grab_focus();
 }
 
 /// Startet den Download-Thread und verarbeitet seine Meldungen in der UI.
@@ -1607,7 +1725,7 @@ fn update_status(state: &Rc<AppState>, status: &gtk::Label, stack: &gtk::Stack) 
 
     // In der Bibliothek steht nur, wie viele Fotos da sind. Alles Weitere
     // gehoert in den Sync-Manager. Die Übersicht zählt keine Fotos.
-    status.set_visible(!state.showing_collections.get());
+    status.set_visible(state.content.get() == Content::Grid);
     status.set_label(&format!(
         "{} {}",
         thousands(shown),
@@ -1849,6 +1967,7 @@ fn start_sync(
                     // Alben — auch wenn die Alben selbst gleich blieben.
                     if summary.stored > 0 || summary.deleted > 0 {
                         state.refresh_albums();
+                        state.refresh_map();
                     }
                     update_status(&state, &status, &stack);
                 }

@@ -337,7 +337,7 @@ ausblenden (Knopf ganz links in der Kopfzeile, F9). Unter 600 sp legt sie sich
 über den Inhalt und schließt nach einer Wahl von selbst.
 
 Die Seitenleiste (`crates/app/src/sidebar.rs`) ist aufgebaut wie in Photos:
-Library, Collections, dann „Pinned" (Favorites, Videos), „Albums" als Baum
+Library, Collections, dann „Pinned" (Favorites, Map, Videos), „Albums" als Baum
 mit auf- und zuklappbaren Ordnern und „Media Types". Leere intelligente Alben
 fehlen. Ordner zeigen nichts selbst, sie klappen nur auf. „Collections"
 (`crates/app/src/collections.rs`) ist eine Übersicht aus Karten mit Titelbild
@@ -349,6 +349,76 @@ Ein gewähltes Album ist ein `Scope` des Katalogs: `page_in`, `count_in` und
 bekommt bewusst keinen — nur so liest SQLite ihre Seiten direkt aus
 `idx_photos_capture`. Skelette gibt es nur in der Bibliothek; in einem Album
 weiß niemand, wie viele Fotos noch hinein gehören.
+
+Was rechts neben der Seitenleiste steht, hält `AppState::content` (`Grid`,
+`Collections`, `Map`) — früher ein einzelner Merker `showing_collections`.
+
+## Karte
+
+„Map" steht unter „Pinned" zwischen Favorites und Videos, wie in Photos
+(`crates/app/src/map_view.rs`). Die Karte ist libshumate (`SimpleMap`, Quelle
+OSM Mapnik aus `MapSourceRegistry::with_defaults()`; Lizenzhinweis und
+Maßstab bringt `SimpleMap` selbst mit). Darauf liegt je Gruppe nahe
+beieinander aufgenommener Fotos eine Markierung: die Vorschau des neuesten
+Fotos, abgerundet, oben rechts die Anzahl. Ein Klick zeigt genau diese Fotos
+im gewohnten Raster; die Seitenleiste bleibt auf „Map", ein Zurück-Knopf in
+der Kopfzeile („Back to Map") oder ein erneuter Klick auf „Map" führt zurück —
+dorthin, wo man die Karte verlassen hat. Beim ersten Öffnen richtet sie sich so
+aus, dass alle Fotos hineinpassen, ohne die äußersten 2 % je Rand (ein
+einzelner Urlaub am anderen Ende der Welt zöge die Ansicht sonst auf
+Weltkartengröße).
+
+Der Katalog liefert dafür `located_photos()` — ID, Ort, Vorschau, neueste
+zuerst, direkt aus `idx_photos_capture`. Die Fotos einer Gruppe sind ein
+eigener Ausschnitt, `Scope::Photos(ids)`: die IDs gehen als JSON-Liste in
+einen einzigen Platzhalter (`json_each`). Die Bedingung heißt bewusst
+`+photos.id IN (…)` — das `+` sperrt den Primärschlüssel, SQLite läuft in
+Rasterreihenfolge durch den Index und hört nach einer Seite auf. Ohne das holt
+es jede ID einzeln und sortiert danach: bei 10.651 Fotos ~190 ms pro Seite
+statt ~10 ms. Der Test `pages_read_the_capture_index_without_sorting` prüft
+per `EXPLAIN QUERY PLAN`, dass Bibliothek und Ausschnitt keinen `TEMP B-TREE`
+brauchen und die Bibliothek weiter ohne Join und ohne `json_each` auskommt.
+
+**Gruppieren** (`crates/app/src/cluster.rs`, GTK-frei und getestet) — die Welt
+wird in Web-Mercator je ganzzahliger Zoomstufe in ein Raster aus 80-px-Zellen
+geteilt, jede besetzte Zelle ist eine Gruppe; danach verschmelzen
+Nachbargruppen, deren Schwerpunkte weniger als eine Zelle auseinander liegen,
+damit ein Ort auf einer Zellgrenze nicht als zwei Markierungen nebeneinander
+steht. Ein Durchgang über alle Punkte, kein Vergleich jeder mit jedem. Weil das
+Raster an der Welt hängt und nicht am Ausschnitt, bleiben die Gruppen beim
+Verschieben gleich — gerechnet wird pro Zoomstufe einmal und zwischengespeichert.
+
+Damit die Karte bei tausenden Orten flüssig bleibt:
+
+- **Nur sichtbare Markierungen sind Widgets.** Gebaut wird, was im Ausschnitt
+  plus einem halben Bildschirm Rand liegt (höchstens 600). Beim Verschieben
+  kommen nur neue dazu; gebaute bleiben stehen. Nachgeführt wird 120 ms nach
+  der letzten Bewegung (Signal `changed` des Viewports, daher Feature `v1_6`) —
+  ein Zoom mit dem Mausrad sind Dutzende Einzelschritte.
+- **Vorschauen im Hilfsthread**, per `Pixbuf::from_file_at_scale` gleich auf
+  160 px verkleinert und im Speicher gehalten (bis 1.500). Volle 360×480 für
+  eine 56-px-Markierung wären Speicher für nichts.
+
+Gemessen an der echten Bibliothek (19.587 Fotos, 10.651 mit Ort), Release-Build:
+`located_photos` 11 ms; Gruppieren je Zoomstufe 0,4–2,5 ms (Zoom 0: 1 Gruppe,
+Zoom 10: 367, Zoom 19: 5.421); eine Rasterseite des größten Ausschnitts (alle
+10.651) 8–12 ms, `count_in` 11 ms, Monatsliste 20 ms. Synthetisch (20.000
+gestreute Punkte, `cluster_timing`): 0,6–8 ms je Zoomstufe.
+
+Der Titel über den Fotos einer Gruppe ist der Ortsname des neuesten Fotos,
+falls er schon im Katalog liegt, sonst „N Photos". Nachgeschlagen wird nur für
+die eine angeklickte Gruppe (Anfrage-ID `map:<id>`, damit der Betrachter die
+Antwort nicht für sein Foto hält) — nie für alle Gruppen der Karte: Nominatim
+erlaubt eine Anfrage pro Sekunde, und jede verrät einen Ort.
+
+**Netz und Privatsphäre.** Jede Kachel ist eine Anfrage an
+`tile.openstreetmap.org` und verrät, welche Gegend man ansieht — und damit
+ungefähr, wo die eigenen Fotos entstanden sind. Die Karte wird deshalb erst beim
+ersten Öffnen gebaut; wer sie nie öffnet, schickt nichts weg. Die Kacheln cacht
+libshumate selbst auf Platte (unter `$XDG_CACHE_HOME`). OSMs Nutzungsregeln
+verlangen einen User-Agent, der die Anwendung nennt; `shumate::set_user_agent`
+setzt ihn vor dem ersten Abruf. Für eine private App mit einem Nutzer ist der
+öffentliche Kachelserver vertretbar, für eine Verteilung an viele nicht.
 
 ## Full-Res-Download: warum nicht `PhotoAlbum.get`
 
@@ -669,6 +739,11 @@ Strg+J gibt es, weil `GtkGridView` die Tabulatortaste für seine Kacheln behält
 - [x] Alben-Seitenleiste — siehe „Alben".
 - [x] Info-Panel mit EXIF — siehe „Bedienung".
 - [ ] Suche
+- [x] Karte mit gruppierten Aufnahmeorten — siehe „Karte".
+- [ ] Karte: Gruppen über die Datumsgrenze (180°) hinweg werden nicht
+      verschmolzen, und „Collections" zeigt die Karte noch nicht als Karte
+      unter „Pinned". Ob die Markierungen auf dem echten Desktop so aussehen
+      wie gedacht, ist nur gebaut und gemessen, nicht angesehen.
 - [ ] Alben ohne Titelbild: die Übersicht dekodiert ihre Titelbilder noch im
       UI-Thread (`Picture::set_filename`). Bei 160 Vorschauen à 30 KB unkritisch,
       bei tausend Alben nicht mehr.
@@ -720,6 +795,14 @@ Die saubere Lösung wäre `glycin` als eigene Abhängigkeit statt des Umwegs üb
 den Pixbuf-Loader — das würde zugleich das Dekodieren aus dem UI-Thread holen.
 Siehe offene Punkte.
 
+Die **Karte** braucht **`libshumate`** (≥ 1.6, hier 1.6.3; Rust-Crate
+`libshumate` 0.8 passt zu `gtk4` 0.11). Anders als libheif ist es eine
+Bauabhängigkeit — ohne die Bibliothek linkt die App nicht:
+
+```
+sudo pacman -S libshumate
+```
+
 ## Entwicklung
 
 ```bash
@@ -729,7 +812,8 @@ python3 -m venv .venv && .venv/bin/pip install -r sidecar/requirements.txt
 # Tests (brauchen nur python3, kein Apple-Konto)
 cargo test --workspace
 
-# UI ohne Apple-Konto ausprobieren: erzeugt 240 Fotos mit Thumbnails
+# UI ohne Apple-Konto ausprobieren: erzeugt 240 Fotos mit Thumbnails,
+# zwei Drittel davon mit Ort in vier Städten (für die Karte)
 cargo run -p icloud-photos-app -- --demo
 
 # Sync gegen synthetische Daten statt iCloud — erzeugt echte Thumbnail-Dateien

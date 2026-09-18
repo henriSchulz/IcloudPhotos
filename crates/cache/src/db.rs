@@ -18,7 +18,7 @@ const SCHEMA_VERSION: i32 = 9;
 /// aus einem Backup in die Bibliothek kam, stünde sonst ganz vorn. Muss
 /// wörtlich mit dem Ausdruck im Index `idx_photos_capture` übereinstimmen,
 /// sonst sortiert SQLite die ganze Tabelle.
-const SORT_KEY: &str = "COALESCE(asset_date, added_date)";
+pub(crate) const SORT_KEY: &str = "COALESCE(asset_date, added_date)";
 
 /// Der lokale Foto-Katalog.
 pub struct Catalog {
@@ -241,10 +241,7 @@ impl Catalog {
         limit: u64,
     ) -> Result<Vec<Photo>, CacheError> {
         let (source, album) = scope.source(3);
-        let mut stmt = self.conn.prepare(&format!(
-            "SELECT photos.* FROM {source} ORDER BY {SORT_KEY} DESC, photos.id DESC \
-             LIMIT ?1 OFFSET ?2"
-        ))?;
+        let mut stmt = self.conn.prepare(&page_sql(&source))?;
         let limit = to_sql_bytes(limit);
         let offset = to_sql_bytes(offset);
         let rows = match album {
@@ -670,6 +667,14 @@ pub struct SyncState {
 /// einzige Anfrage kostet.
 pub fn place_cell(lat: f64, lon: f64) -> String {
     format!("{lat:.3},{lon:.3}")
+}
+
+/// Die Seitenabfrage des Rasters; Grenze und Versatz sind `?1` und `?2`.
+pub(crate) fn page_sql(source: &str) -> String {
+    format!(
+        "SELECT photos.* FROM {source} ORDER BY {SORT_KEY} DESC, photos.id DESC \
+         LIMIT ?1 OFFSET ?2"
+    )
 }
 
 /// Ein Monat der Bibliothek und wo er im Raster beginnt.
