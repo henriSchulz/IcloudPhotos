@@ -7,7 +7,9 @@ pub mod sidecar;
 
 pub use protocol::{SidecarMessage, SyncEvent};
 pub use session::{Original, SidecarSession};
-pub use sidecar::{Prompts, RECONCILE_AFTER, SecretRequest, SidecarOptions, SyncSummary, run_sync};
+pub use sidecar::{
+    Prompts, RECONCILE_AFTER, SecretRequest, SidecarOptions, SyncSummary, TermsRequest, run_sync,
+};
 
 /// Fehler eines Sync-Laufs.
 #[derive(Debug, thiserror::Error)]
@@ -36,6 +38,8 @@ pub enum SyncError {
     TwoFactorAborted,
     #[error("Passwort wurde nicht bereitgestellt")]
     PasswordAborted,
+    #[error("Die geänderten iCloud-Nutzungsbedingungen wurden nicht akzeptiert")]
+    TermsDeclined,
     #[error("Katalog konnte nicht geschrieben werden")]
     Catalog(#[from] icloud_photos_cache::CacheError),
 }

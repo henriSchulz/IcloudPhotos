@@ -1,19 +1,21 @@
 //! Hauptfenster: virtualisiertes Foto-Grid, Viewer und Sync-Steuerung.
 
 use std::cell::{Cell, RefCell};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::rc::Rc;
 
 use adw::prelude::*;
 use gtk::{gdk, gio, glib};
 use icloud_photos_cache::Catalog;
 use icloud_photos_core::Config;
+use icloud_photos_core::model::Photo;
 use std::path::PathBuf;
 
 use crate::downloader::{self, DownloadMessage, Downloader};
 use crate::export;
 use crate::geocode::{self, Geocoder};
 use crate::photo_object::PhotoObject;
-use crate::progress::{SyncBanner, thousands};
+use crate::sync_manager::{Overview, SyncManager, thousands};
 use crate::sync_task::{self, SyncMessage};
 use crate::viewer::{self, Viewer};
 use icloud_photos_sync::SyncSummary;
@@ -63,15 +65,6 @@ const SKELETON_CSS: &str = "
     padding: 4px 14px;
     font-weight: bold;
 }
-/* Der Fortschrittsstreifen unter der Kopfzeile. */
-.sync-banner {
-    background-color: alpha(@accent_bg_color, 0.13);
-    border-bottom: 1px solid alpha(@theme_fg_color, 0.12);
-}
-.sync-banner progressbar trough,
-.sync-banner progressbar progress {
-    min-height: 6px;
-}
 /* Ausgewaehlte Kacheln sollen als solche erkennbar sein. */
 gridview > child:selected picture {
     outline: 3px solid @accent_bg_color;
@@ -106,8 +99,11 @@ pub struct AppState {
     /// Bestand laut iCloud, sobald der Sidecar ihn gemeldet hat. Bezugsgroesse
     /// fuer Skelette und Fortschrittsanzeige.
     expected_total: Cell<u64>,
-    /// Katalogstand beim letzten Nachziehen, um unnoetige Arbeit zu sparen.
+    /// Katalogstand beim letzten Nachziehen. Um so viel darf das geladene
+    /// Fenster wachsen — neue Fotos fallen mitten hinein.
     last_seen_count: Cell<u64>,
+    /// Der Sync hat seit dem letzten Nachziehen etwas geschrieben.
+    model_dirty: Cell<bool>,
     /// Laeuft im Hintergrund und holt Originale auf Abruf.
     downloader: RefCell<Option<Downloader>>,
     /// Loest Koordinaten in Ortsnamen auf — erst, wenn ein Foto offen ist.
@@ -119,6 +115,13 @@ pub struct AppState {
     /// Das Raster, um nach dem Schliessen des Betrachters dorthin
     /// zurueckzufinden, wo das Foto lag.
     grid: RefCell<Option<gtk::GridView>>,
+    /// Scrollstand des Rasters. Ob jemand oben steht oder weiter unten liest,
+    /// entscheidet, ob ein laufender Sync das Raster umbauen darf.
+    scroll: RefCell<Option<gtk::Adjustment>>,
+    /// Alles ueber die Synchronisation — getrennt von der Bibliothek.
+    sync_manager: RefCell<Option<Rc<SyncManager>>>,
+    /// Das zuletzt gewaehlte Format beim Sichern.
+    save_format: Cell<export::Format>,
     /// Ein laufender Sicherungs-, Kopier- oder Oeffnen-Auftrag.
     job: RefCell<Option<export::Job>>,
     /// Loest Sichern, Kopieren und Oeffnen aus. Vom Hauptfenster eingehaengt,
@@ -165,11 +168,15 @@ impl AppState {
             syncing: Cell::new(false),
             expected_total: Cell::new(0),
             last_seen_count: Cell::new(0),
+            model_dirty: Cell::new(false),
             downloader: RefCell::new(None),
             geocoder: RefCell::new(None),
             viewer: RefCell::new(None),
             screens: RefCell::new(None),
             grid: RefCell::new(None),
+            scroll: RefCell::new(None),
+            sync_manager: RefCell::new(None),
+            save_format: Cell::new(export::Format::Original),
             job: RefCell::new(None),
             actions: RefCell::new(None),
         })
@@ -204,10 +211,38 @@ impl AppState {
         if photos.is_empty() {
             return false;
         }
-        let objects: Vec<PhotoObject> = photos.iter().map(PhotoObject::new).collect();
-        self.model.extend_from_slice(&objects);
         self.loaded.set(offset + photos.len() as u64);
-        true
+
+        // Hat ein laufender Sync oben Fotos eingefuegt, die das Raster noch
+        // nicht zeigt, verschiebt sich der Katalog gegen das Modell: die neue
+        // Seite beginnt dann mit Fotos, die schon im Raster stehen.
+        let shown: HashSet<String> = if self.model_dirty.get() {
+            (0..self.model.n_items())
+                .filter_map(|i| self.model.item(i).and_downcast::<PhotoObject>())
+                .map(|object| object.id())
+                .collect()
+        } else {
+            HashSet::new()
+        };
+        let objects: Vec<PhotoObject> = photos
+            .iter()
+            .filter(|photo| !shown.contains(photo.id()))
+            .map(PhotoObject::new)
+            .collect();
+
+        // Vor den Skeletten einfuegen, nicht dahinter.
+        let placeholders = (0..self.model.n_items())
+            .rev()
+            .take_while(|&i| {
+                self.model
+                    .item(i)
+                    .and_downcast::<PhotoObject>()
+                    .is_some_and(|o| o.is_placeholder())
+            })
+            .count() as u32;
+        self.model
+            .splice(self.model.n_items() - placeholders, 0, &objects);
+        !objects.is_empty()
     }
 
     /// Ob ein Sync ueberhaupt losgeschickt werden kann.
@@ -360,17 +395,6 @@ impl AppState {
         self.authenticated.set(false);
     }
 
-    /// Verwirft das Modell und lädt von vorn — nach einem Sync.
-    fn reload(&self) {
-        let open = self.viewer_id();
-        self.model.remove_all();
-        self.loaded.set(0);
-        self.exhausted.set(false);
-        self.last_seen_count.set(0);
-        self.load_next_page();
-        self.relocate_viewer(open);
-    }
-
     /// Die ID des Fotos, das der Betrachter gerade zeigt.
     fn viewer_id(&self) -> Option<String> {
         self.viewer
@@ -391,39 +415,104 @@ impl AppState {
         viewer.relocate(&id);
     }
 
-    /// Zieht die sichtbaren Kacheln auf den aktuellen Katalogstand nach.
+    /// Bringt das Modell auf den aktuellen Katalogstand — waehrend und nach
+    /// einem Sync.
     ///
-    /// Wird waehrend eines Syncs regelmaessig aufgerufen, damit Fotos einlaufen,
-    /// statt erst am Ende auf einen Schlag zu erscheinen. Gibt zurueck, ob sich
-    /// etwas geaendert hat.
-    fn refresh_in_place(&self) -> bool {
+    /// Frueher wurde dafuer das ganze Modell ersetzt. Damit verlor das Raster
+    /// alle zwei Sekunden seinen Halt: jede Kachel wurde neu gebaut, die
+    /// Scrollposition sprang, die Auswahl war weg. Jetzt werden nur die
+    /// tatsaechlichen Aenderungen eingespielt — ein neues Foto wird an seiner
+    /// Stelle eingefuegt, ein geloeschtes herausgenommen, eine eingetroffene
+    /// Vorschau am vorhandenen Objekt gesetzt. Alles andere bleibt dasselbe
+    /// Objekt, und GTK haelt den Blick auf dem Foto, das gerade oben steht.
+    fn sync_model(&self) {
         let total = self.catalog.borrow().count().unwrap_or(0);
-        if total == self.last_seen_count.get() {
-            return false;
-        }
-        self.last_seen_count.set(total);
         let open = self.viewer_id();
+        let was_at_top = self.at_top();
 
-        // So viele Zeilen wie bisher geladen, mindestens eine Seite. Der
-        // Katalog ist nach `added_date` sortiert, neue Fotos koennen also
-        // mitten hinein fallen — anhaengen reicht nicht.
-        let want = self.loaded.get().max(PAGE_SIZE);
+        // Das geladene Fenster darf um die neu hinzugekommenen Fotos wachsen,
+        // sonst fielen am Ende Fotos heraus, die gerade noch zu sehen waren.
+        let growth = total.saturating_sub(self.last_seen_count.get());
+        let want = (self.loaded.get() + growth).max(PAGE_SIZE);
+        self.last_seen_count.set(total);
+        self.model_dirty.set(false);
+
         let photos = match self.catalog.borrow().page(0, want) {
             Ok(photos) => photos,
             Err(error) => {
-                tracing::error!(%error, "Katalog waehrend des Syncs nicht lesbar");
-                return false;
+                tracing::error!(%error, "Katalog nicht lesbar");
+                return;
             }
         };
 
-        let mut objects: Vec<PhotoObject> = photos.iter().map(PhotoObject::new).collect();
-        self.loaded.set(objects.len() as u64);
-        self.exhausted.set((objects.len() as u64) < want);
+        let real = apply_diff(&self.model, &photos);
+        self.loaded.set(real);
+        self.exhausted.set(real < want);
 
-        objects.extend(self.placeholders(total, objects.len() as u64));
-        self.model.splice(0, self.model.n_items(), &objects);
+        // Skelette stehen immer am Ende; nur ihre Zahl wird angeglichen.
+        let wanted = self.placeholders(total, real).len() as u32;
+        let current = self.model.n_items() - real as u32;
+        if wanted > current {
+            let extra: Vec<PhotoObject> = (current..wanted)
+                .map(|_| PhotoObject::placeholder())
+                .collect();
+            self.model.splice(self.model.n_items(), 0, &extra);
+        } else if wanted < current {
+            self.model.splice(
+                real as u32 + wanted,
+                current - wanted,
+                &[] as &[PhotoObject],
+            );
+        }
+
+        // GTK haelt beim Einfuegen das bisher oberste Foto fest und scrollt
+        // ihm hinterher. Wer oben stand, will aber oben bleiben und die neuen
+        // Fotos sehen.
+        if was_at_top
+            && self.model.n_items() > 0
+            && let Some(grid) = self.grid.borrow().as_ref()
+        {
+            grid.scroll_to(0, gtk::ListScrollFlags::NONE, None);
+        }
+
         self.relocate_viewer(open);
-        true
+    }
+
+    /// Ob die Ansicht am Anfang der Bibliothek steht.
+    fn at_top(&self) -> bool {
+        self.scroll
+            .borrow()
+            .as_ref()
+            .is_none_or(|adjustment| adjustment.value() < 1.0)
+    }
+
+    /// Nachziehen waehrend eines Syncs, ohne dem Nutzer das Raster unter den
+    /// Augen umzubauen.
+    ///
+    /// Neue Fotos fallen mitten in die sortierte Bibliothek — beim Erstaufbau
+    /// sogar fast alle ganz nach oben, weil iCloud alt vor neu liefert. GTK
+    /// haelt beim Einfuegen zwar das oberste Foto fest, im Raster fliesst aber
+    /// alles um so viele Spalten weiter, wie oben dazukam. Wer weiter unten
+    /// liest, saehe die Kacheln alle zwei Sekunden seitwaerts springen.
+    ///
+    /// Deshalb: Steht die Ansicht oben, laufen neue Fotos live ein und die
+    /// Ansicht bleibt oben — wie ein Feed. Steht sie weiter unten, fuellen nur
+    /// eintreffende Vorschauen ihre Kacheln; der Umbau wartet, bis der Nutzer
+    /// wieder oben ist oder der Sync endet.
+    fn refresh_live(&self) {
+        if self.at_top() {
+            self.sync_model();
+            return;
+        }
+        let window = self.loaded.get().max(PAGE_SIZE);
+        let photos = match self.catalog.borrow().page(0, window) {
+            Ok(photos) => photos,
+            Err(error) => {
+                tracing::error!(%error, "Katalog nicht lesbar");
+                return;
+            }
+        };
+        update_in_place(&self.model, &photos);
     }
 
     /// Skelette fuer Fotos, die der Sync noch nicht geliefert hat.
@@ -443,6 +532,94 @@ impl AppState {
     }
 }
 
+/// Setzt neue Vorschauen an vorhandenen Objekten, ohne das Modell zu
+/// veraendern — keine Kachel verschiebt sich.
+fn update_in_place(model: &gio::ListStore, photos: &[Photo]) {
+    let by_id: HashMap<&str, &Photo> = photos.iter().map(|p| (p.id(), p)).collect();
+    for index in 0..model.n_items() {
+        let Some(object) = model.item(index).and_downcast::<PhotoObject>() else {
+            continue;
+        };
+        if object.is_placeholder() {
+            break;
+        }
+        if let Some(photo) = by_id.get(object.id().as_str()) {
+            object.update_from(photo);
+        }
+    }
+}
+
+/// Spielt die Unterschiede zwischen Modell und `photos` als einzelne
+/// Einfuege- und Entfernschritte ein. Gibt die Zahl der echten Fotos zurueck.
+///
+/// Beide Seiten sind gleich sortiert. Ein Foto, dessen Platz sich geaendert
+/// hat — ein korrigiertes Aufnahmedatum —, wird an der alten Stelle
+/// entfernt und an der neuen eingefuegt. Skelette am Ende bleiben liegen.
+fn apply_diff(model: &gio::ListStore, photos: &[Photo]) -> u64 {
+    let object_at = |index: u32| model.item(index).and_downcast::<PhotoObject>();
+
+    let mut real = (0..model.n_items())
+        .take_while(|&index| object_at(index).is_some_and(|o| !o.is_placeholder()))
+        .count() as u32;
+
+    let wanted: HashSet<&str> = photos.iter().map(|p| p.id()).collect();
+    let mut present: HashSet<String> = (0..real)
+        .filter_map(|index| object_at(index).map(|o| o.id()))
+        .collect();
+
+    let mut index = 0u32;
+    let mut next = 0usize;
+    while next < photos.len() {
+        let photo = &photos[next];
+        let current = (index < real).then(|| object_at(index)).flatten();
+        match current {
+            Some(object) if object.id() == photo.id() => {
+                object.update_from(photo);
+                index += 1;
+                next += 1;
+            }
+            // Geloescht, oder aus dem geladenen Fenster gefallen.
+            Some(object) if !wanted.contains(object.id().as_str()) => {
+                present.remove(&object.id());
+                model.remove(index);
+                real -= 1;
+            }
+            Some(_) if !present.contains(photo.id()) => {
+                // Ein Lauf neuer Fotos auf einmal: ein Schritt statt vieler.
+                let run: Vec<PhotoObject> = photos[next..]
+                    .iter()
+                    .take_while(|p| !present.contains(p.id()))
+                    .map(PhotoObject::new)
+                    .collect();
+                let count = run.len() as u32;
+                model.splice(index, 0, &run);
+                index += count;
+                real += count;
+                next += count as usize;
+            }
+            Some(object) => {
+                // Beide gibt es, aber in anderer Reihenfolge: das alte Objekt
+                // raus, es kommt an seiner neuen Stelle wieder hinein.
+                present.remove(&object.id());
+                model.remove(index);
+                real -= 1;
+            }
+            None => {
+                let rest: Vec<PhotoObject> = photos[next..].iter().map(PhotoObject::new).collect();
+                model.splice(index, 0, &rest);
+                index += rest.len() as u32;
+                real += rest.len() as u32;
+                next = photos.len();
+            }
+        }
+    }
+    // Was danach noch an echten Fotos steht, gibt es im Fenster nicht mehr.
+    if index < real {
+        model.splice(index, real - index, &[] as &[PhotoObject]);
+    }
+    index as u64
+}
+
 pub fn build(app: &adw::Application, state: Rc<AppState>) {
     let window = adw::ApplicationWindow::builder()
         .application(app)
@@ -457,13 +634,13 @@ pub fn build(app: &adw::Application, state: Rc<AppState>) {
         .ellipsize(gtk::pango::EllipsizeMode::End)
         .build();
 
-    let sync_button = gtk::Button::builder()
-        .icon_name("view-refresh-symbolic")
-        .tooltip_text("Jetzt synchronisieren")
-        .build();
+    // Die Bibliothek zeigt nur, wie viele Fotos da sind. Wie die
+    // Synchronisation steht, steht im Sync-Manager hinter diesem Knopf.
+    let manager = SyncManager::new();
+    *state.sync_manager.borrow_mut() = Some(manager.clone());
 
     let header = adw::HeaderBar::new();
-    header.pack_start(&sync_button);
+    header.pack_start(manager.button());
     header.pack_end(&status);
 
     let grid = build_grid(&state, &window);
@@ -492,6 +669,7 @@ pub fn build(app: &adw::Application, state: Rc<AppState>) {
     photos.add_overlay(&month);
 
     let adjustment = scroller.vadjustment();
+    *state.scroll.borrow_mut() = Some(adjustment.clone());
 
     // Eine Stelle, die die Datumszeile nachführt — aufgerufen beim Scrollen,
     // beim Einlaufen neuer Fotos und nach einem Sprung.
@@ -511,13 +689,25 @@ pub fn build(app: &adw::Application, state: Rc<AppState>) {
             if remaining < PREFETCH_MARGIN {
                 state.load_next_page();
             }
+            // Zurueck oben: was der Sync inzwischen gebracht hat, jetzt
+            // einspielen. Nicht mitten im Signal — das Einspielen verschiebt
+            // selbst den Scrollstand.
+            if adj.value() < 1.0 && state.syncing.get() && state.model_dirty.get() {
+                let state = state.clone();
+                glib::idle_add_local_once(move || state.sync_model());
+            }
             refresh_month();
         }
     });
-    // Auch ohne Scrollen soll die Zeile stimmen, sobald Fotos da sind.
+    // Auch ohne Scrollen soll die Zeile stimmen, sobald Fotos da sind. Erst
+    // im Leerlauf: waehrend der Meldung tragen die Kacheln noch die Monate
+    // ihrer alten Belegung, die Zeile zeigte sonst kurz einen falschen.
     state.model.connect_items_changed({
         let refresh_month = refresh_month.clone();
-        move |_, _, _, _| refresh_month()
+        move |_, _, _, _| {
+            let refresh_month = refresh_month.clone();
+            glib::idle_add_local_once(move || refresh_month());
+        }
     });
 
     let empty = adw::StatusPage::builder()
@@ -530,11 +720,8 @@ pub fn build(app: &adw::Application, state: Rc<AppState>) {
     stack.add_named(&photos, Some("grid"));
     stack.add_named(&empty, Some("empty"));
 
-    let banner = SyncBanner::new();
-
     let library = gtk::Box::new(gtk::Orientation::Vertical, 0);
     library.append(&header);
-    library.append(banner.widget());
     library.append(&stack);
 
     // Die beiden Ebenen des Fensters. Ein geöffnetes Foto ist keine zweite
@@ -579,8 +766,8 @@ pub fn build(app: &adw::Application, state: Rc<AppState>) {
         let status = status.clone();
         let stack = stack.clone();
         let window = window.clone();
-        let sync_button = sync_button.clone();
-        let banner = banner.clone();
+        let manager = manager.clone();
+        let toasts = toasts.clone();
         Rc::new(move || {
             // Ohne Apple-ID gibt es nichts zu synchronisieren.
             if !state.sync_configured() {
@@ -593,7 +780,6 @@ pub fn build(app: &adw::Application, state: Rc<AppState>) {
                 tracing::debug!("Sync laeuft bereits, Anforderung verworfen");
                 return;
             }
-            sync_button.set_sensitive(false);
 
             if !state.authenticated.get() {
                 // Auch beim Start mit hinterlegtem Passwort: erst nach
@@ -606,8 +792,8 @@ pub fn build(app: &adw::Application, state: Rc<AppState>) {
                 status.clone(),
                 stack.clone(),
                 window.clone(),
-                sync_button.clone(),
-                banner.clone(),
+                manager.clone(),
+                toasts.clone(),
             );
         })
     };
@@ -625,17 +811,36 @@ pub fn build(app: &adw::Application, state: Rc<AppState>) {
         let status = status.clone();
         let stack = stack.clone();
         move || {
-            if state.syncing.get() && state.refresh_in_place() {
+            if state.syncing.get() && state.model_dirty.get() {
+                state.refresh_live();
                 update_status(&state, &status, &stack);
             }
             glib::ControlFlow::Continue
         }
     });
 
-    sync_button.connect_clicked({
-        let trigger = trigger.clone();
-        move |_| trigger()
+    manager.set_on_sync(trigger.clone());
+
+    // Beim Oeffnen frisch: „vor 3 Minuten" altert, waehrend der Manager zu ist.
+    let open_manager: Rc<dyn Fn()> = {
+        let state = state.clone();
+        let status = status.clone();
+        let stack = stack.clone();
+        let manager = manager.clone();
+        let window = window.clone();
+        Rc::new(move || {
+            update_status(&state, &status, &stack);
+            manager.present(&window);
+        })
+    };
+    let show_manager = gio::SimpleAction::new("sync-manager", None);
+    show_manager.connect_activate({
+        let open_manager = open_manager.clone();
+        move |_, _| open_manager()
     });
+    group.add_action(&show_manager);
+    app.set_accels_for_action("photos.sync-manager", &["<Control><Shift>r"]);
+    manager.button().connect_clicked(move |_| open_manager());
 
     // Aktualisieren gehört auf die gewohnte Taste, nicht nur auf einen Knopf
     // in der Kopfzeile, den das Raster mit der Tabulatortaste nie erreicht.
@@ -905,6 +1110,10 @@ fn start_downloader(
                         None => drop(responder),
                     }
                 }
+                DownloadMessage::TermsRequired(request) => {
+                    let accepted = ask_terms(&window, &request.url).await;
+                    let _ = request.responder.send(accepted);
+                }
                 DownloadMessage::TwoFactorRequired { responder } => {
                     match ask_secret(
                         &window,
@@ -973,49 +1182,51 @@ fn build_grid(state: &Rc<AppState>, window: &adw::ApplicationWindow) -> gtk::Gri
         item.set_child(Some(&overlay));
     });
 
-    factory.connect_bind(|_, item| {
-        let item = item.downcast_ref::<gtk::ListItem>().unwrap();
-        let Some(photo) = item.item().and_downcast::<PhotoObject>() else {
-            return;
-        };
-        let Some(overlay) = item.child().and_downcast::<gtk::Overlay>() else {
-            return;
-        };
-        let Some((picture, badge)) = tile_parts(&overlay) else {
-            return;
-        };
+    // Eine eintreffende Vorschau meldet sich am Objekt; die Kachel, die es
+    // gerade zeigt, laedt dann nur sich selbst neu. Die Anmeldung haengt an
+    // der Kachel und muss beim Loesen wieder ab, sonst zeichnete eine
+    // recycelte Kachel das Bild eines fremden Fotos.
+    let watchers: Rc<RefCell<HashMap<gtk::ListItem, (PhotoObject, glib::SignalHandlerId)>>> =
+        Rc::default();
 
-        // Die Datumszeile ueber dem Raster liest den Monat der obersten
-        // sichtbaren Kachel hier ab.
-        overlay.set_widget_name(&photo.month_label());
+    factory.connect_bind({
+        let watchers = watchers.clone();
+        move |_, item| {
+            let item = item.downcast_ref::<gtk::ListItem>().unwrap();
+            let Some(photo) = item.item().and_downcast::<PhotoObject>() else {
+                return;
+            };
+            let Some(overlay) = item.child().and_downcast::<gtk::Overlay>() else {
+                return;
+            };
+            show_tile(&overlay, &photo);
 
-        if photo.needs_skeleton() {
-            // Noch kein Bild da: Platzhalter statt leerer Flaeche, damit die
-            // Ansicht von Anfang an ihre spaetere Form hat.
-            picture.add_css_class("photo-skeleton");
-            picture.set_paintable(gdk::Paintable::NONE);
-            badge.set_visible(false);
-            overlay.set_tooltip_text(None);
-            return;
+            let handler = photo.connect_thumb_path_notify({
+                let overlay = overlay.downgrade();
+                move |photo| {
+                    if let Some(overlay) = overlay.upgrade() {
+                        show_tile(&overlay, photo);
+                    }
+                }
+            });
+            if let Some((old, id)) = watchers.borrow_mut().insert(item.clone(), (photo, handler)) {
+                old.disconnect(id);
+            }
         }
-
-        picture.remove_css_class("photo-skeleton");
-        badge.set_visible(photo.is_video());
-        overlay.set_tooltip_text(Some(&format!(
-            "{}\n{}",
-            photo.filename(),
-            photo.captured_label()
-        )));
-        set_image(&picture, photo.thumb_path().as_deref());
     });
 
     // Freigeben, sonst hält jede recycelte Zelle ihre Textur fest.
-    factory.connect_unbind(|_, item| {
+    factory.connect_unbind(move |_, item| {
         let item = item.downcast_ref::<gtk::ListItem>().unwrap();
+        if let Some((photo, id)) = watchers.borrow_mut().remove(item) {
+            photo.disconnect(id);
+        }
         if let Some(overlay) = item.child().and_downcast::<gtk::Overlay>()
             && let Some((picture, badge)) = tile_parts(&overlay)
         {
             picture.set_paintable(gdk::Paintable::NONE);
+            // Ein noch laufendes Dekodieren darf hier nichts mehr setzen.
+            picture.set_widget_name("");
             picture.remove_css_class("photo-skeleton");
             badge.set_visible(false);
             overlay.set_tooltip_text(None);
@@ -1081,18 +1292,107 @@ fn open_viewer(state: &Rc<AppState>, parent: &adw::ApplicationWindow, position: 
 }
 
 /// Lädt ein Bild von der Platte; fehlt oder bricht es, bleibt ein Platzhalter.
-fn set_image(picture: &gtk::Picture, path: Option<&str>) {
-    let texture = path.and_then(|path| match gdk::Texture::from_filename(path) {
-        Ok(texture) => Some(texture),
-        Err(error) => {
-            tracing::debug!(path, %error, "Bild konnte nicht geladen werden");
-            None
+/// Zeichnet eine Kachel fuer `photo` — Skelett oder Vorschau.
+fn show_tile(overlay: &gtk::Overlay, photo: &PhotoObject) {
+    let Some((picture, badge)) = tile_parts(overlay) else {
+        return;
+    };
+
+    // Die Datumszeile ueber dem Raster liest den Monat der obersten
+    // sichtbaren Kachel hier ab.
+    overlay.set_widget_name(&photo.month_label());
+
+    let Some(path) = photo.thumb_path().filter(|_| !photo.is_placeholder()) else {
+        // Noch kein Bild da: Platzhalter statt leerer Flaeche, damit die
+        // Ansicht von Anfang an ihre spaetere Form hat.
+        picture.add_css_class("photo-skeleton");
+        picture.set_paintable(gdk::Paintable::NONE);
+        picture.set_widget_name("");
+        badge.set_visible(false);
+        overlay.set_tooltip_text(None);
+        return;
+    };
+
+    badge.set_visible(photo.is_video());
+    overlay.set_tooltip_text(Some(&format!(
+        "{}\n{}",
+        photo.filename(),
+        photo.captured_label()
+    )));
+    set_image(&picture, &path);
+}
+
+/// So viele dekodierte Vorschauen haelt die App im Speicher — zwei, drei
+/// Bildschirme. Eine Vorschau hat 360×480 Pixel, dekodiert also rund 0,7 MB;
+/// mehr als ~140 MB soll das nicht werden.
+const TEXTURE_CACHE: usize = 200;
+
+thread_local! {
+    /// Zuletzt benutzte Vorschauen. Wer zurueckscrollt, sieht sie sofort,
+    /// statt jede noch einmal von der Platte zu dekodieren.
+    static TEXTURES: RefCell<(HashMap<String, gdk::Texture>, VecDeque<String>)> =
+        RefCell::default();
+}
+
+fn cached_texture(path: &str) -> Option<gdk::Texture> {
+    TEXTURES.with_borrow(|(map, _)| map.get(path).cloned())
+}
+
+fn remember_texture(path: &str, texture: &gdk::Texture) {
+    TEXTURES.with_borrow_mut(|(map, order)| {
+        if map.insert(path.to_string(), texture.clone()).is_none() {
+            order.push_back(path.to_string());
+        }
+        while order.len() > TEXTURE_CACHE {
+            if let Some(oldest) = order.pop_front() {
+                map.remove(&oldest);
+            }
         }
     });
-    match texture {
-        Some(texture) => picture.set_paintable(Some(&texture)),
-        None => picture.set_paintable(gdk::Paintable::NONE),
+}
+
+/// Setzt die Vorschau. Liegt sie nicht schon dekodiert vor, geschieht das
+/// Dekodieren in einem Hilfsthread — im UI-Thread liess es jedes Scrollen
+/// ruckeln, und waehrend eines Syncs erst recht.
+fn set_image(picture: &gtk::Picture, path: &str) {
+    if let Some(texture) = cached_texture(path) {
+        picture.remove_css_class("photo-skeleton");
+        picture.set_paintable(Some(&texture));
+        picture.set_widget_name(path);
+        return;
     }
+
+    // Die Kachel merkt sich, welches Bild sie erwartet. Ist sie bis zum Ende
+    // des Dekodierens an ein anderes Foto gewandert, verfaellt das Ergebnis.
+    // Bis dahin bleibt stehen, was die Kachel zeigt — kein Aufblitzen.
+    if picture.widget_name() != path {
+        picture.set_paintable(gdk::Paintable::NONE);
+        picture.add_css_class("photo-skeleton");
+    }
+    picture.set_widget_name(path);
+
+    let picture = picture.downgrade();
+    let path = path.to_string();
+    glib::spawn_future_local(async move {
+        let source = path.clone();
+        let decoded = gio::spawn_blocking(move || gdk::Texture::from_filename(&source)).await;
+        let texture = match decoded {
+            Ok(Ok(texture)) => texture,
+            Ok(Err(error)) => {
+                tracing::debug!(%path, %error, "Vorschau nicht ladbar");
+                return;
+            }
+            Err(_) => return,
+        };
+        remember_texture(&path, &texture);
+        let Some(picture) = picture.upgrade() else {
+            return;
+        };
+        if picture.widget_name() == path {
+            picture.remove_css_class("photo-skeleton");
+            picture.set_paintable(Some(&texture));
+        }
+    });
 }
 
 fn chrono_now() -> chrono::DateTime<chrono::Utc> {
@@ -1101,24 +1401,39 @@ fn chrono_now() -> chrono::DateTime<chrono::Utc> {
 
 fn update_status(state: &Rc<AppState>, status: &gtk::Label, stack: &gtk::Stack) {
     let total = state.catalog.borrow().count().unwrap_or(0);
-    let cached = state.catalog.borrow().cached_bytes().unwrap_or(0);
-    let limit = state.config.borrow().cache.limit_bytes();
 
     // Bis zur abgeschlossenen Anmeldung bleibt die Maske stehen.
     stack.set_visible_child_name(state.current_page(total));
 
-    // Den laufenden Fortschritt zeigt der Streifen; hier stehen die Angaben,
-    // die auch dann stimmen, wenn gerade nichts passiert.
-    let mut line = format!(
-        "{} Fotos · Cache {} / {}",
+    // In der Bibliothek steht nur, wie viele Fotos da sind. Alles Weitere
+    // gehoert in den Sync-Manager.
+    status.set_label(&format!(
+        "{} {}",
         thousands(total),
-        human_bytes(cached),
-        human_bytes(limit)
-    );
-    if let Some(last) = last_sync(state) {
-        line.push_str(&format!(" · {}", since(last, chrono_now())));
+        if total == 1 { "Foto" } else { "Fotos" }
+    ));
+
+    if let Some(manager) = state.sync_manager.borrow().as_ref() {
+        let now = chrono_now();
+        let sync_state = state.catalog.borrow().sync_state().ok();
+        let cached = state.catalog.borrow().cached_bytes().unwrap_or(0);
+        let limit = state.config.borrow().cache.limit_bytes();
+        manager.show_overview(&Overview {
+            photos: total,
+            apple_id: state.config.borrow().icloud.username.clone(),
+            last_sync: last_sync(state).map(|then| since(then, now)),
+            last_full_pass: sync_state
+                .and_then(|s| s.last_baseline_at)
+                .map(|then| since(then, now)),
+            cache: format!("{} von {}", human_bytes(cached), human_bytes(limit)),
+            thumbnails: {
+                let (bytes, count) = state.catalog.borrow().thumbnail_usage().unwrap_or((0, 0));
+                format!("{} · {} Vorschauen", human_bytes(bytes), thousands(count))
+            },
+            thumbnail_dir: state.config.borrow().paths.thumbnail_dir.clone(),
+            full_res_dir: state.config.borrow().paths.full_res_dir.clone(),
+        });
     }
-    status.set_label(&line);
 }
 
 fn last_sync(state: &Rc<AppState>) -> Option<chrono::DateTime<chrono::Utc>> {
@@ -1194,8 +1509,8 @@ fn start_sync(
     status: gtk::Label,
     stack: gtk::Stack,
     window: adw::ApplicationWindow,
-    sync_button: gtk::Button,
-    banner: Rc<SyncBanner>,
+    manager: Rc<SyncManager>,
+    toasts: adw::ToastOverlay,
 ) {
     let mut messages = sync_task::spawn(&state.config.borrow(), state.take_password());
 
@@ -1213,21 +1528,25 @@ fn start_sync(
                     if let Some(offset) = resuming {
                         tracing::info!(offset, "setze abgebrochenen Abgleich fort");
                     }
-                    banner.start(resuming, full_pass);
+                    manager.start(resuming, full_pass);
                 }
-                SyncMessage::Progress { stored } => banner.progress(stored),
+                SyncMessage::Progress { stored } => {
+                    state.model_dirty.set(true);
+                    manager.progress(stored);
+                }
                 SyncMessage::Thumbnails { stored } => {
+                    state.model_dirty.set(true);
                     if backfilling {
-                        banner.backfilled(stored);
+                        manager.backfilled(stored);
                     } else {
                         // Waehrend des Abgleichs zaehlen Vorschauen dieselben
                         // Assets wie die Metadaten, nur feiner.
-                        banner.progress(stored);
+                        manager.progress(stored);
                     }
                 }
                 SyncMessage::BackfillStarted { missing } => {
                     backfilling = true;
-                    banner.backfill(missing);
+                    manager.backfill(missing);
                 }
                 SyncMessage::Unchanged => {
                     tracing::debug!("Bibliothek unveraendert");
@@ -1237,11 +1556,14 @@ fn start_sync(
                     // Raster kann die Luecke mit Skeletten fuellen, der Balken
                     // einen Stand statt nur Bewegung zeigen.
                     state.expected_total.set(total);
-                    banner.set_expected(total);
-                    state.refresh_in_place();
+                    manager.set_expected(total);
+                    state.sync_model();
                     update_status(&state, &status, &stack);
                 }
-                SyncMessage::Deleted { removed } => banner.deleting(removed),
+                SyncMessage::Deleted { removed } => {
+                    state.model_dirty.set(true);
+                    manager.deleting(removed);
+                }
                 SyncMessage::Authenticated { trusted } => {
                     // Erst hier ist die Anmeldung wirklich durch — Passwort und
                     // 2FA sind bestaetigt. Jetzt darf die Maske weichen.
@@ -1249,7 +1571,7 @@ fn start_sync(
                     state.authenticated.set(true);
                     state.authenticating.set(false);
                     state.login_busy(false);
-                    banner.authenticated();
+                    manager.authenticated();
                     update_status(&state, &status, &stack);
                 }
                 SyncMessage::PasswordRequired { responder } => {
@@ -1271,13 +1593,17 @@ fn start_sync(
                     tracing::warn!(%message, "Anmeldung abgelehnt");
                     state.reset_credentials();
                     state.login_error("Apple hat diese Zugangsdaten abgelehnt.");
-                    banner.failed("Anmeldung fehlgeschlagen");
+                    manager.failed("Anmeldung fehlgeschlagen", &message);
                     update_status(&state, &status, &stack);
                     show_error(
                         &window,
                         "Anmeldung fehlgeschlagen",
                         &format!("Apple hat die Anmeldung abgelehnt: {message}"),
                     );
+                }
+                SyncMessage::TermsRequired(request) => {
+                    let accepted = ask_terms(&window, &request.url).await;
+                    let _ = request.responder.send(accepted);
                 }
                 SyncMessage::TwoFactorRequired { responder } => {
                     let code = ask_secret(
@@ -1305,8 +1631,10 @@ fn start_sync(
                         failed = summary.thumbnails_failed,
                         "Sync fertig"
                     );
-                    banner.finished(&outcome(&summary));
-                    state.reload();
+                    manager.finished(&outcome(&summary));
+                    // Vor dem Nachziehen: sonst blieben die Skelette stehen.
+                    state.syncing.set(false);
+                    state.sync_model();
                     update_status(&state, &status, &stack);
                 }
                 SyncMessage::Finished(Err(error)) => {
@@ -1317,8 +1645,19 @@ fn start_sync(
                     if !state.authenticated.get() {
                         state.login_error("Anmeldung nicht abgeschlossen. Bitte erneut versuchen.");
                     }
-                    banner.failed("Abgleich fehlgeschlagen");
-                    show_error(&window, "Sync fehlgeschlagen", &error);
+                    manager.failed("Abgleich fehlgeschlagen", &error);
+                    // Was bis zum Abbruch ankam, soll stehen bleiben — nur die
+                    // Skelette fuer den Rest nicht.
+                    state.syncing.set(false);
+                    state.sync_model();
+                    // Kein Dialog mitten ins Betrachten: ein Hinweis, der
+                    // von selbst verschwindet, und die Einzelheiten im Manager.
+                    let toast = adw::Toast::builder()
+                        .title("Synchronisation fehlgeschlagen")
+                        .button_label("Details")
+                        .action_name("photos.sync-manager")
+                        .build();
+                    toasts.add_toast(toast);
                     update_status(&state, &status, &stack);
                 }
             }
@@ -1330,7 +1669,6 @@ fn start_sync(
             state.login_busy(false);
         }
         state.syncing.set(false);
-        sync_button.set_sensitive(true);
     });
 }
 
@@ -1389,6 +1727,29 @@ async fn ask_secret(
             .to_string(),
     };
     if text.is_empty() { None } else { Some(text) }
+}
+
+/// Fragt, ob Apples geaenderte Nutzungsbedingungen akzeptiert werden.
+///
+/// Die Zustimmung gilt fuer das ganze Apple-Konto, nicht nur fuer diese App.
+/// Deshalb kein Haken im Hintergrund, sondern eine Entscheidung mit Verweis
+/// auf den Text — und Ablehnen als Vorgabe beim Schliessen.
+async fn ask_terms(parent: &adw::ApplicationWindow, url: &str) -> bool {
+    let link = gtk::LinkButton::with_label(url, "Nutzungsbedingungen lesen");
+    let dialog = adw::AlertDialog::builder()
+        .heading("Neue iCloud-Nutzungsbedingungen")
+        .body(
+            "Apple hat die iCloud-Nutzungsbedingungen geändert. Ohne Zustimmung \
+             lässt iCloud keine Anmeldung zu.\n\nDie Zustimmung gilt für dein \
+             Apple-Konto, genauso als hättest du sie auf icloud.com gegeben.",
+        )
+        .extra_child(&link)
+        .close_response("decline")
+        .build();
+    dialog.add_response("decline", "Ablehnen");
+    dialog.add_response("accept", "Akzeptieren");
+    dialog.set_response_appearance("accept", adw::ResponseAppearance::Suggested);
+    dialog.choose_future(Some(parent)).await == "accept"
 }
 
 fn show_error(parent: &adw::ApplicationWindow, heading: &str, body: &str) {
@@ -1694,6 +2055,63 @@ fn selected_items(grid: &gtk::GridView) -> Vec<export::Item> {
 }
 
 /// Startet eine Aktion auf einer Auswahl.
+/// Fragt, in welchem Format gesichert wird. Vorausgewaehlt ist die letzte
+/// Wahl — wer einmal JPEG will, will es meist wieder.
+async fn ask_format(
+    parent: &adw::ApplicationWindow,
+    last: export::Format,
+    count: usize,
+) -> Option<export::Format> {
+    let list = gtk::ListBox::builder()
+        .selection_mode(gtk::SelectionMode::None)
+        .css_classes(["boxed-list"])
+        .build();
+    let mut group: Option<gtk::CheckButton> = None;
+    let mut choices = Vec::new();
+    for format in export::Format::ALL {
+        let check = gtk::CheckButton::builder()
+            .valign(gtk::Align::Center)
+            .active(format == last)
+            .build();
+        if let Some(first) = &group {
+            check.set_group(Some(first));
+        } else {
+            group = Some(check.clone());
+        }
+        let row = adw::ActionRow::builder()
+            .title(format.label())
+            .subtitle(format.description())
+            .activatable_widget(&check)
+            .build();
+        row.add_prefix(&check);
+        list.append(&row);
+        choices.push((format, check));
+    }
+
+    let dialog = adw::AlertDialog::builder()
+        .heading(if count == 1 {
+            "Foto sichern".to_string()
+        } else {
+            format!("{} Fotos sichern", thousands(count as u64))
+        })
+        .body("In welchem Format? Videos bleiben immer im Original.")
+        .extra_child(&list)
+        .default_response("choose")
+        .close_response("cancel")
+        .build();
+    dialog.add_response("cancel", "Abbrechen");
+    dialog.add_response("choose", "Ordner wählen …");
+    dialog.set_response_appearance("choose", adw::ResponseAppearance::Suggested);
+
+    if dialog.choose_future(Some(parent)).await != "choose" {
+        return None;
+    }
+    choices
+        .into_iter()
+        .find(|(_, check)| check.is_active())
+        .map(|(format, _)| format)
+}
+
 fn start_action(
     state: &Rc<AppState>,
     window: &adw::ApplicationWindow,
@@ -1712,38 +2130,36 @@ fn start_action(
 
     match action {
         UiAction::Save => {
-            // Erst das Ziel, dann die Downloads: wer abbricht, soll nichts
-            // angestoßen haben.
-            let dialog = gtk::FileDialog::builder()
-                .title("Fotos sichern")
-                .accept_label("Hierhin sichern")
-                .build();
-            dialog.select_folder(
-                Some(window),
-                gio::Cancellable::NONE,
-                glib::clone!(
-                    #[strong]
-                    state,
-                    #[strong]
-                    status,
-                    #[strong]
-                    toasts,
-                    #[strong]
-                    window,
-                    move |result| {
-                        let Ok(folder) = result else { return };
-                        let Some(path) = folder.path() else { return };
-                        begin_job(
-                            &state,
-                            &window,
-                            &status,
-                            &toasts,
-                            export::Action::SaveTo(path),
-                            items.clone(),
-                        );
-                    }
-                ),
-            );
+            // Erst Format und Ziel, dann die Downloads: wer abbricht, soll
+            // nichts angestoßen haben.
+            let state = state.clone();
+            let window = window.clone();
+            let status = status.clone();
+            let toasts = toasts.clone();
+            glib::spawn_future_local(async move {
+                let count = items.len();
+                let Some(format) = ask_format(&window, state.save_format.get(), count).await else {
+                    return;
+                };
+                state.save_format.set(format);
+
+                let dialog = gtk::FileDialog::builder()
+                    .title("Fotos sichern")
+                    .accept_label("Hierhin sichern")
+                    .build();
+                let Ok(folder) = dialog.select_folder_future(Some(&window)).await else {
+                    return;
+                };
+                let Some(path) = folder.path() else { return };
+                begin_job(
+                    &state,
+                    &window,
+                    &status,
+                    &toasts,
+                    export::Action::SaveTo(path, format),
+                    items,
+                );
+            });
         }
         UiAction::Clipboard => begin_job(
             state,
@@ -1812,9 +2228,56 @@ fn advance_job(
     let Some(job) = state.job.borrow_mut().take() else {
         return;
     };
+
+    // Sichern kann umwandeln, und das dauert: im Hilfsthread, sonst stuende
+    // die App bei hundert HEICs sekundenlang.
+    if let export::Action::SaveTo(dir, format) = &job.action
+        && !job.ready().is_empty()
+    {
+        let dir = dir.clone();
+        let format = *format;
+        let files = job.ready().to_vec();
+        let missing = job.failed();
+        status.set_label(&format!("Sichere {} …", format.label()));
+        let status = status.clone();
+        let toasts = toasts.clone();
+        glib::spawn_future_local(async move {
+            let saved = gio::spawn_blocking(move || export::save_into(&dir, &files, format))
+                .await
+                .unwrap_or_else(|_| export::Saved {
+                    errors: vec!["Sichern abgebrochen".to_string()],
+                    ..Default::default()
+                });
+            for error in &saved.errors {
+                tracing::warn!(%error, "Sichern fehlgeschlagen");
+            }
+            toasts.add_toast(adw::Toast::new(&saved_message(&saved, missing)));
+            status.set_label("");
+        });
+        return;
+    }
+
     let message = finish_job(window, &job);
     toasts.add_toast(adw::Toast::new(&message));
     status.set_label("");
+}
+
+/// „3 Fotos gesichert · 1 Video im Original · 2 nicht"
+fn saved_message(saved: &export::Saved, missing: usize) -> String {
+    let mut message = match saved.saved {
+        1 => "1 Foto gesichert".to_string(),
+        other => format!("{other} Fotos gesichert"),
+    };
+    match saved.kept_as_video {
+        0 => {}
+        1 => message.push_str(" · 1 Video im Original"),
+        other => message.push_str(&format!(" · {other} Videos im Original")),
+    }
+    let failed = missing + saved.errors.len();
+    if failed > 0 {
+        message.push_str(&format!(" · {failed} nicht"));
+    }
+    message
 }
 
 /// Führt den fertigen Auftrag aus und beschreibt, was dabei herauskam.
@@ -1826,20 +2289,9 @@ fn finish_job(window: &adw::ApplicationWindow, job: &export::Job) -> String {
     let missing = job.failed();
 
     match &job.action {
-        export::Action::SaveTo(dir) => {
-            let (saved, errors) = export::save_into(dir, files);
-            for error in &errors {
-                tracing::warn!(%error, "Sichern fehlgeschlagen");
-            }
-            let mut message = match saved {
-                1 => "1 Foto gesichert".to_string(),
-                other => format!("{other} Fotos gesichert"),
-            };
-            if missing + errors.len() > 0 {
-                message.push_str(&format!(" · {} nicht", missing + errors.len()));
-            }
-            message
-        }
+        // Laeuft in `advance_job` im Hilfsthread; hier nur, falls es
+        // nichts zu sichern gab.
+        export::Action::SaveTo(..) => format!("Nichts gesichert · {missing} nicht verfügbar"),
         export::Action::Clipboard => {
             let paths: Vec<gio::File> = files
                 .iter()
@@ -2037,5 +2489,141 @@ mod tests {
         assert_eq!(human_bytes(5_000_000), "5.0 MB");
         assert_eq!(human_bytes(20_000_000), "20.0 MB");
         assert_eq!(human_bytes(5_000_000_000), "5.0 GB");
+    }
+
+    fn photo(id: &str, day: u32) -> Photo {
+        Photo::new(icloud_photos_core::model::PhotoRecord {
+            id: id.to_string(),
+            master_id: None,
+            filename: format!("{id}.HEIC"),
+            added_date: DateTime::parse_from_rfc3339(&format!("2026-01-{day:02}T00:00:00Z"))
+                .unwrap()
+                .with_timezone(&chrono::Utc),
+            asset_date: None,
+            checksum: None,
+            width: None,
+            height: None,
+            lat: None,
+            lon: None,
+            item_type: None,
+        })
+    }
+
+    fn ids(model: &gio::ListStore) -> Vec<String> {
+        (0..model.n_items())
+            .map(|i| {
+                let object = model.item(i).and_downcast::<PhotoObject>().unwrap();
+                if object.is_placeholder() {
+                    "_".to_string()
+                } else {
+                    object.id()
+                }
+            })
+            .collect()
+    }
+
+    fn object(model: &gio::ListStore, index: u32) -> PhotoObject {
+        model.item(index).and_downcast().unwrap()
+    }
+
+    /// Zaehlt, wie viele Positionen die Aenderungsmeldungen beruehren.
+    fn watch(model: &gio::ListStore) -> Rc<Cell<u32>> {
+        let touched = Rc::new(Cell::new(0));
+        model.connect_items_changed({
+            let touched = touched.clone();
+            move |_, _, removed, added| touched.set(touched.get() + removed + added)
+        });
+        touched
+    }
+
+    #[test]
+    fn diff_inserts_new_photos_without_replacing_the_others() {
+        let model = gio::ListStore::new::<PhotoObject>();
+        apply_diff(&model, &[photo("c", 3), photo("a", 1)]);
+        let before_c = object(&model, 0);
+        let before_a = object(&model, 1);
+        let touched = watch(&model);
+
+        // Ein neues Foto faellt zwischen die beiden.
+        let real = apply_diff(&model, &[photo("c", 3), photo("b", 2), photo("a", 1)]);
+
+        assert_eq!(real, 3);
+        assert_eq!(ids(&model), ["c", "b", "a"]);
+        // Dieselben Objekte: Auswahl und Scrollhalt bleiben erhalten.
+        assert_eq!(object(&model, 0), before_c);
+        assert_eq!(object(&model, 2), before_a);
+        // Genau eine Einfuegung, kein Umbau des ganzen Modells.
+        assert_eq!(touched.get(), 1);
+    }
+
+    #[test]
+    fn diff_removes_deleted_photos_and_keeps_placeholders() {
+        let model = gio::ListStore::new::<PhotoObject>();
+        apply_diff(&model, &[photo("c", 3), photo("b", 2), photo("a", 1)]);
+        model.append(&PhotoObject::placeholder());
+
+        let real = apply_diff(&model, &[photo("c", 3), photo("a", 1)]);
+
+        assert_eq!(real, 2);
+        assert_eq!(ids(&model), ["c", "a", "_"]);
+    }
+
+    #[test]
+    fn diff_handles_a_moved_photo() {
+        let model = gio::ListStore::new::<PhotoObject>();
+        apply_diff(&model, &[photo("c", 4), photo("b", 3), photo("a", 2)]);
+
+        // Aufnahmedatum korrigiert: "c" rutscht ans Ende.
+        apply_diff(&model, &[photo("b", 3), photo("a", 2), photo("c", 1)]);
+
+        assert_eq!(ids(&model), ["b", "a", "c"]);
+    }
+
+    #[test]
+    fn arriving_thumbnail_updates_the_object_in_place() {
+        let model = gio::ListStore::new::<PhotoObject>();
+        apply_diff(&model, &[photo("a", 1)]);
+        let tile = object(&model, 0);
+        assert!(tile.needs_skeleton());
+
+        let notified = Rc::new(Cell::new(0));
+        tile.connect_thumb_path_notify({
+            let notified = notified.clone();
+            move |_| notified.set(notified.get() + 1)
+        });
+        let touched = watch(&model);
+
+        let mut with_thumb = photo("a", 1);
+        with_thumb.thumb_path = Some(PathBuf::from("/cache/a.jpg"));
+        apply_diff(&model, std::slice::from_ref(&with_thumb));
+
+        assert_eq!(object(&model, 0), tile);
+        assert!(!tile.needs_skeleton());
+        assert_eq!(notified.get(), 1);
+        assert_eq!(touched.get(), 0, "das Modell selbst bleibt unberuehrt");
+
+        // Unveraendert: keine erneute Meldung, also kein Neuzeichnen.
+        apply_diff(&model, std::slice::from_ref(&with_thumb));
+        assert_eq!(notified.get(), 1);
+    }
+
+    #[test]
+    fn sync_model_replaces_skeletons_with_arriving_photos() {
+        let state = state();
+        state.syncing.set(true);
+        state.expected_total.set(5);
+        state.sync_model();
+        assert_eq!(ids(&state.model), ["_", "_", "_", "_", "_"]);
+
+        let catalog = state.catalog.borrow();
+        catalog.upsert_record(&photo("a", 1).record).unwrap();
+        catalog.upsert_record(&photo("b", 2).record).unwrap();
+        drop(catalog);
+        state.sync_model();
+        assert_eq!(ids(&state.model), ["b", "a", "_", "_", "_"]);
+
+        state.syncing.set(false);
+        state.sync_model();
+        assert_eq!(ids(&state.model), ["b", "a"]);
     }
 }

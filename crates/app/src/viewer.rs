@@ -158,6 +158,12 @@ pub fn open(
     let page = gtk::Box::new(gtk::Orientation::Vertical, 0);
     page.append(&header);
     page.append(&stack);
+    // Die Gruppe muss haengen, bevor die Seite ins Fenster kommt. Spaeter
+    // eingehaengt, loest GTK die Aktionen zwar noch auf, das Menue erfaehrt
+    // davon aber nichts und zeigt alle Eintraege ausgegraut. Die Aktionen
+    // selbst kommen erst in `connect_actions` dazu — das bemerkt es.
+    let actions = gio::SimpleActionGroup::new();
+    page.insert_action_group("viewer", Some(&actions));
     // Eine Seite dieses Namens kann noch stehen, wenn der Stack sie waehrend
     // einer laufenden Blende nicht sofort losgelassen hat. Zwei gleichnamige
     // Seiten sind ein Fehler, und GTK zeigte dann die alte.
@@ -190,7 +196,7 @@ pub fn open(
     connect_navigation(&viewer, &previous, &next);
     connect_zoom(&viewer, &scroller);
     connect_keys(&viewer);
-    connect_actions(&viewer, &page);
+    connect_actions(&viewer, &actions);
 
     back.connect_clicked({
         let weak = Rc::downgrade(&viewer);
@@ -456,6 +462,7 @@ impl Viewer {
             .map(|ext| ext.to_string_lossy().to_lowercase())
             .is_some_and(|ext| matches!(ext.as_str(), "heic" | "heif" | "avif"));
 
+        self.failed.set_title("Original nicht verfügbar");
         self.failed.set_description(Some(if heic {
             "Das Original liegt lokal, lässt sich aber nicht anzeigen. \
              Für HEIC-Dateien braucht gdk-pixbuf die Bibliothek libheif \
@@ -469,6 +476,28 @@ impl Viewer {
     fn show_video(&self, path: &Path) {
         self.video.set_filename(Some(path));
         self.stack.set_visible_child_name("video");
+
+        // GtkVideo scheitert sonst stumm: eine schwarze Flaeche mit
+        // Abspielknopf, der nichts tut. Der Fehler steht nur am Stream.
+        let Some(stream) = self.video.media_stream() else {
+            return;
+        };
+        let failed = self.failed.clone();
+        let stack = self.stack.clone();
+        let path = path.to_path_buf();
+        let report = move |stream: &gtk::MediaStream| {
+            let Some(error) = stream.error() else {
+                return;
+            };
+            // Der rohe GStreamer-Text gehoert ins Log, nicht in die Oberflaeche.
+            tracing::warn!(path = %path.display(), %error, "Video nicht abspielbar");
+            let (title, body) = video_failure(&error.to_string());
+            failed.set_title(title);
+            failed.set_description(Some(body));
+            stack.set_visible_child_name("failed");
+        };
+        report(&stream);
+        stream.connect_error_notify(report);
     }
 
     /// Hält ein laufendes Video an und gibt die Datei frei.
@@ -737,8 +766,7 @@ fn connect_keys(viewer: &Rc<Viewer>) {
 
 /// Sichern, Kopieren und Öffnen hängen an der Aktionsstelle des Hauptfensters —
 /// dort liegen Dialog, Fortschritt und Download-Warteschlange.
-fn connect_actions(viewer: &Rc<Viewer>, page: &gtk::Box) {
-    let group = gio::SimpleActionGroup::new();
+fn connect_actions(viewer: &Rc<Viewer>, group: &gio::SimpleActionGroup) {
     for (name, action) in [
         ("save", UiAction::Save),
         ("copy", UiAction::Clipboard),
@@ -757,7 +785,6 @@ fn connect_actions(viewer: &Rc<Viewer>, page: &gtk::Box) {
         });
         group.add_action(&entry);
     }
-    page.insert_action_group("viewer", Some(&group));
 }
 
 impl Viewer {
@@ -772,6 +799,33 @@ fn set_clamped(adjustment: &gtk::Adjustment, value: f64) {
     adjustment.set_value(value.clamp(0.0, max));
 }
 
+/// Erklaert, warum ein Video nicht laeuft.
+///
+/// Wie bei HEIC liegt es fast immer an einem Paket, nicht an der Datei: GTK
+/// spielt ueber GStreamer ab, und dessen Grundausstattung kann weder `.mov`
+/// oeffnen (`qtdemux` steckt in gst-plugins-good) noch HEVC dekodieren — und
+/// iPhones filmen in HEVC. Ohne diesen Hinweis sucht man den Fehler bei iCloud.
+fn video_failure(message: &str) -> (&'static str, &'static str) {
+    let lower = message.to_lowercase();
+    let missing_plugin = ["missing a plug-in", "no suitable plugins", "no decoder"]
+        .iter()
+        .any(|needle| lower.contains(needle));
+    if missing_plugin {
+        (
+            "Video lässt sich nicht abspielen",
+            "Das Video liegt lokal, aber dem System fehlen die Bausteine, um \
+             iPhone-Videos abzuspielen. Installiere:\n\n\
+             sudo pacman -S gst-plugins-good gst-libav gst-plugin-va\n\n\
+             Danach die App neu starten.",
+        )
+    } else {
+        (
+            "Video lässt sich nicht abspielen",
+            "Die Datei ließ sich nicht abspielen. Einzelheiten stehen im Log.",
+        )
+    }
+}
+
 /// Ruft `f` auf, solange der Betrachter noch lebt.
 ///
 /// Die Steuerungen des Fensters halten den Betrachter nur schwach — sonst
@@ -779,5 +833,21 @@ fn set_clamped(adjustment: &gtk::Adjustment, value: f64) {
 fn with(weak: &Weak<Viewer>, f: impl FnOnce(&Viewer)) {
     if let Some(viewer) = weak.upgrade() {
         f(&viewer);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn missing_gstreamer_plugins_are_named() {
+        // Die Meldung, die GTK auf einem System ohne gst-plugins-good liefert.
+        let (_, text) = video_failure("Your GStreamer installation is missing a plug-in.");
+        assert!(text.contains("gst-plugins-good"));
+        assert!(text.contains("gst-libav"));
+
+        let (_, other) = video_failure("Datei beschädigt");
+        assert!(!other.contains("gst-"));
     }
 }

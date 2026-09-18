@@ -5,6 +5,7 @@ Das Protokoll ist zeilenweises JSON; jede Zeile hat ein Feld ``type``:
 
     {"type": "password_required", "username": "..."}  -> erwartet Passwort auf stdin
     {"type": "auth_required", "method": "2fa"}   -> erwartet Code auf stdin
+    {"type": "terms_required", "url": "..."}    -> erwartet "accept" auf stdin
     {"type": "auth_ok", "trusted": true}
     {"type": "photo", "id": ..., "filename": ..., "lat": 48.137, "lon": 11.575}
     {"type": "cursor", "token": "..."}          Zone-Token vor dem Durchlauf
@@ -144,10 +145,34 @@ def read_secret() -> str:
     return sys.stdin.readline().rstrip("\r\n")
 
 
+# Apples iCloud-Nutzungsbedingungen. Die API liefert nur eine Versionsnummer,
+# keinen Text — die App zeigt deshalb diesen Verweis zum Nachlesen.
+TERMS_URL = "https://www.apple.com/de/legal/internet-services/icloud/"
+
+
+def confirm_terms() -> None:
+    """Fragt die App, ob die geaenderten Nutzungsbedingungen akzeptiert werden.
+
+    Kehrt nur bei Zustimmung zurueck. Akzeptiert wird nie stillschweigend: die
+    Zustimmung gilt fuer das Apple-Konto, nicht nur fuer diese App.
+    """
+    emit({"type": "terms_required", "url": TERMS_URL})
+    if read_secret().strip() != "accept":
+        emit(
+            {
+                "type": "error",
+                "kind": "terms",
+                "message": "Nutzungsbedingungen nicht akzeptiert",
+            }
+        )
+        sys.exit(EXIT_AUTH)
+    log("Geaenderte iCloud-Nutzungsbedingungen akzeptiert")
+
+
 def authenticate(username: str, cookie_dir: str | None):
     """Meldet sich an und erledigt Passwort- und 2FA-Abfrage ueber stdin."""
     from pyicloud import PyiCloudService
-    from pyicloud.exceptions import PyiCloudFailedLoginException
+    from pyicloud.exceptions import PyiCloudAcceptTermsException, PyiCloudFailedLoginException
     from pyicloud.utils import get_password_from_keyring, store_password_in_keyring
 
     password = get_password_from_keyring(username)
@@ -164,7 +189,16 @@ def authenticate(username: str, cookie_dir: str | None):
             sys.exit(EXIT_AUTH)
 
     try:
-        api = PyiCloudService(username, password, cookie_directory=cookie_dir)
+        try:
+            api = PyiCloudService(username, password, cookie_directory=cookie_dir)
+        except PyiCloudAcceptTermsException:
+            # Hat Apple die Bedingungen geaendert, scheitert schon der
+            # Konstruktor. Nach der Zustimmung also noch einmal von vorn —
+            # diesmal mit Erlaubnis, sie zu akzeptieren.
+            confirm_terms()
+            api = PyiCloudService(
+                username, password, cookie_directory=cookie_dir, accept_terms=True
+            )
     except PyiCloudFailedLoginException as exc:
         # Eigene Fehlerart, damit die App gezielt erneut nach dem Passwort
         # fragen kann statt den Sync als kaputt zu melden.
@@ -186,12 +220,21 @@ def authenticate(username: str, cookie_dir: str | None):
         if not code:
             emit({"type": "error", "kind": "auth", "message": "Kein 2FA-Code erhalten"})
             sys.exit(EXIT_AUTH)
-        if not api.validate_2fa_code(code):
-            emit({"type": "error", "kind": "auth", "message": "2FA-Code abgelehnt"})
-            sys.exit(EXIT_AUTH)
-        # Ohne trust_session laeuft die Sitzung nach Stunden ab und jeder Sync
-        # fragt erneut nach einem Code.
-        if not api.is_trusted_session:
+        try:
+            if not api.validate_2fa_code(code):
+                emit({"type": "error", "kind": "auth", "message": "2FA-Code abgelehnt"})
+                sys.exit(EXIT_AUTH)
+            # Ohne trust_session laeuft die Sitzung nach Stunden ab und jeder
+            # Sync fragt erneut nach einem Code.
+            if not api.is_trusted_session:
+                api.trust_session()
+        except PyiCloudAcceptTermsException:
+            # Nach der 2FA meldet sich pyicloud erneut an und stoesst erst
+            # dann auf die Bedingungen. Der Code ist verbraucht; nur die
+            # Anmeldung wird wiederholt. `_accept_terms` ist nicht oeffentlich,
+            # einen anderen Weg gibt es an diesem Punkt aber nicht.
+            confirm_terms()
+            api._accept_terms = True
             api.trust_session()
 
     elif api.requires_2sa:
@@ -726,13 +769,15 @@ def run_serve(username: str, cookie_dir: str | None) -> int:
 FAKE_FLAKY_ID = "fake-flaky"
 
 
-def run_fake_serve(count: int, needs_password: bool) -> int:
+def run_fake_serve(count: int, needs_password: bool, needs_terms: bool = False) -> int:
     """Serve-Modus ohne iCloud: liefert erzeugte Originale."""
     if needs_password:
         emit({"type": "password_required", "username": "fake@example.com"})
         if read_secret() != FAKE_PASSWORD:
             emit({"type": "error", "kind": "credentials", "message": "Anmeldung abgelehnt"})
             return EXIT_AUTH
+    if needs_terms:
+        confirm_terms()
     emit({"type": "auth_ok", "trusted": True})
     emit({"type": "ready"})
 
@@ -933,6 +978,7 @@ def run_fake(
     limit: int | None,
     delay_ms: int,
     missing: int = 0,
+    needs_terms: bool = False,
 ) -> int:
     """Erzeugt synthetische Datensaetze ohne iCloud-Zugriff.
 
@@ -944,6 +990,8 @@ def run_fake(
         if read_secret() != FAKE_PASSWORD:
             emit({"type": "error", "kind": "credentials", "message": "Anmeldung abgelehnt"})
             return EXIT_AUTH
+    if needs_terms:
+        confirm_terms()
     if needs_2fa:
         emit({"type": "auth_required", "method": "2fa"})
         if read_secret().strip() != FAKE_2FA_CODE:
@@ -1041,6 +1089,11 @@ def main(argv: list[str] | None = None) -> int:
         help=f"Im Fake-Modus nach dem Passwort fragen (korrekt: {FAKE_PASSWORD})",
     )
     parser.add_argument(
+        "--fake-terms",
+        action="store_true",
+        help="Im Fake-Modus die Zustimmung zu geaenderten Nutzungsbedingungen verlangen",
+    )
+    parser.add_argument(
         "--thumbs",
         metavar="DIR",
         help="Vorschaubilder in dieses Verzeichnis laden",
@@ -1090,7 +1143,7 @@ def main(argv: list[str] | None = None) -> int:
 
     if args.fake is not None:
         if args.serve:
-            return run_fake_serve(args.fake, args.fake_password)
+            return run_fake_serve(args.fake, args.fake_password, args.fake_terms)
         return run_fake(
             args.fake,
             args.fake_2fa,
@@ -1102,6 +1155,7 @@ def main(argv: list[str] | None = None) -> int:
             args.limit,
             args.fake_delay_ms,
             args.fake_missing,
+            args.fake_terms,
         )
 
     if not args.username:

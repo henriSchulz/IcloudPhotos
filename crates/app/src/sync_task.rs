@@ -10,7 +10,8 @@ use chrono::Utc;
 use icloud_photos_cache::Catalog;
 use icloud_photos_core::Config;
 use icloud_photos_sync::{
-    Prompts, RECONCILE_AFTER, SecretRequest, SidecarOptions, SyncEvent, SyncSummary, run_sync,
+    Prompts, RECONCILE_AFTER, SecretRequest, SidecarOptions, SyncEvent, SyncSummary, TermsRequest,
+    run_sync,
 };
 use tokio::sync::mpsc;
 
@@ -56,6 +57,8 @@ pub enum SyncMessage {
     TwoFactorRequired {
         responder: SecretRequest,
     },
+    /// Apple hat die Nutzungsbedingungen geaendert; die UI muss fragen.
+    TermsRequired(TermsRequest),
     Finished(Result<SyncSummary, String>),
     /// Die Anmeldung wurde abgelehnt — die UI soll erneut fragen.
     CredentialsRejected {
@@ -128,6 +131,7 @@ pub fn spawn(
             options.fake = fake_count();
             // Erlaubt, den kompletten Anmeldeweg ohne Apple-Konto durchzuspielen.
             options.fake_password = std::env::var_os("ICLOUD_PHOTOS_FAKE_PASSWORD").is_some();
+            options.fake_terms = std::env::var_os("ICLOUD_PHOTOS_FAKE_TERMS").is_some();
             options.fake_delay_ms = std::env::var("ICLOUD_PHOTOS_FAKE_DELAY_MS")
                 .ok()
                 .and_then(|value| value.parse().ok())
@@ -136,6 +140,7 @@ pub fn spawn(
             let (event_tx, mut event_rx) = mpsc::unbounded_channel::<SyncEvent>();
             let (tfa_tx, mut tfa_rx) = mpsc::unbounded_channel::<SecretRequest>();
             let (password_tx, mut password_rx) = mpsc::unbounded_channel::<SecretRequest>();
+            let (terms_tx, mut terms_rx) = mpsc::unbounded_channel::<TermsRequest>();
 
             let forwarder = {
                 let tx = tx.clone();
@@ -186,6 +191,12 @@ pub fn spawn(
                                 }
                                 None => break,
                             },
+                            request = terms_rx.recv() => match request {
+                                Some(request) => {
+                                    let _ = tx.send(SyncMessage::TermsRequired(request));
+                                }
+                                None => break,
+                            },
                         }
                     }
                 })
@@ -195,6 +206,7 @@ pub fn spawn(
                 events: Some(event_tx),
                 password: Some(password_tx),
                 two_factor: Some(tfa_tx),
+                terms: Some(terms_tx),
             };
 
             let mut result = run_sync(&mut catalog, &options, &prompts).await;

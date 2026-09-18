@@ -343,6 +343,19 @@ impl Catalog {
         Ok(from_sql_bytes(sum))
     }
 
+    /// Wie viel Platz die Vorschauen belegen, und wie viele es sind.
+    ///
+    /// Gezaehlt wird, was der Katalog ueber sie weiss — eine Vorschau ohne
+    /// Katalogzeile (nach einem Absturz liegengeblieben) fehlt hier.
+    pub fn thumbnail_usage(&self) -> Result<(u64, u64), CacheError> {
+        let (sum, count): (i64, i64) = self.conn.query_row(
+            "SELECT COALESCE(SUM(thumb_bytes), 0), COUNT(*) FROM photos WHERE thumb_path IS NOT NULL",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )?;
+        Ok((from_sql_bytes(sum), from_sql_bytes(count)))
+    }
+
     /// Der gespeicherte Sync-Zustand.
     pub fn sync_state(&self) -> Result<SyncState, CacheError> {
         let (token, done, offset, baseline_at, sync_at, gap): (
@@ -774,6 +787,27 @@ mod tests {
             cursor.to_rfc3339_opts(SecondsFormat::Secs, true),
             "2026-03-01T00:00:00Z"
         );
+    }
+
+    #[test]
+    fn thumbnail_usage_sums_only_existing_previews() {
+        let mut catalog = Catalog::open_in_memory().unwrap();
+        catalog
+            .upsert_batch(&[
+                record("a", "2026-01-01T00:00:00Z"),
+                record("b", "2026-02-01T00:00:00Z"),
+                record("c", "2026-03-01T00:00:00Z"),
+            ])
+            .unwrap();
+        assert_eq!(catalog.thumbnail_usage().unwrap(), (0, 0));
+
+        catalog
+            .set_thumbnail("a", Path::new("/t/a.jpg"), 30_000)
+            .unwrap();
+        catalog
+            .set_thumbnail("b", Path::new("/t/b.jpg"), 45_000)
+            .unwrap();
+        assert_eq!(catalog.thumbnail_usage().unwrap(), (75_000, 2));
     }
 
     #[test]

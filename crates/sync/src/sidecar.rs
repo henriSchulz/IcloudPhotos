@@ -55,6 +55,8 @@ pub struct SidecarOptions {
     pub fake_two_factor: bool,
     /// Testmodus: die Passwortabfrage durchspielen.
     pub fake_password: bool,
+    /// Testmodus: die Zustimmung zu geaenderten Nutzungsbedingungen verlangen.
+    pub fake_terms: bool,
     /// Testmodus: je Asset so lange warten, damit das Einlaufen sichtbar wird.
     pub fake_delay_ms: u64,
     /// Testmodus: so viele Assets mehr zaehlen als liefern. Stellt die
@@ -83,6 +85,7 @@ impl SidecarOptions {
             fake: None,
             fake_two_factor: false,
             fake_password: false,
+            fake_terms: false,
             fake_delay_ms: 0,
             fake_missing: 0,
         }
@@ -124,6 +127,9 @@ impl SidecarOptions {
             if self.fake_password {
                 args.push("--fake-password".into());
             }
+            if self.fake_terms {
+                args.push("--fake-terms".into());
+            }
             if self.fake_delay_ms > 0 {
                 args.push("--fake-delay-ms".into());
                 args.push(self.fake_delay_ms.to_string());
@@ -155,6 +161,9 @@ impl SidecarOptions {
             args.push(count.to_string());
             if self.fake_password {
                 args.push("--fake-password".into());
+            }
+            if self.fake_terms {
+                args.push("--fake-terms".into());
             }
             return args;
         }
@@ -206,6 +215,14 @@ pub struct SyncSummary {
 /// 2FA-Code. Die Antwort geht über den enthaltenen `oneshot`-Sender zurück.
 pub type SecretRequest = oneshot::Sender<String>;
 
+/// Frage an die UI, ob geaenderte iCloud-Nutzungsbedingungen akzeptiert
+/// werden. `true` stimmt zu; ein verworfener `responder` lehnt ab.
+pub struct TermsRequest {
+    /// Wo die Bedingungen nachzulesen sind.
+    pub url: String,
+    pub responder: oneshot::Sender<bool>,
+}
+
 /// Rückkanäle zur UI. Fehlt einer, bricht der Sync ab, sobald der Sidecar
 /// danach fragt.
 #[derive(Default)]
@@ -216,6 +233,9 @@ pub struct Prompts {
     pub password: Option<mpsc::UnboundedSender<SecretRequest>>,
     /// Abfrage des 2FA-Codes.
     pub two_factor: Option<mpsc::UnboundedSender<SecretRequest>>,
+    /// Zustimmung zu geaenderten Nutzungsbedingungen. Fehlt der Kanal, gilt
+    /// das als Ablehnung — zugestimmt wird nie ohne Nachfrage.
+    pub terms: Option<mpsc::UnboundedSender<TermsRequest>>,
 }
 
 impl Prompts {
@@ -236,6 +256,22 @@ impl Prompts {
     /// Fragt nach dem 2FA-Code.
     pub async fn ask_two_factor(&self) -> Option<String> {
         Self::ask(&self.two_factor).await
+    }
+
+    /// Fragt, ob die geaenderten Nutzungsbedingungen akzeptiert werden.
+    pub async fn ask_terms(&self, url: &str) -> bool {
+        let Some(channel) = &self.terms else {
+            return false;
+        };
+        let (responder, answer) = oneshot::channel();
+        let request = TermsRequest {
+            url: url.to_string(),
+            responder,
+        };
+        if channel.send(request).is_err() {
+            return false;
+        }
+        answer.await.unwrap_or(false)
     }
 
     /// Fragt über `channel` nach einem Geheimnis und wartet auf die Antwort.
@@ -416,6 +452,15 @@ pub async fn run_sync(
                 stdin.write_all(format!("{code}\n").as_bytes()).await?;
                 stdin.flush().await?;
             }
+            SidecarMessage::TermsRequired { url } => {
+                tracing::info!(%url, "Sidecar fordert Zustimmung zu neuen Nutzungsbedingungen an");
+                if !prompts.ask_terms(&url).await {
+                    failure = Some(SyncError::TermsDeclined);
+                    break;
+                }
+                stdin.write_all(b"accept\n").await?;
+                stdin.flush().await?;
+            }
             SidecarMessage::AuthOk { trusted } => {
                 if !trusted {
                     tracing::warn!(
@@ -444,6 +489,8 @@ pub async fn run_sync(
             SidecarMessage::Error { kind, message } => {
                 failure = Some(if kind == "credentials" {
                     SyncError::Credentials { message }
+                } else if kind == "terms" {
+                    SyncError::TermsDeclined
                 } else {
                     SyncError::Sidecar { kind, message }
                 });

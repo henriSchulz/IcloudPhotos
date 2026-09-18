@@ -17,6 +17,12 @@ pub enum SidecarMessage {
     AuthRequired {
         method: String,
     },
+    /// Apple hat die iCloud-Nutzungsbedingungen geaendert. Der Sidecar wartet
+    /// auf `accept` auf stdin; alles andere lehnt ab.
+    TermsRequired {
+        #[serde(default)]
+        url: String,
+    },
     AuthOk {
         #[serde(default)]
         trusted: bool,
@@ -139,6 +145,12 @@ mod tests {
                 r#"{"type":"auth_required","method":"2fa"}"#,
                 SidecarMessage::AuthRequired {
                     method: "2fa".into(),
+                },
+            ),
+            (
+                r#"{"type":"terms_required","url":"https://example.com"}"#,
+                SidecarMessage::TermsRequired {
+                    url: "https://example.com".into(),
                 },
             ),
             (

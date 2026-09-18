@@ -192,6 +192,7 @@ Protokoll, alles Menschenlesbare geht nach stderr.
 ```json
 {"type": "password_required", "username": "..."}
 {"type": "auth_required", "method": "2fa"}
+{"type": "terms_required", "url": "https://www.apple.com/de/legal/internet-services/icloud/"}
 {"type": "auth_ok", "trusted": true}
 {"type": "photo", "id": "...", "filename": "IMG_1234.HEIC", "added_date": "...", "asset_date": "...", "checksum": "...", "width": 4032, "height": 3024, "item_type": "image"}
 {"type": "thumb", "id": "...", "path": "...", "bytes": 34567}
@@ -222,6 +223,18 @@ bzw. den 2FA-Code als eine Zeile auf stdin — nie über `argv`, denn
 Kommandozeilen sind in `/proc` für jeden Prozess des Nutzers lesbar. Nach
 erfolgreicher Anmeldung legt der Sidecar das Passwort im Keyring ab
 (`pyicloud://icloud-password`), sodass kein weiterer Lauf danach fragt.
+
+Ändert Apple die iCloud-Nutzungsbedingungen, lässt iCloud keine Anmeldung
+mehr zu (`PyiCloudAcceptTermsException`). pyicloud könnte sie per
+`accept_terms=True` einfach akzeptieren — das tut der Sidecar bewusst nicht
+ungefragt, denn die Zustimmung gilt für das ganze Apple-Konto. Er meldet
+`terms_required` und wartet auf `accept` auf stdin; die App fragt per Dialog
+mit Verweis auf den Text. Alles andere, auch ein fehlender `Prompts::terms`-
+Kanal, ist eine Ablehnung (`SyncError::TermsDeclined`). Die API liefert nur
+eine Versionsnummer, keinen Text, daher der feste Verweis. Stößt pyicloud erst
+nach der 2FA auf die Bedingungen, wird nur `trust_session` wiederholt — über
+das nicht-öffentliche `_accept_terms`. `--fake-terms` bzw.
+`ICLOUD_PHOTOS_FAKE_TERMS=1` spielt den Weg ohne Apple-Konto durch.
 
 `--fake N` erzeugt N synthetische Datensätze ohne iCloud-Zugriff und ohne
 Import von `pyicloud`; damit läuft die komplette Rust-Seite im Test gegen einen
@@ -339,6 +352,11 @@ Drei Fallen dieser Bauweise:
   Erfassungsphase und gibt jede Taste weiter, solange der Betrachter nicht die
   sichtbare Seite ist. Beim Schließen wird sie wieder abgenommen, sonst sammelt
   das Fenster mit jedem geöffneten Foto eine weitere an.
+- Die **Aktionsgruppe `viewer`** (Sichern, Kopieren, Öffnen) muss an der Seite
+  hängen, **bevor** die Seite in den Stack kommt. Später eingehängt, löst GTK
+  die Aktionen zwar noch auf, das Menü hinter ⋮ erfährt davon aber nichts und
+  zeigt alle Einträge ausgegraut. Aktionen, die erst danach in die schon
+  eingehängte Gruppe kommen, bemerkt es dagegen.
 - Zurück im Raster wird auf die Position des zuletzt gezeigten Fotos gescrollt
   (`AppState::return_to_grid`) — sonst steht man nach dem Schließen irgendwo.
 
@@ -373,11 +391,52 @@ Widget-Namen trägt; die Virtualisierung bleibt unangetastet. Findet sie nichts
 (direkt nach einem Sprung sind die Kacheln am Ziel noch nicht zugeteilt),
 bleibt die letzte Angabe stehen, statt zu verschwinden.
 
-**Sync-Anzeige** (`crates/app/src/progress.rs`) — ein Streifen, der unter der
-Kopfzeile ausfährt, statt einer grauen Zeile am Rand. Er benennt die Phase,
-zeigt einen Balken und fährt vier Sekunden nach dem Abschluss wieder ein.
+**Sync-Manager** (`crates/app/src/sync_manager.rs`) — Bibliothek und
+Synchronisation sind getrennt. In der Kopfzeile der Bibliothek steht nur, wie
+viele Fotos da sind (`1.234 Fotos`), und ein Knopf, der den Manager öffnet
+(Strg+Umschalt+R). Der Knopf zeigt ein Drehsymbol, solange ein Lauf arbeitet,
+und ein Warnzeichen, wenn der letzte gescheitert ist und noch niemand
+hineingesehen hat.
 
-Drei Dinge, an denen die Anzeige sonst lügt:
+Im Manager (ein `AdwDialog`, kein zweites Fenster — unter Hyprland landete das
+als Kachel neben der App) stehen Phase und Balken des laufenden Laufs,
+„Jetzt synchronisieren", der letzte Fehler, Bestand lokal und in iCloud, die
+Zeitpunkte des letzten und des letzten vollständigen Abgleichs, Apple-ID sowie
+die Belegung von Vorschauen und Originalen — je mit einem Knopf, der den Ordner
+im Dateimanager öffnet (`gtk::FileLauncher`; ein noch fehlender Ordner wird
+angelegt, statt dass der Knopf wortlos nichts tut).
+
+Früher lag der Fortschritt als Streifen über der Bibliothek und ein
+gescheiterter Sync öffnete einen Fehlerdialog — beides riss aus dem
+Betrachten. Ein Fehlschlag meldet sich jetzt als Toast mit „Details", der den
+Manager öffnet. Nur abgelehnte Zugangsdaten bekommen weiter einen Dialog, weil
+sie ein Handeln verlangen.
+
+**Raster während eines Syncs** — die Bibliothek muss benutzbar bleiben,
+während Fotos einlaufen. Drei Regeln:
+
+- **Nie das ganze Modell ersetzen.** `apply_diff` spielt nur Einfüge- und
+  Entfernschritte ein; unveränderte Fotos bleiben dasselbe `PhotoObject`. Nur
+  so behält GTK Scrollhalt und Auswahl. Früher wurde alle zwei Sekunden das
+  komplette Modell ausgetauscht — jede Kachel neu gebaut, Position und Auswahl
+  weg, und nach dem Sync sprang die Ansicht ganz nach oben.
+- **Eine Vorschau ist keine Strukturänderung.** `thumb-path` ist eine
+  beobachtbare Eigenschaft; trifft eine Vorschau ein, zeichnet nur ihre Kachel
+  neu.
+- **Umgebaut wird nur, wenn der Nutzer oben steht** (`refresh_live`). Neue
+  Fotos fallen meist *oberhalb* des Sichtbereichs ein — beim Erstaufbau fast
+  alle, weil iCloud alt vor neu liefert. GTK hält dabei zwar das Foto fest, im
+  Raster fließt aber alles um so viele Spalten weiter, wie oben dazukam. Wer
+  weiter unten liest, bekommt deshalb nur Vorschauen; der Umbau wartet, bis er
+  wieder oben ist oder der Sync endet. Wer oben steht, bleibt oben
+  (`scroll_to(0)`) und sieht die neuen Fotos einlaufen.
+
+Vorschauen werden in einem Hilfsthread dekodiert (`gio::spawn_blocking`) und
+die letzten 200 im Speicher gehalten (~140 MB bei 360×480). Eine Kachel merkt
+sich über ihren Widget-Namen, welches Bild sie erwartet — ist sie inzwischen
+recycelt, verfällt das Ergebnis.
+
+Drei Dinge, an denen die Fortschrittsanzeige im Manager sonst lügt:
 
 - **Ein fortgesetzter Erstaufbau muss als solcher erkennbar sein.** Der Balken
   bekommt den `baseline_offset` als Sockel (`SyncMessage::Started.resuming`),
@@ -395,9 +454,7 @@ Der Nachlauf für fehlende Vorschauen ist eine eigene Phase
 (`SyncMessage::BackfillStarted`) mit eigener Bezugsgröße — seine bis zu 500
 Bilder haben mit dem Bibliotheksbestand nichts zu tun.
 
-Wenn nichts läuft, steht in der Kopfzeile, was auch dann stimmt:
-`940 Fotos · Cache 2,1 / 5,0 GB · vor 3 Minuten`. Dafür gibt es
-`sync_state.last_sync_at` (Schema 5) — `last_baseline_at` taugt nicht, das
+„Zuletzt abgeglichen" im Manager liest `sync_state.last_sync_at` (Schema 5) — `last_baseline_at` taugt nicht, das
 steht nur nach einem vollständigen Durchlauf, und den gibt es alle 24 Stunden
 einmal.
 
@@ -408,6 +465,16 @@ Cache, wenn sie schon einmal geöffnet wurden. Jede Aktion ist deshalb ein
 Dateinamen aus iCloud sind nicht eindeutig (`IMG_0001.HEIC` gibt es mehrfach),
 deshalb weicht `save_into` auf `IMG_0001-1.HEIC` aus, statt zu überschreiben.
 
+Beim **Sichern** wird zuerst das Format gewählt — Original, JPEG, PNG oder
+HEIC; die letzte Wahl ist vorausgewählt. Umgewandelt wird über die Werkzeuge
+von libheif, das ohnehin Laufzeitabhängigkeit ist: `heif-dec` für HEIC → JPEG/
+PNG, weil es EXIF (Aufnahmezeit, Ort) mitschreibt und die Drehung in die Pixel
+übernimmt; `heif-enc` für JPEG/PNG → HEIC. JPEG ↔ PNG erledigt gdk-pixbuf.
+Liegt ein Foto schon im Zielformat vor, wird es nur kopiert — ein zweites
+Kodieren kostete Qualität. Videos bleiben immer im Original. Das Sichern läuft
+in `gio::spawn_blocking`, sonst stünde die App bei hundert HEICs sekundenlang;
+eine gescheiterte Umwandlung hinterlässt keine halbe Datei.
+
 | Kürzel | Wirkung |
 |---|---|
 | Strg+A | alles auswählen |
@@ -416,6 +483,7 @@ deshalb weicht `save_into` auf `IMG_0001-1.HEIC` aus, statt zu überschreiben.
 | Strg+O | mit der Standardanwendung öffnen (nur bei genau einem Foto) |
 | Strg+J | Monatsliste zum Springen |
 | Strg+R / F5 | jetzt synchronisieren |
+| Strg+Umschalt+R | Sync-Manager öffnen |
 
 Strg+J gibt es, weil `GtkGridView` die Tabulatortaste für seine Kacheln behält
 — die Kopfzeile ist von der Auswahl aus sonst gar nicht erreichbar.
@@ -478,9 +546,8 @@ Strg+J gibt es, weil `GtkGridView` die Tabulatortaste für seine Kacheln behält
       `is_live_photo`, `item_type`, `master_id`, `resources`, `size`,
       `versions`) — es bräuchte den Rohzugriff auf das CloudKit-Feld.
 - [ ] Alben-Seitenleiste (`api.photos.albums`), Suche und Info-Panel mit EXIF
-- [ ] Vorschauen im Hintergrund dekodieren. `connect_bind` ruft
-      `gdk::Texture::from_filename` synchron im UI-Thread; bei sechstelligen
-      Bibliotheken ist schnelles Scrollen damit nicht flüssig zu halten.
+- [x] Vorschauen im Hintergrund dekodieren — siehe „Raster während eines
+      Syncs".
 - [ ] `GListModel`-Implementierung für paginierte SQLite-Queries.
       Zwischenlösung: `gio::ListStore`, der beim Scrollen seitenweise nachlädt
       (`PAGE_SIZE = 200`) — der Katalog landet nie ganz im RAM, aber
@@ -502,6 +569,19 @@ Fehlt es, lädt das Raster weiter seine JPEG-Vorschauen, und der Betrachter
 zeigt für jedes HEIC nichts — in einer typischen iPhone-Bibliothek sind das
 drei von vier Fotos. Der Fehler ist von aussen nicht als Paketproblem zu
 erkennen, deshalb benennt die Fehlerseite im Betrachter die Ursache.
+
+**Videos** spielt GTK über GStreamer ab (`GtkGstMediaFileBuiltin`). Dessen
+Grundausstattung (`gstreamer`, `gst-plugins-base`) reicht für iPhone-Videos
+nicht: `.mov` braucht `qtdemux` aus **`gst-plugins-good`**, und iPhones filmen
+in HEVC — dafür **`gst-libav`** (Software) und für flüssiges 4K
+**`gst-plugin-va`** (Hardware, hier über `intel-media-driver`). Fehlt etwas,
+meldet GTK „Your GStreamer installation is missing a plug-in." nur am Stream;
+der Betrachter liest das ab und nennt die Pakete (`video_failure`), statt eine
+schwarze Fläche mit totem Abspielknopf zu zeigen.
+
+```
+sudo pacman -S --needed gst-plugins-good gst-libav gst-plugin-va
+```
 
 Die saubere Lösung wäre `glycin` als eigene Abhängigkeit statt des Umwegs über
 den Pixbuf-Loader — das würde zugleich das Dekodieren aus dem UI-Thread holen.
@@ -542,7 +622,7 @@ laufende Produktivinstanz weiter und der Testlauf beendet sich wortlos.
 
 Jedes neunte Fake-Asset ist ein `.MOV` mit `item_type: "movie"` — damit
 Video-Kennzeichen und Betrachter-Zweig überhaupt einen Fall bekommen. Die Datei
-dahinter ist ein PNG, der Abspieler zeigt für sie also seinen eigenen Fehler;
+dahinter ist ein PNG, der Betrachter zeigt für sie also seine Fehlerseite;
 das ist gewollt und kein Defekt. Aufnahme- und Hinzufügedatum fallen im Fake
 bewusst auseinander, sonst fiele eine Ansicht, die nach dem falschen der beiden
 sortiert, im Test nicht auf.

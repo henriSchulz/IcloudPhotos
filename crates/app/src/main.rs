@@ -5,7 +5,7 @@ mod downloader;
 mod export;
 mod geocode;
 mod photo_object;
-mod progress;
+mod sync_manager;
 mod sync_task;
 mod viewer;
 mod window;

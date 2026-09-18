@@ -40,6 +40,10 @@ enum SessionMessage {
         #[serde(default)]
         method: String,
     },
+    TermsRequired {
+        #[serde(default)]
+        url: String,
+    },
     AuthOk {
         #[serde(default)]
         trusted: bool,
@@ -132,8 +136,17 @@ impl SidecarSession {
                     };
                     write_line(&mut stdin, &code).await?;
                 }
+                SessionMessage::TermsRequired { url } => {
+                    if !prompts.ask_terms(&url).await {
+                        return Err(SyncError::TermsDeclined);
+                    }
+                    write_line(&mut stdin, "accept").await?;
+                }
                 SessionMessage::Error { kind, message } if kind == "credentials" => {
                     return Err(SyncError::Credentials { message });
+                }
+                SessionMessage::Error { kind, .. } if kind == "terms" => {
+                    return Err(SyncError::TermsDeclined);
                 }
                 SessionMessage::Error { kind, message } => {
                     return Err(SyncError::Sidecar { kind, message });

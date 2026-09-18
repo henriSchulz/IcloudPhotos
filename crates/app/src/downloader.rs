@@ -9,7 +9,7 @@ use chrono::Utc;
 use icloud_photos_cache::{Catalog, enforce_limit};
 use icloud_photos_core::Config;
 use icloud_photos_sync::{
-    Original, Prompts, SecretRequest, SidecarOptions, SidecarSession, SyncError,
+    Original, Prompts, SecretRequest, SidecarOptions, SidecarSession, SyncError, TermsRequest,
 };
 use tokio::sync::mpsc;
 
@@ -30,6 +30,7 @@ pub enum DownloadMessage {
     TwoFactorRequired {
         responder: SecretRequest,
     },
+    TermsRequired(TermsRequest),
     /// Die Eviction hat aufgeräumt; die Cache-Anzeige stimmt nicht mehr.
     CacheChanged,
 }
@@ -120,10 +121,12 @@ pub fn spawn(
 
             let (password_tx, mut password_rx) = mpsc::unbounded_channel::<SecretRequest>();
             let (tfa_tx, mut tfa_rx) = mpsc::unbounded_channel::<SecretRequest>();
+            let (terms_tx, mut terms_rx) = mpsc::unbounded_channel::<TermsRequest>();
             let prompts = Prompts {
                 events: None,
                 password: Some(password_tx),
                 two_factor: Some(tfa_tx),
+                terms: Some(terms_tx),
             };
 
             // Abfragen an die UI weiterreichen, solange der Thread lebt.
@@ -143,6 +146,12 @@ pub fn spawn(
                                 Some(responder) => {
                                     let _ = message_tx
                                         .send(DownloadMessage::TwoFactorRequired { responder });
+                                }
+                                None => break,
+                            },
+                            request = terms_rx.recv() => match request {
+                                Some(request) => {
+                                    let _ = message_tx.send(DownloadMessage::TermsRequired(request));
                                 }
                                 None => break,
                             },
@@ -316,7 +325,7 @@ fn is_final(error: &SyncError) -> bool {
         SyncError::Sidecar { kind, .. } => kind == "missing",
         // Ein abgelehntes Passwort wird beim zweiten Mal nicht richtig.
         SyncError::Credentials { .. } | SyncError::PasswordAborted => true,
-        SyncError::TwoFactorAborted => true,
+        SyncError::TwoFactorAborted | SyncError::TermsDeclined => true,
         _ => false,
     }
 }

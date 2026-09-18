@@ -16,11 +16,77 @@ pub struct Item {
     pub filename: String,
 }
 
+/// In welchem Format gesichert wird.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum Format {
+    /// Unverändert, wie es in iCloud liegt.
+    #[default]
+    Original,
+    Jpeg,
+    Png,
+    Heic,
+}
+
+impl Format {
+    pub const ALL: [Format; 4] = [Format::Original, Format::Jpeg, Format::Png, Format::Heic];
+
+    pub fn label(self) -> &'static str {
+        match self {
+            Format::Original => "Original",
+            Format::Jpeg => "JPEG",
+            Format::Png => "PNG",
+            Format::Heic => "HEIC",
+        }
+    }
+
+    pub fn description(self) -> &'static str {
+        match self {
+            Format::Original => "Unverändert, wie in iCloud abgelegt",
+            Format::Jpeg => "Öffnet überall, verlustbehaftet",
+            Format::Png => "Verlustfrei, aber große Dateien",
+            Format::Heic => "Klein und hochwertig, nicht überall lesbar",
+        }
+    }
+
+    /// Endung der Zieldatei; `None` heisst: die des Originals behalten.
+    fn extension(self) -> Option<&'static str> {
+        match self {
+            Format::Original => None,
+            Format::Jpeg => Some("jpg"),
+            Format::Png => Some("png"),
+            Format::Heic => Some("heic"),
+        }
+    }
+}
+
+/// Wie eine Quelldatei vorliegt, erkannt an der Endung.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Kind {
+    Heic,
+    Jpeg,
+    Png,
+    /// Videos und alles Unbekannte: wird nie umgewandelt.
+    Other,
+}
+
+fn kind_of(path: &Path) -> Kind {
+    let extension = path
+        .extension()
+        .map(|e| e.to_string_lossy().to_ascii_lowercase())
+        .unwrap_or_default();
+    match extension.as_str() {
+        "heic" | "heif" => Kind::Heic,
+        "jpg" | "jpeg" => Kind::Jpeg,
+        "png" => Kind::Png,
+        _ => Kind::Other,
+    }
+}
+
 /// Was mit den Originalen geschehen soll, sobald sie beisammen sind.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Action {
-    /// In dieses Verzeichnis kopieren.
-    SaveTo(PathBuf),
+    /// In dieses Verzeichnis sichern, dabei ins gewünschte Format bringen.
+    SaveTo(PathBuf, Format),
     /// Als Dateiliste in die Zwischenablage legen.
     Clipboard,
     /// Mit der Standardanwendung öffnen.
@@ -31,7 +97,7 @@ impl Action {
     /// Verb für die Fortschrittsanzeige.
     pub fn verb(&self) -> &'static str {
         match self {
-            Action::SaveTo(_) => "Sichere",
+            Action::SaveTo(..) => "Sichere",
             Action::Clipboard => "Kopiere",
             Action::Open => "Öffne",
         }
@@ -120,24 +186,132 @@ impl Job {
     }
 }
 
-/// Kopiert die Originale in ein Verzeichnis. Gibt zurück, wie viele ankamen
-/// und welche Fehler auftraten.
-pub fn save_into(dir: &Path, files: &[(Item, PathBuf)]) -> (usize, Vec<String>) {
-    let mut saved = 0;
-    let mut errors = Vec::new();
+/// Was beim Sichern herauskam.
+#[derive(Debug, Default, PartialEq, Eq)]
+pub struct Saved {
+    pub saved: usize,
+    /// Videos, die unabhängig vom gewählten Format im Original gesichert
+    /// wurden — ein Video lässt sich nicht in ein Bildformat bringen.
+    pub kept_as_video: usize,
+    pub errors: Vec<String>,
+}
+
+/// Sichert die Originale in ein Verzeichnis, auf Wunsch umgewandelt.
+///
+/// Blockiert: Umwandeln kostet je Foto einen Bruchteil einer Sekunde, bei
+/// einer grossen Auswahl also spürbar lange. Gehört in einen Hilfsthread.
+pub fn save_into(dir: &Path, files: &[(Item, PathBuf)], format: Format) -> Saved {
+    let mut result = Saved::default();
     let mut taken: HashSet<PathBuf> = HashSet::new();
 
     for (item, source) in files {
-        let target = unique_target(dir, &item.filename, &taken);
-        match std::fs::copy(source, &target) {
-            Ok(_) => {
+        let kind = kind_of(source);
+        let wanted = match format.extension() {
+            Some(extension) if kind != Kind::Other => Some(extension),
+            _ => None,
+        };
+        if kind == Kind::Other && format != Format::Original {
+            result.kept_as_video += 1;
+        }
+
+        // Liegt es schon im Zielformat vor, genügt eine Kopie — ein zweites
+        // Kodieren kostete nur Qualität.
+        let convert = wanted.is_some() && !already_in(kind, format);
+        let filename = match wanted {
+            Some(extension) if convert => renamed(&item.filename, extension),
+            _ => item.filename.clone(),
+        };
+        let target = unique_target(dir, &filename, &taken);
+
+        let outcome = if convert {
+            convert_file(source, kind, &target, format)
+        } else {
+            std::fs::copy(source, &target)
+                .map(|_| ())
+                .map_err(|error| error.to_string())
+        };
+        match outcome {
+            Ok(()) => {
                 taken.insert(target);
-                saved += 1;
+                result.saved += 1;
             }
-            Err(error) => errors.push(format!("{}: {error}", item.filename)),
+            Err(error) => {
+                // Keine halbe Datei liegen lassen.
+                let _ = std::fs::remove_file(&target);
+                result.errors.push(format!("{}: {error}", item.filename));
+            }
         }
     }
-    (saved, errors)
+    result
+}
+
+fn already_in(kind: Kind, format: Format) -> bool {
+    matches!(
+        (kind, format),
+        (Kind::Heic, Format::Heic) | (Kind::Jpeg, Format::Jpeg) | (Kind::Png, Format::Png)
+    )
+}
+
+/// `IMG_0001.HEIC` → `IMG_0001.jpg`.
+fn renamed(filename: &str, extension: &str) -> String {
+    let stem = Path::new(filename)
+        .file_stem()
+        .map(|s| s.to_string_lossy().into_owned())
+        .unwrap_or_else(|| "foto".to_string());
+    format!("{stem}.{extension}")
+}
+
+/// Qualität für verlustbehaftete Ziele. 92 ist bei Fotos von einer
+/// verlustfreien Kopie kaum zu unterscheiden und deutlich kleiner.
+const QUALITY: &str = "92";
+
+/// Wandelt eine Datei um.
+///
+/// HEIC geht über die Werkzeuge von libheif, das die App ohnehin braucht:
+/// `heif-dec` schreibt die EXIF-Daten — Aufnahmezeit, Ort — mit in das JPEG,
+/// was der Umweg über gdk-pixbuf nicht täte. JPEG und PNG untereinander
+/// erledigt gdk-pixbuf direkt.
+fn convert_file(source: &Path, kind: Kind, target: &Path, format: Format) -> Result<(), String> {
+    match (kind, format) {
+        (Kind::Heic, Format::Jpeg | Format::Png) => run(std::process::Command::new("heif-dec")
+            .args(["--quiet", "-q", QUALITY])
+            .arg(source)
+            .arg(target)),
+        (Kind::Jpeg | Kind::Png, Format::Heic) => run(std::process::Command::new("heif-enc")
+            .args(["-q", QUALITY, "-o"])
+            .arg(target)
+            .arg(source)),
+        (Kind::Jpeg | Kind::Png, Format::Jpeg | Format::Png) => {
+            use gtk::gdk_pixbuf::Pixbuf;
+            let pixbuf = Pixbuf::from_file(source).map_err(|error| error.to_string())?;
+            // Ohne das stünde ein hochkant aufgenommenes Foto quer.
+            let pixbuf = pixbuf.apply_embedded_orientation().unwrap_or(pixbuf);
+            let result = if format == Format::Jpeg {
+                pixbuf.savev(target, "jpeg", &[("quality", QUALITY)])
+            } else {
+                pixbuf.savev(target, "png", &[])
+            };
+            result.map_err(|error| error.to_string())
+        }
+        _ => Err("nicht umwandelbar".to_string()),
+    }
+}
+
+fn run(command: &mut std::process::Command) -> Result<(), String> {
+    let program = command.get_program().to_string_lossy().into_owned();
+    let output = command.output().map_err(|error| {
+        if error.kind() == std::io::ErrorKind::NotFound {
+            format!("{program} fehlt — Paket libheif installieren")
+        } else {
+            format!("{program}: {error}")
+        }
+    })?;
+    if output.status.success() {
+        Ok(())
+    } else {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        Err(format!("{program}: {}", stderr.trim()))
+    }
 }
 
 /// Ein freier Dateiname im Zielverzeichnis.
@@ -230,10 +404,10 @@ mod tests {
 
         let target = dir.path().join("ziel");
         std::fs::create_dir(&target).unwrap();
-        let (saved, errors) = save_into(&target, &files);
+        let result = save_into(&target, &files, Format::Original);
 
-        assert_eq!(saved, 3);
-        assert!(errors.is_empty(), "{errors:?}");
+        assert_eq!(result.saved, 3);
+        assert!(result.errors.is_empty(), "{:?}", result.errors);
         assert!(target.join("IMG_0001.HEIC").is_file());
         assert!(target.join("IMG_0001-1.HEIC").is_file());
         assert!(target.join("IMG_0001-2.HEIC").is_file());
@@ -249,9 +423,114 @@ mod tests {
             },
             dir.path().join("gibt-es-nicht"),
         )];
-        let (saved, errors) = save_into(dir.path(), &files);
-        assert_eq!(saved, 0);
-        assert_eq!(errors.len(), 1);
-        assert!(errors[0].starts_with("IMG_0001.HEIC:"));
+        let result = save_into(dir.path(), &files, Format::Original);
+        assert_eq!(result.saved, 0);
+        assert_eq!(result.errors.len(), 1);
+        assert!(result.errors[0].starts_with("IMG_0001.HEIC:"));
+    }
+
+    fn item(filename: &str) -> Item {
+        Item {
+            id: filename.to_string(),
+            filename: filename.to_string(),
+        }
+    }
+
+    /// Ein kleines echtes Bild, damit die Umwandlung etwas zu tun hat.
+    fn sample_png(path: &Path) {
+        let pixbuf =
+            gtk::gdk_pixbuf::Pixbuf::new(gtk::gdk_pixbuf::Colorspace::Rgb, false, 8, 32, 24)
+                .unwrap();
+        pixbuf.fill(0x3366_99ff);
+        pixbuf.savev(path, "png", &[]).unwrap();
+    }
+
+    fn has_tool(name: &str) -> bool {
+        std::process::Command::new(name)
+            .arg("--version")
+            .output()
+            .is_ok()
+    }
+
+    #[test]
+    fn converts_between_jpeg_and_png() {
+        let dir = tempfile::tempdir().unwrap();
+        let source = dir.path().join("quelle.png");
+        sample_png(&source);
+        let out = dir.path().join("out");
+        std::fs::create_dir(&out).unwrap();
+
+        let result = save_into(&out, &[(item("IMG_0001.PNG"), source)], Format::Jpeg);
+        assert_eq!(result.saved, 1, "{:?}", result.errors);
+
+        let jpeg = out.join("IMG_0001.jpg");
+        let loaded = gtk::gdk_pixbuf::Pixbuf::from_file(&jpeg).unwrap();
+        assert_eq!((loaded.width(), loaded.height()), (32, 24));
+    }
+
+    #[test]
+    fn heic_round_trip_keeps_the_image() {
+        if !has_tool("heif-enc") || !has_tool("heif-dec") {
+            eprintln!("übersprungen: libheif-Werkzeuge fehlen");
+            return;
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let source = dir.path().join("quelle.png");
+        sample_png(&source);
+
+        let heic_dir = dir.path().join("heic");
+        std::fs::create_dir(&heic_dir).unwrap();
+        let result = save_into(&heic_dir, &[(item("IMG_0002.PNG"), source)], Format::Heic);
+        assert_eq!(result.saved, 1, "{:?}", result.errors);
+        let heic = heic_dir.join("IMG_0002.heic");
+        assert!(heic.is_file());
+
+        let png_dir = dir.path().join("png");
+        std::fs::create_dir(&png_dir).unwrap();
+        let result = save_into(&png_dir, &[(item("IMG_0002.HEIC"), heic)], Format::Png);
+        assert_eq!(result.saved, 1, "{:?}", result.errors);
+        let loaded = gtk::gdk_pixbuf::Pixbuf::from_file(png_dir.join("IMG_0002.png")).unwrap();
+        assert_eq!((loaded.width(), loaded.height()), (32, 24));
+    }
+
+    #[test]
+    fn same_format_and_videos_are_copied_untouched() {
+        let dir = tempfile::tempdir().unwrap();
+        let photo = dir.path().join("a.heic");
+        let video = dir.path().join("b.mov");
+        std::fs::write(&photo, b"heic-bytes").unwrap();
+        std::fs::write(&video, b"mov-bytes").unwrap();
+        let out = dir.path().join("out");
+        std::fs::create_dir(&out).unwrap();
+
+        let result = save_into(
+            &out,
+            &[(item("IMG_1.HEIC"), photo), (item("IMG_2.MOV"), video)],
+            Format::Heic,
+        );
+
+        assert_eq!(result.saved, 2, "{:?}", result.errors);
+        assert_eq!(result.kept_as_video, 1);
+        // Byte fuer Byte das Original — kein zweites Kodieren.
+        assert_eq!(
+            std::fs::read(out.join("IMG_1.HEIC")).unwrap(),
+            b"heic-bytes"
+        );
+        assert_eq!(std::fs::read(out.join("IMG_2.MOV")).unwrap(), b"mov-bytes");
+    }
+
+    #[test]
+    fn a_failed_conversion_leaves_no_half_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let broken = dir.path().join("kaputt.png");
+        std::fs::write(&broken, b"kein bild").unwrap();
+        let out = dir.path().join("out");
+        std::fs::create_dir(&out).unwrap();
+
+        let result = save_into(&out, &[(item("IMG_3.PNG"), broken)], Format::Jpeg);
+
+        assert_eq!(result.saved, 0);
+        assert_eq!(result.errors.len(), 1);
+        assert!(std::fs::read_dir(&out).unwrap().next().is_none());
     }
 }

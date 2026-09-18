@@ -7,7 +7,9 @@
 use std::path::PathBuf;
 
 use icloud_photos_cache::Catalog;
-use icloud_photos_sync::{Prompts, SecretRequest, SidecarOptions, SyncError, SyncEvent, run_sync};
+use icloud_photos_sync::{
+    Prompts, SecretRequest, SidecarOptions, SyncError, SyncEvent, TermsRequest, run_sync,
+};
 use tokio::sync::mpsc;
 
 fn script() -> PathBuf {
@@ -411,6 +413,75 @@ async fn password_is_forwarded_to_stdin() {
 }
 
 #[tokio::test]
+async fn accepted_terms_let_the_sync_continue() {
+    let python = python_or_skip!();
+    let mut catalog = Catalog::open_in_memory().unwrap();
+
+    let mut options = options(&python, 3);
+    options.fake_terms = true;
+
+    let (tx, mut rx) = mpsc::unbounded_channel::<TermsRequest>();
+    let responder = tokio::spawn(async move {
+        let request = rx.recv().await.expect("Zustimmung wurde nicht angefragt");
+        assert!(request.url.starts_with("https://"));
+        request.responder.send(true).unwrap();
+    });
+
+    let summary = run_sync(
+        &mut catalog,
+        &options,
+        &Prompts {
+            terms: Some(tx),
+            ..Default::default()
+        },
+    )
+    .await
+    .unwrap();
+    responder.await.unwrap();
+
+    assert_eq!(summary.stored, 3);
+}
+
+#[tokio::test]
+async fn terms_are_never_accepted_without_asking() {
+    let python = python_or_skip!();
+
+    // Kein Kanal fuer die Frage: das muss als Ablehnung gelten.
+    let mut catalog = Catalog::open_in_memory().unwrap();
+    let mut options = options(&python, 3);
+    options.fake_terms = true;
+    let error = run_sync(&mut catalog, &options, &Prompts::default())
+        .await
+        .unwrap_err();
+    assert!(
+        matches!(error, SyncError::TermsDeclined),
+        "unerwartet: {error:?}"
+    );
+
+    // Ausdrueckliche Ablehnung.
+    let (tx, mut rx) = mpsc::unbounded_channel::<TermsRequest>();
+    tokio::spawn(async move {
+        let request = rx.recv().await.unwrap();
+        request.responder.send(false).unwrap();
+    });
+    let error = run_sync(
+        &mut catalog,
+        &options,
+        &Prompts {
+            terms: Some(tx),
+            ..Default::default()
+        },
+    )
+    .await
+    .unwrap_err();
+    assert!(
+        matches!(error, SyncError::TermsDeclined),
+        "unerwartet: {error:?}"
+    );
+    assert_eq!(catalog.count().unwrap(), 0);
+}
+
+#[tokio::test]
 async fn wrong_password_is_reported_as_credentials_error() {
     let python = python_or_skip!();
     let mut catalog = Catalog::open_in_memory().unwrap();
@@ -474,6 +545,7 @@ async fn password_and_two_factor_are_asked_in_order() {
             events: Some(event_tx),
             password: Some(password_tx),
             two_factor: Some(tfa_tx),
+            ..Default::default()
         },
     )
     .await

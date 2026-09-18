@@ -2,6 +2,7 @@
 
 use chrono::{Datelike, Local};
 use gtk::glib;
+use gtk::prelude::*;
 use gtk::subclass::prelude::*;
 use icloud_photos_core::model::Photo;
 
@@ -30,10 +31,14 @@ mod imp {
 
     use super::*;
 
-    #[derive(Default)]
+    #[derive(Default, glib::Properties)]
+    #[properties(wrapper_type = super::PhotoObject)]
     pub struct PhotoObject {
         pub id: RefCell<String>,
         pub filename: RefCell<String>,
+        /// Beobachtbar: trifft waehrend eines Syncs eine Vorschau ein, zeichnet
+        /// nur ihre Kachel neu, statt das Raster umzubauen.
+        #[property(get, set, nullable)]
         pub thumb_path: RefCell<Option<String>>,
         pub orig_path: RefCell<Option<String>>,
         pub is_orig_cached: RefCell<bool>,
@@ -55,6 +60,7 @@ mod imp {
         type Type = super::PhotoObject;
     }
 
+    #[glib::derived_properties]
     impl ObjectImpl for PhotoObject {}
 }
 
@@ -95,6 +101,27 @@ impl PhotoObject {
         object
     }
 
+    /// Uebernimmt den neuen Katalogstand desselben Fotos, ohne das Objekt zu
+    /// ersetzen. Ein ersetztes Objekt kostete die Kachel ihre Auswahl und das
+    /// Raster seinen Halt beim Scrollen.
+    pub fn update_from(&self, photo: &Photo) {
+        let imp = self.imp();
+        let thumb = photo
+            .thumb_path
+            .as_ref()
+            .map(|p| p.to_string_lossy().into_owned());
+        *imp.orig_path.borrow_mut() = photo
+            .orig_path
+            .as_ref()
+            .map(|p| p.to_string_lossy().into_owned());
+        *imp.is_orig_cached.borrow_mut() = photo.is_orig_cached;
+        *imp.coordinates.borrow_mut() = photo.record.coordinates();
+        // Nur bei echter Aenderung melden — jede Meldung laedt die Kachel neu.
+        if *imp.thumb_path.borrow() != thumb {
+            self.set_thumb_path(thumb);
+        }
+    }
+
     /// Ein Skelett fuer ein Foto, das der Sync noch nicht geliefert hat.
     pub fn placeholder() -> Self {
         let object: Self = glib::Object::builder().build();
@@ -118,10 +145,6 @@ impl PhotoObject {
 
     pub fn filename(&self) -> String {
         self.imp().filename.borrow().clone()
-    }
-
-    pub fn thumb_path(&self) -> Option<String> {
-        self.imp().thumb_path.borrow().clone()
     }
 
     pub fn is_video(&self) -> bool {
