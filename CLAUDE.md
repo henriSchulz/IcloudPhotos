@@ -839,6 +839,11 @@ scripts/uninstall.sh    # entfernt Binary, Eintrag und Symbol wieder
 den Eintrag `data/de.henri.IcloudPhotos.desktop` (mit eingesetztem absolutem
 Pfad) nach `~/.local/share/applications/` und das Symbol nach
 `~/.local/share/icons/hicolor/scalable/apps/`; `XDG_DATA_HOME` wird beachtet.
+Liegt unter `~/.config/icloud-photos/` ein `icon.svg` oder `icon.png`, nimmt
+es stattdessen dieses (PNG auf 512 px skaliert nach `hicolor/512x512/apps/`).
+Das eigene Symbol bleibt so außerhalb des Repos — hier liegt dort Apples
+Photos-Symbol, das zwar laut Wikimedia Commons nicht urheberrechtlich geschützt
+ist, als Marke aber Apple gehört und nicht mit dem Code verteilt werden soll.
 Bewusst **nicht** nach `~/.local/bin` — dort liegen die per stow verwalteten
 Skripte aus den Dotfiles. Kopie statt Symlink ins `target/`, damit ein
 `cargo clean` den Launcher nicht still bricht. `uninstall.sh` lässt Katalog,

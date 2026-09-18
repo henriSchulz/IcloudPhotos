@@ -12,7 +12,8 @@ desktop_dir=$data/applications
 
 rm -f "$bin_dir/icloud-photos" \
     "$desktop_dir/$APP_ID.desktop" \
-    "$data/icons/hicolor/scalable/apps/$APP_ID.svg"
+    "$data/icons/hicolor/scalable/apps/$APP_ID.svg" \
+    "$data/icons/hicolor/512x512/apps/$APP_ID.png"
 
 # Nur das eigene bin/ entfernen, und nur wenn es leer ist; das Elternverzeichnis
 # enthält den Katalog.

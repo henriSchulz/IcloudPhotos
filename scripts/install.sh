@@ -66,7 +66,29 @@ printf '%s\n' "$entry" >"$tmp"
 chmod 0644 "$tmp"
 mv -f "$tmp" "$desktop_dir/$APP_ID.desktop"
 
-install -D -m 0644 "$repo/data/icons/$APP_ID.svg" "$icon_dir/$APP_ID.svg"
+# Ein eigenes Icon, falls unter ~/.config/icloud-photos/ eines liegt. Es
+# bleibt bewusst außerhalb des Repos: wer etwa Apples Photos-Symbol nutzen
+# will, soll dessen Marke nicht mit dem Code verteilen.
+config=${XDG_CONFIG_HOME:-$HOME/.config}/icloud-photos
+png_dir=$data/icons/hicolor/512x512/apps
+if [[ -f $config/icon.svg ]]; then
+    install -D -m 0644 "$config/icon.svg" "$icon_dir/$APP_ID.svg"
+    rm -f "$png_dir/$APP_ID.png"
+    echo "Eigenes Icon: $config/icon.svg"
+elif [[ -f $config/icon.png ]]; then
+    # Das Symbol aus scalable/ gewönne sonst gegen die Rastergrafik.
+    rm -f "$icon_dir/$APP_ID.svg"
+    mkdir -p "$png_dir"
+    if command -v magick >/dev/null; then
+        magick "$config/icon.png" -resize 512x512 "$png_dir/$APP_ID.png"
+    else
+        install -m 0644 "$config/icon.png" "$png_dir/$APP_ID.png"
+    fi
+    echo "Eigenes Icon: $config/icon.png"
+else
+    install -D -m 0644 "$repo/data/icons/$APP_ID.svg" "$icon_dir/$APP_ID.svg"
+    rm -f "$png_dir/$APP_ID.png"
+fi
 
 if command -v desktop-file-validate >/dev/null; then
     desktop-file-validate "$desktop_dir/$APP_ID.desktop" ||
@@ -85,4 +107,4 @@ fi
 echo "Installiert:"
 echo "  $binary"
 echo "  $desktop_dir/$APP_ID.desktop"
-echo "  $icon_dir/$APP_ID.svg"
+echo "  Icon unter $data/icons/hicolor/"
