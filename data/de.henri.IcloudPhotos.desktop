@@ -1,0 +1,13 @@
+[Desktop Entry]
+Type=Application
+Name=iCloud Photos
+GenericName=Photo Viewer
+Comment=Browse your iCloud Photos library
+Exec=@EXEC@
+TryExec=@BINARY@
+Icon=de.henri.IcloudPhotos
+Terminal=false
+Categories=Graphics;Photography;GTK;
+Keywords=icloud;photos;pictures;images;gallery;library;
+StartupNotify=true
+StartupWMClass=de.henri.IcloudPhotos

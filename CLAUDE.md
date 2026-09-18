@@ -177,6 +177,8 @@ icloud-photos/
 ├── sidecar/
 │   ├── pyicloud_sync.py       # Python-Skript mit pyicloud, gibt NDJSON aus
 │   └── requirements.txt
+├── data/                      # .desktop-Vorlage und App-Symbol
+├── scripts/                   # install.sh / uninstall.sh für den Launcher
 └── CLAUDE.md
 ```
 
@@ -579,6 +581,9 @@ Strg+J gibt es, weil `GtkGridView` die Tabulatortaste für seine Kacheln behält
 
 ## Offene Punkte / TODO
 
+- [x] **Start über den Launcher** (Super+Space) statt `cargo run`:
+      `scripts/install.sh` legt Binary, `.desktop`-Eintrag und Symbol im
+      Nutzerverzeichnis ab — siehe „Entwicklung".
 - [x] **Anmeldung in der App**, kein Terminal nötig: Beim ersten Start zeigt die
       App eine Maske für Apple-ID und Passwort. Die Apple-ID landet in
       `config.toml` (0600), das Passwort geht über stdin an den Sidecar und von
@@ -711,6 +716,36 @@ ICLOUD_PHOTOS_FAKE=40 ICLOUD_PHOTOS_FAKE_PASSWORD=1 cargo run -p icloud-photos-a
     --cookie-dir ~/.local/share/icloud-photos/cookies \
     --thumbs ~/.cache/icloud-photos/thumbnails --limit 5
 ```
+
+### Installieren für den Launcher
+
+```bash
+scripts/install.sh      # baut --release und installiert; nach jedem Pull erneut
+scripts/uninstall.sh    # entfernt Binary, Eintrag und Symbol wieder
+```
+
+`install.sh` kopiert das Binary nach `~/.local/share/icloud-photos/bin/icloud-photos`,
+den Eintrag `data/de.henri.IcloudPhotos.desktop` (mit eingesetztem absolutem
+Pfad) nach `~/.local/share/applications/` und das Symbol nach
+`~/.local/share/icons/hicolor/scalable/apps/`; `XDG_DATA_HOME` wird beachtet.
+Bewusst **nicht** nach `~/.local/bin` — dort liegen die per stow verwalteten
+Skripte aus den Dotfiles. Kopie statt Symlink ins `target/`, damit ein
+`cargo clean` den Launcher nicht still bricht. `uninstall.sh` lässt Katalog,
+Cookies und Caches stehen.
+
+Der Eintrag heisst nach der Application-ID und setzt
+`StartupWMClass=de.henri.IcloudPhotos`: unter Wayland ist die `app_id` des
+Fensters die GApplication-ID, nur so ordnen Launcher und Compositor Fenster und
+Symbol dem Eintrag zu.
+
+**Das Projekt darf danach nicht verschoben werden.** Das Binary findet Sidecar
+und venv über den beim Bauen einkompilierten Projektpfad (`project_root()` in
+`sync_task.rs`, aus `CARGO_MANIFEST_DIR`). Nach einem Umzug `install.sh` neu
+ausführen oder `ICLOUD_PHOTOS_PYTHON`/`ICLOUD_PHOTOS_SIDECAR` setzen. Aus
+demselben Grund nie aus einem Worktree installieren — das Skript warnt dann;
+der Worktree wird weggeräumt, der Pfad im Binary bleibt. Fehlt `.venv`, bricht
+`install.sh` ab: das Binary fiele sonst still auf das System-Python ohne
+pyicloud zurück.
 
 Umgebungsvariablen: `ICLOUD_PHOTOS_PYTHON` und `ICLOUD_PHOTOS_SIDECAR`
 überschreiben Interpreter und Skriptpfad, `RUST_LOG` steuert das Logging.
