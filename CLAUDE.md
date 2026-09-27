@@ -902,3 +902,21 @@ Verzeichnisse schreibt.
 - Commit-Messages: konventionell (`feat:`, `fix:`, `refactor:`, ...)
 - Keine Secrets (iCloud-Passwort, Session-Cookies) ins Repo — gehören in
   Keyring bzw. `config.toml` (in `.gitignore`)
+
+## Ein Foto von außen öffnen (`--open <id>`)
+
+`icloud-photos --open <Katalog-ID>` zeigt genau dieses Foto im Betrachter —
+so öffnet das Foto-Widget der Omarchy-Mitteilungszentrale (`henri.clock`) das
+Bild, das es gerade zeigt. Die ID ist `photos.id` aus `catalog.sqlite`.
+
+- Läuft die App schon, registriert sich der zweite Prozess nur am Bus, ruft
+  die App-Aktion `open-photo` (String-Parameter) auf der laufenden Instanz
+  auf, leert den Bus und beendet sich (`main.rs`). Die Aktion hängt am
+  `adw::Application` und wird in `window::build` angelegt.
+- Sonst startet die App normal und löst die Aktion aus, sobald das Fenster
+  steht.
+- `open_photo` (`window.rs`) holt die Position über `Catalog::position_of`
+  (Index in der Reihenfolge von `Catalog::page`), stellt die Bibliothek als
+  Ausschnitt ein, lädt das Raster bis dorthin nach (wie der Monatssprung) und
+  öffnet den Betrachter; `window.present()` holt das Fenster nach vorn
+  (Hyprland: `misc.focus_on_activate`).

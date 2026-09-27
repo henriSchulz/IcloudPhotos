@@ -299,6 +299,34 @@ impl Catalog {
         Ok(groups)
     }
 
+    /// Wo ein Foto in der Bibliothek steht — als Index in derselben
+    /// Reihenfolge wie [`Catalog::page`], damit das Raster dorthin springen
+    /// und der Betrachter es öffnen kann. `None`, wenn es das Foto nicht gibt.
+    pub fn position_of(&self, id: &str) -> Result<Option<u64>, CacheError> {
+        let before: Option<i64> = self
+            .conn
+            .query_row(
+                &format!(
+                    r#"
+                    SELECT COUNT(*)
+                      FROM photos, (SELECT {SORT_KEY} AS sort_key, id FROM photos WHERE id = ?1) target
+                     WHERE {SORT_KEY} > target.sort_key
+                        OR ({SORT_KEY} = target.sort_key AND photos.id > target.id)
+                    "#
+                ),
+                params![id],
+                |row| row.get(0),
+            )
+            .optional()?;
+        // Ohne Treffer liefert die Unterabfrage keine Zeile — und COUNT(*)
+        // über ein leeres Produkt ist 0, nicht NULL. Deshalb erst prüfen, ob
+        // es das Foto gibt.
+        if self.get(id)?.is_none() {
+            return Ok(None);
+        }
+        Ok(before.map(from_sql_bytes))
+    }
+
     pub fn get(&self, id: &str) -> Result<Option<Photo>, CacheError> {
         let row = self
             .conn

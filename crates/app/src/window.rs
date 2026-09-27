@@ -1113,6 +1113,21 @@ pub fn build(app: &adw::Application, state: Rc<AppState>) {
     app.set_accels_for_action("photos.sync", &["<Control>r", "F5"]);
 
     update_status(&state, &status, &stack);
+    // „open-photo“ mit der Katalog-ID — `icloud-photos --open <id>` (das
+    // Foto-Widget der Mitteilungszentrale). Läuft die App schon, kommt die
+    // Aktion per D-Bus von der zweiten Instanz.
+    let open_photo_action = gio::SimpleAction::new("open-photo", Some(glib::VariantTy::STRING));
+    open_photo_action.connect_activate({
+        let state = state.clone();
+        let window = window.clone();
+        move |_, parameter| {
+            if let Some(id) = parameter.and_then(|p| p.get::<String>()) {
+                open_photo(&state, &window, &id);
+            }
+        }
+    });
+    app.add_action(&open_photo_action);
+
     window.present();
 
     // Ohne gesetzten Fokus landen Tastatureingaben auf der Werkzeugleiste —
@@ -1581,6 +1596,56 @@ fn tile_parts(overlay: &gtk::Overlay) -> Option<(gtk::Picture, gtk::Image)> {
     let picture = overlay.child().and_downcast::<gtk::Picture>()?;
     let badge = overlay.last_child().and_downcast::<gtk::Image>()?;
     Some((picture, badge))
+}
+
+/// Zeigt genau dieses Foto im Betrachter — die App-Aktion „open-photo“.
+///
+/// Der Betrachter blättert im Modell des Rasters. Deshalb stellt die
+/// Bibliothek den Ausschnitt, und das Raster wird bis zur Position des Fotos
+/// nachgeladen, wie beim Sprung zu einem Monat.
+fn open_photo(state: &Rc<AppState>, window: &adw::ApplicationWindow, id: &str) {
+    let position = state.catalog.borrow().position_of(id);
+    let position = match position {
+        Ok(Some(position)) => position,
+        Ok(None) => {
+            tracing::warn!(id, "Foto nicht im Katalog");
+            window.present();
+            return;
+        }
+        Err(error) => {
+            tracing::error!(%error, "Position des Fotos nicht lesbar");
+            window.present();
+            return;
+        }
+    };
+    if *state.scope.borrow() != Scope::Library || state.content.get() != Content::Grid {
+        let sidebar = state.sidebar.borrow().clone();
+        match sidebar {
+            Some(sidebar) => sidebar.select(&Target::Library),
+            None => state.set_scope(Scope::Library),
+        }
+    }
+    let Some(grid) = state.grid.borrow().clone() else {
+        return;
+    };
+    jump_to(state, &grid, position);
+    let count = state.model.n_items();
+    if count == 0 {
+        return;
+    }
+    // Ein laufender Sync kann Fotos vor dieses geschoben haben, die das
+    // Modell noch nicht zeigt — dann zählt, wo es im Modell wirklich steht.
+    let in_model = (0..count).find(|&index| {
+        state
+            .model
+            .item(index)
+            .and_downcast::<PhotoObject>()
+            .is_some_and(|photo| photo.id() == id)
+    });
+    let position = in_model.unwrap_or_else(|| u32::try_from(position).unwrap_or(count - 1).min(count - 1));
+    tracing::info!(id, position, "Foto per Aktion geöffnet");
+    open_viewer(state, window, position);
+    window.present();
 }
 
 /// Öffnet den Betrachter als Seite desselben Fensters.

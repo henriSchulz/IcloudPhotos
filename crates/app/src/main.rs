@@ -17,9 +17,11 @@ mod viewer;
 mod window;
 mod zoom_view;
 
+use std::cell::RefCell;
 use std::rc::Rc;
 
 use adw::prelude::*;
+use gtk::gio;
 use icloud_photos_cache::{Catalog, enforce_limit, housekeeping};
 use icloud_photos_core::Config;
 
@@ -80,17 +82,54 @@ fn main() -> anyhow::Result<()> {
     } else {
         adw::Application::builder().application_id(APP_ID).build()
     };
+    // `--open <id>`: genau dieses Foto zeigen — vom Foto-Widget der
+    // Mitteilungszentrale. Läuft die App schon, geht die ID per D-Bus als
+    // Aktion an sie; sonst öffnet dieser Start das Foto selbst, sobald das
+    // Fenster steht.
+    let open_id = open_argument();
+    let pending_open = Rc::new(RefCell::new(open_id.clone()));
     app.connect_activate({
         let state = state.clone();
+        let pending_open = pending_open.clone();
         move |app| {
             window::build(app, state.clone());
             schedule_housekeeping(state.clone());
+            if let Some(id) = pending_open.borrow_mut().take() {
+                app.activate_action("open-photo", Some(&id.to_variant()));
+            }
         }
     });
 
-    // GTK soll `--demo` nicht als eigenes Argument deuten.
+    if let Some(id) = &open_id {
+        app.register(gio::Cancellable::NONE)?;
+        if app.is_remote() {
+            app.activate_action("open-photo", Some(&id.to_variant()));
+            // Die Aktion geht ohne Antwort über den Bus; erst leeren, sonst
+            // nimmt das Ende des Prozesses sie mit.
+            if let Ok(bus) = gio::bus_get_sync(gio::BusType::Session, gio::Cancellable::NONE) {
+                let _ = bus.flush_sync(gio::Cancellable::NONE);
+            }
+            return Ok(());
+        }
+    }
+
+    // GTK soll `--demo` und `--open` nicht als eigene Argumente deuten.
     app.run_with_args::<&str>(&[]);
     Ok(())
+}
+
+/// Die Foto-ID hinter `--open`, falls angegeben.
+fn open_argument() -> Option<String> {
+    let mut args = std::env::args().skip(1);
+    while let Some(arg) = args.next() {
+        if arg == "--open" {
+            return args.next();
+        }
+        if let Some(id) = arg.strip_prefix("--open=") {
+            return Some(id.to_string());
+        }
+    }
+    None
 }
 
 /// Wählt den GL-Renderer, sofern der Nutzer nichts anderes vorgibt.
