@@ -1,0 +1,5 @@
+#!/bin/sh
+# The sidecar's interpreter: system Python plus the pinned pyicloud fork and
+# its dependencies, vendored next to it. Only the sidecar sees this path.
+export PYTHONPATH=/usr/lib/icloud-photos/python${PYTHONPATH:+:$PYTHONPATH}
+exec /usr/bin/python3 "$@"

@@ -1,0 +1,52 @@
+# Built from this checkout, not from a download:
+#   cd packaging/arch && makepkg -si
+pkgname=icloud-photos
+pkgver=1.0.0.r37.g4b81984
+pkgrel=1
+pkgdesc="Browse your iCloud Photos library (GTK4)"
+arch=(aarch64 x86_64)
+url="https://github.com/henriSchulz/IcloudPhotos"
+license=(custom)
+depends=(gtk4 libadwaita libshumate gstreamer gst-plugins-base-libs
+         gst-plugins-bad-libs sqlite openssl dbus glib2 python)
+makedepends=(cargo)
+options=(!debug !lto)
+source=(icloud-photos python3)
+sha256sums=(SKIP SKIP)
+
+_root="$startdir/../.."
+
+pkgver() {
+  local v
+  v=$(sed -n 's/^version = "\(.*\)"/\1/p' "$_root/Cargo.toml" | head -1)
+  printf '%s.r%s.g%s' "$v" "$(git -C "$_root" rev-list --count HEAD)" \
+    "$(git -C "$_root" rev-parse --short HEAD)"
+}
+
+build() {
+  cd "$_root"
+  cargo build --release --locked -p icloud-photos-app
+
+  # pyicloud pins versions Arch does not carry, so its dependency tree is
+  # vendored. A throwaway venv provides pip; nothing of it is packaged.
+  python -m venv "$srcdir/pipenv"
+  rm -rf "$srcdir/pylib"
+  "$srcdir/pipenv/bin/pip" install --quiet --no-compile \
+    --target "$srcdir/pylib" -r sidecar/requirements.txt
+  rm -rf "$srcdir/pylib/bin"   # console scripts, unused and tied to $srcdir
+}
+
+package() {
+  cd "$_root"
+  install -Dm755 target/release/icloud-photos-app "$pkgdir/usr/lib/icloud-photos/icloud-photos-app"
+  install -Dm644 sidecar/pyicloud_sync.py "$pkgdir/usr/lib/icloud-photos/sidecar/pyicloud_sync.py"
+  cp -r "$srcdir/pylib" "$pkgdir/usr/lib/icloud-photos/python"
+  install -Dm755 "$srcdir/python3" "$pkgdir/usr/lib/icloud-photos/python3"
+  install -Dm755 "$srcdir/icloud-photos" "$pkgdir/usr/bin/icloud-photos"
+
+  sed -e 's|@EXEC@|icloud-photos|' -e 's|@BINARY@|icloud-photos|' \
+    data/de.henri.IcloudPhotos.desktop \
+    | install -Dm644 /dev/stdin "$pkgdir/usr/share/applications/de.henri.IcloudPhotos.desktop"
+  install -Dm644 data/icons/de.henri.IcloudPhotos.svg \
+    "$pkgdir/usr/share/icons/hicolor/scalable/apps/de.henri.IcloudPhotos.svg"
+}

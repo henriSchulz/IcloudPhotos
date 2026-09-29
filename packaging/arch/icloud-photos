@@ -1,0 +1,6 @@
+#!/bin/sh
+# Launcher for the packaged app: the binary looks for the sidecar and its
+# Python relative to the source tree unless these point elsewhere.
+export ICLOUD_PHOTOS_SIDECAR=/usr/lib/icloud-photos/sidecar/pyicloud_sync.py
+export ICLOUD_PHOTOS_PYTHON=/usr/lib/icloud-photos/python3
+exec /usr/lib/icloud-photos/icloud-photos-app "$@"
