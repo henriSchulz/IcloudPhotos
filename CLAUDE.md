@@ -920,3 +920,21 @@ Bild, das es gerade zeigt. Die ID ist `photos.id` aus `catalog.sqlite`.
   Ausschnitt ein, lädt das Raster bis dorthin nach (wie der Monatssprung) und
   öffnet den Betrachter; `window.present()` holt das Fenster nach vorn
   (Hyprland: `misc.focus_on_activate`).
+
+## Velum-Optik
+
+Hat der Desktop die Velum-Schicht (`~/.config/gtk-4.0/gtk.css` importiert
+etwas mit „velum“), lädt `crates/app/src/velum.rs` das eigene Stylesheet
+`velum.css` und gibt dem Fenster die Klasse `velum-photos`. Darin stehen nur
+Velum-Rollen (`--v-*`), keine Farben oder Radien von Hand; ohne die Schicht
+wären die Variablen leer, deshalb gibt es dann gar nichts davon.
+
+- Priorität **über** dem Benutzer-Stylesheet (`STYLE_PROVIDER_PRIORITY_USER + 1`):
+  die Velum-Schicht rundet jede `.card`, auch die Kacheln, die hier Kante an
+  Kante liegen. Mit Anwendungspriorität gewinnt die Schicht.
+- Das Skelett pulsiert unter Velum nicht (keine Schleifen außerhalb von
+  `motion.ambient`).
+- Prüfen ohne den Desktop zu stören: `~/.cache/photos-velum-rig/run.sh
+  light|dark [variant] [velum|plain]` startet `--demo` im Velum-Prüfstand
+  (`VELUM_RIG_ID=photos ~/Projects/velum/shell/rig/rig.sh start`), Screenshot
+  mit `WAYLAND_DISPLAY=<nested socket> grim` — `rig.sh shot` lieferte schwarz.
