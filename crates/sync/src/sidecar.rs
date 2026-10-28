@@ -330,10 +330,12 @@ pub async fn run_sync(
         .stdout
         .take()
         .expect("stdout wurde als Pipe angefordert");
-    let mut stdin = child
-        .stdin
-        .take()
-        .expect("stdin wurde als Pipe angefordert");
+    let mut stdin_slot = Some(
+        child
+            .stdin
+            .take()
+            .expect("stdin wurde als Pipe angefordert"),
+    );
     let mut lines = BufReader::new(stdout).lines();
 
     let mut summary = SyncSummary::default();
@@ -456,8 +458,10 @@ pub async fn run_sync(
                     failure = Some(SyncError::PasswordAborted);
                     break;
                 };
-                stdin.write_all(format!("{password}\n").as_bytes()).await?;
-                stdin.flush().await?;
+                if let Some(stdin) = stdin_slot.as_mut() {
+                    stdin.write_all(format!("{password}\n").as_bytes()).await?;
+                    stdin.flush().await?;
+                }
             }
             SidecarMessage::AuthRequired { method } => {
                 tracing::info!(%method, "Sidecar fordert 2FA-Code an");
@@ -467,8 +471,10 @@ pub async fn run_sync(
                     failure = Some(SyncError::TwoFactorAborted);
                     break;
                 };
-                stdin.write_all(format!("{code}\n").as_bytes()).await?;
-                stdin.flush().await?;
+                if let Some(stdin) = stdin_slot.as_mut() {
+                    stdin.write_all(format!("{code}\n").as_bytes()).await?;
+                    stdin.flush().await?;
+                }
             }
             SidecarMessage::TermsRequired { url } => {
                 tracing::info!(%url, "Sidecar fordert Zustimmung zu neuen Nutzungsbedingungen an");
@@ -476,8 +482,10 @@ pub async fn run_sync(
                     failure = Some(SyncError::TermsDeclined);
                     break;
                 }
-                stdin.write_all(b"accept\n").await?;
-                stdin.flush().await?;
+                if let Some(stdin) = stdin_slot.as_mut() {
+                    stdin.write_all(b"accept\n").await?;
+                    stdin.flush().await?;
+                }
             }
             SidecarMessage::AuthOk { trusted } => {
                 if !trusted {
@@ -493,18 +501,27 @@ pub async fn run_sync(
                 if options.albums {
                     let known = serde_json::to_string(&options.known_album_sizes)
                         .unwrap_or_else(|_| "{}".to_string());
-                    stdin.write_all(known.as_bytes()).await?;
-                    stdin.write_all(b"\n").await?;
-                    stdin.flush().await?;
-                    stdin.shutdown().await?;
+                    if let Some(stdin) = stdin_slot.as_mut() {
+                        stdin.write_all(known.as_bytes()).await?;
+                        stdin.write_all(b"\n").await?;
+                        stdin.flush().await?;
+                    }
+                    // Schließen heißt fallen lassen: `shutdown()` lässt bei
+                    // einer Pipe das Ende offen, der Sidecar sähe nie EOF.
+                    stdin_slot = None;
                 }
                 if options.is_thumbnail_backfill() {
                     let payload = options.fetch_thumbnails_for.join("\n");
-                    stdin.write_all(payload.as_bytes()).await?;
-                    stdin.write_all(b"\n").await?;
-                    stdin.flush().await?;
-                    // EOF beendet die Leseschleife des Sidecars.
-                    stdin.shutdown().await?;
+                    if let Some(stdin) = stdin_slot.as_mut() {
+                        stdin.write_all(payload.as_bytes()).await?;
+                        stdin.write_all(b"\n").await?;
+                        stdin.flush().await?;
+                    }
+                    // EOF beendet die Leseschleife des Sidecars — und EOF gibt
+                    // es nur, wenn das Ende fallen gelassen wird: `shutdown()`
+                    // lässt eine Pipe offen. So hing der Vorschau-Nachlauf am
+                    // 2026-10-28 ohne Ende, und die Alben danach kamen nie.
+                    stdin_slot = None;
                 }
             }
             SidecarMessage::Album(album) => {
@@ -555,7 +572,7 @@ pub async fn run_sync(
 
     // stdin schliessen, damit ein noch auf einen 2FA-Code wartender Sidecar EOF
     // sieht und sich beendet, statt den Prozess ewig haengen zu lassen.
-    drop(stdin);
+    drop(stdin_slot);
 
     // Nach einem Fehler nicht auf ein geordnetes Ende warten: der Sidecar kann
     // in einem Netz-Timeout oder auf einer vollen stdout-Pipe stehen.
