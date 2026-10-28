@@ -12,6 +12,7 @@
 
 use std::cell::{Cell, RefCell};
 
+use adw::prelude::AnimationExt;
 use gtk::prelude::*;
 use gtk::subclass::prelude::*;
 use gtk::{gdk, glib, graphene, gsk};
@@ -31,6 +32,72 @@ const SMOOTH_ZOOM_PIXELS: f64 = 70.0;
 
 /// Wer über Änderungen am Ausschnitt Bescheid wissen will.
 type ChangeCallback = Box<dyn Fn(&View)>;
+/// Meldet ein Wischen; `true`, wenn der Betrachter ihm gefolgt ist (am Ende
+/// der Bibliothek gibt es kein nächstes Foto — dann federt das Bild zurück).
+type SwipeCallback = Box<dyn Fn(Swipe) -> bool>;
+
+/// Was ein Wischen über das eingepasste Foto auslöst — wie in Photos auf dem
+/// iPad: zur Seite blättert, nach unten schließt.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Swipe {
+    Next,
+    Previous,
+    Close,
+}
+
+/// Erst ab so viel Weg weiß ein Finger, ob er blättert oder schließt.
+const SWIPE_SLOP: f64 = 12.0;
+/// So weit (Anteil der Breite bzw. Höhe) muss das Foto gezogen sein, damit
+/// das Loslassen blättert bzw. schließt …
+const SWIPE_COMMIT: f64 = 0.2;
+/// … oder es fliegt mindestens so schnell in diese Richtung (px/ms).
+const SWIPE_FLICK: f64 = 0.5;
+/// Nach unten gezogen schrumpft das Foto bis auf diesen Anteil.
+const DISMISS_MIN_SCALE: f64 = 0.7;
+
+/// Achse eines laufenden Wischens.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum SwipeAxis {
+    #[default]
+    None,
+    Across,
+    Down,
+}
+
+/// Wohin ein losgelassenes Wischen führt: `offset` ist der Weg, `velocity`
+/// die letzte Geschwindigkeit (px/ms), `viewport` die Größe des Bildes.
+pub fn decide_swipe(
+    axis: SwipeAxis,
+    offset: (f64, f64),
+    velocity: (f64, f64),
+    viewport: (f64, f64),
+) -> Option<Swipe> {
+    match axis {
+        SwipeAxis::Across => {
+            let far = offset.0.abs() > viewport.0 * SWIPE_COMMIT;
+            let flick = velocity.0.abs() > SWIPE_FLICK && velocity.0.signum() == offset.0.signum();
+            (far || flick).then_some(if offset.0 < 0.0 {
+                Swipe::Next
+            } else {
+                Swipe::Previous
+            })
+        }
+        SwipeAxis::Down => {
+            let far = offset.1 > viewport.1 * SWIPE_COMMIT;
+            let flick = velocity.1 > SWIPE_FLICK;
+            (far || flick).then_some(Swipe::Close)
+        }
+        SwipeAxis::None => None,
+    }
+}
+
+/// Wie stark das nach unten gezogene Foto schrumpft.
+pub fn dismiss_scale(dy: f64, height: f64) -> f64 {
+    if height <= 0.0 {
+        return 1.0;
+    }
+    1.0 - (dy.max(0.0) / height).min(1.0) * (1.0 - DISMISS_MIN_SCALE)
+}
 
 /// Maßstab und Ausschnitt, unabhängig von GTK.
 ///
@@ -183,6 +250,16 @@ mod imp {
         /// zwischen den Fingern.
         pub pinch_start: Cell<Option<(f64, (f64, f64))>>,
         pub on_change: RefCell<Option<ChangeCallback>>,
+        /// Wischen über das eingepasste Foto: Achse, Weg, die letzten
+        /// Messpunkte (µs, x, y) für die Geschwindigkeit, die Feder zurück.
+        pub swipe_axis: Cell<SwipeAxis>,
+        pub swipe: Cell<(f64, f64)>,
+        pub swipe_samples: RefCell<Vec<(i64, f64, f64)>>,
+        pub swipe_anim: RefCell<Option<adw::SpringAnimation>>,
+        pub on_swipe: RefCell<Option<SwipeCallback>>,
+        /// Einfaches Antippen — erst gemeldet, wenn kein zweites folgt.
+        pub on_tap: RefCell<Option<Box<dyn Fn()>>>,
+        pub tap_pending: RefCell<Option<glib::SourceId>>,
     }
 
     #[glib::object_subclass]
@@ -229,6 +306,18 @@ mod imp {
             }
             let (x, y, width, height) = view.bounds();
             let bounds = graphene::Rect::new(x as f32, y as f32, width as f32, height as f32);
+            // Ein laufendes Wischen verschiebt das Foto; nach unten schrumpft
+            // es dazu um seine Mitte.
+            let (sx, sy) = self.swipe.get();
+            let moved = sx != 0.0 || sy != 0.0;
+            if moved {
+                let (cx, cy) = view.viewport_center();
+                let scale = dismiss_scale(sy, view.viewport.1) as f32;
+                snapshot.save();
+                snapshot.translate(&graphene::Point::new((cx + sx) as f32, (cy + sy) as f32));
+                snapshot.scale(scale, scale);
+                snapshot.translate(&graphene::Point::new(-cx as f32, -cy as f32));
+            }
             // Beim Verkleinern glättet Trilinear, statt Treppen zu zeigen; ab
             // einem Bildpunkt pro Bildschirmpunkt aufwärts sollen die Pixel
             // scharf sichtbar werden, wie in jedem Bildbetrachter.
@@ -240,6 +329,9 @@ mod imp {
                 gsk::ScalingFilter::Trilinear
             };
             snapshot.append_scaled_texture(&texture, filter, &bounds);
+            if moved {
+                snapshot.restore();
+            }
         }
     }
 }
@@ -286,6 +378,50 @@ impl ZoomView {
 
     pub fn view(&self) -> View {
         self.imp().view.get()
+    }
+
+    /// Einmal antippen (kein Doppeltipp, kein Wischen).
+    pub fn connect_tap(&self, callback: impl Fn() + 'static) {
+        *self.imp().on_tap.borrow_mut() = Some(Box::new(callback));
+    }
+
+    /// Wischen über das eingepasste Foto: blättern oder schließen.
+    pub fn connect_swipe(&self, callback: impl Fn(Swipe) -> bool + 'static) {
+        *self.imp().on_swipe.borrow_mut() = Some(Box::new(callback));
+    }
+
+    fn set_swipe(&self, offset: (f64, f64)) {
+        self.imp().swipe.set(offset);
+        self.queue_draw();
+    }
+
+    /// Lässt das Foto von `from` auf seinen Platz federn — Velums snappy,
+    /// dieselbe Feder wie in der Shell.
+    fn settle_swipe(&self, from: (f64, f64)) {
+        if let Some(anim) = self.imp().swipe_anim.take() {
+            anim.skip();
+        }
+        if from == (0.0, 0.0) {
+            self.set_swipe(from);
+            return;
+        }
+        let target = adw::CallbackAnimationTarget::new({
+            let widget = self.downgrade();
+            move |t| {
+                if let Some(widget) = widget.upgrade() {
+                    widget.set_swipe((from.0 * t, from.1 * t));
+                }
+            }
+        });
+        let anim = adw::SpringAnimation::builder()
+            .widget(self)
+            .value_from(1.0)
+            .value_to(0.0)
+            .spring_params(&crate::velum::spring("snappy"))
+            .target(&target)
+            .build();
+        anim.play();
+        self.imp().swipe_anim.replace(Some(anim));
     }
 
     /// Meldet jede Änderung von Maßstab oder Ausschnitt.
@@ -467,7 +603,14 @@ fn connect_input(widget: &ZoomView) {
             let Some(widget) = widget.upgrade() else {
                 return;
             };
-            widget.imp().drag_start.set(widget.view());
+            let imp = widget.imp();
+            imp.drag_start.set(widget.view());
+            imp.swipe_axis.set(SwipeAxis::None);
+            imp.swipe_samples.borrow_mut().clear();
+            // Ein neuer Finger setzt ein noch federndes Foto auf seinen Platz.
+            if let Some(anim) = imp.swipe_anim.take() {
+                anim.skip();
+            }
             if !widget.view().is_fitted() {
                 widget.set_cursor_from_name(Some("grabbing"));
             }
@@ -479,8 +622,28 @@ fn connect_input(widget: &ZoomView) {
             let Some(widget) = widget.upgrade() else {
                 return;
             };
-            let start = widget.imp().drag_start.get();
+            let imp = widget.imp();
+            let start = imp.drag_start.get();
             if start.is_fitted() {
+                // Eingepasst wird gewischt statt verschoben.
+                let axis = match imp.swipe_axis.get() {
+                    SwipeAxis::None if dx.abs().max(dy.abs()) < SWIPE_SLOP => return,
+                    SwipeAxis::None if dx.abs() >= dy.abs() => SwipeAxis::Across,
+                    SwipeAxis::None if dy > 0.0 => SwipeAxis::Down,
+                    SwipeAxis::None => return,
+                    axis => axis,
+                };
+                imp.swipe_axis.set(axis);
+                let mut samples = imp.swipe_samples.borrow_mut();
+                samples.push((glib::monotonic_time(), dx, dy));
+                if samples.len() > 4 {
+                    samples.remove(0);
+                }
+                drop(samples);
+                widget.set_swipe(match axis {
+                    SwipeAxis::Across => (dx, 0.0),
+                    _ => (0.0, dy.max(0.0)),
+                });
                 return;
             }
             widget.update(|view| {
@@ -492,8 +655,44 @@ fn connect_input(widget: &ZoomView) {
     drag.connect_drag_end({
         let widget = widget.downgrade();
         move |_, _, _| {
-            if let Some(widget) = widget.upgrade() {
-                widget.notify_change();
+            let Some(widget) = widget.upgrade() else {
+                return;
+            };
+            widget.notify_change();
+            let imp = widget.imp();
+            let axis = imp.swipe_axis.replace(SwipeAxis::None);
+            if axis == SwipeAxis::None {
+                return;
+            }
+            let offset = imp.swipe.get();
+            let velocity = {
+                let samples = imp.swipe_samples.borrow();
+                match (samples.first(), samples.last()) {
+                    (Some(a), Some(b)) if b.0 > a.0 => {
+                        let ms = (b.0 - a.0) as f64 / 1000.0;
+                        ((b.1 - a.1) / ms, (b.2 - a.2) / ms)
+                    }
+                    _ => (0.0, 0.0),
+                }
+            };
+            let view = widget.view();
+            let decided = decide_swipe(axis, offset, velocity, view.viewport);
+            let followed = decided.is_some_and(|swipe| {
+                imp.on_swipe
+                    .borrow()
+                    .as_ref()
+                    .is_some_and(|callback| callback(swipe))
+            });
+            match decided {
+                // Das nächste Foto kommt von der Seite, zu der der Finger zog.
+                Some(Swipe::Next) if followed => {
+                    widget.settle_swipe((offset.0 + view.viewport.0, 0.0))
+                }
+                Some(Swipe::Previous) if followed => {
+                    widget.settle_swipe((offset.0 - view.viewport.0, 0.0))
+                }
+                Some(Swipe::Close) if followed => widget.set_swipe((0.0, 0.0)),
+                _ => widget.settle_swipe(offset),
             }
         }
     });
@@ -507,7 +706,41 @@ fn connect_input(widget: &ZoomView) {
             if clicks == 2
                 && let Some(widget) = widget.upgrade()
             {
+                // Ein Doppeltipp ist kein Antippen.
+                if let Some(pending) = widget.imp().tap_pending.take() {
+                    pending.remove();
+                }
                 widget.toggle_zoom((x, y));
+            }
+        }
+    });
+    // Antippen meldet sich erst, wenn die Zeit für einen Doppeltipp vorbei
+    // ist — sonst blendete jeder Doppeltipp zum Zoomen auch die Leisten aus.
+    click.connect_released({
+        let widget = widget.downgrade();
+        move |_, clicks, _, _| {
+            let Some(widget) = widget.upgrade() else {
+                return;
+            };
+            if clicks != 1 || widget.imp().swipe_axis.get() != SwipeAxis::None {
+                return;
+            }
+            let wait = gtk::Settings::default()
+                .map_or(400, |s| s.gtk_double_click_time())
+                .max(0) as u64;
+            let id = glib::timeout_add_local_once(std::time::Duration::from_millis(wait), {
+                let widget = widget.downgrade();
+                move || {
+                    if let Some(widget) = widget.upgrade() {
+                        widget.imp().tap_pending.take();
+                        if let Some(callback) = widget.imp().on_tap.borrow().as_ref() {
+                            callback();
+                        }
+                    }
+                }
+            });
+            if let Some(old) = widget.imp().tap_pending.replace(Some(id)) {
+                old.remove();
             }
         }
     });
@@ -527,6 +760,52 @@ mod tests {
         };
         view.clamp();
         view
+    }
+
+    #[test]
+    fn swipe_decides_by_distance_or_speed() {
+        let vp = (1000.0, 800.0);
+        assert_eq!(
+            decide_swipe(SwipeAxis::Across, (-250.0, 0.0), (0.0, 0.0), vp),
+            Some(Swipe::Next)
+        );
+        assert_eq!(
+            decide_swipe(SwipeAxis::Across, (250.0, 0.0), (0.0, 0.0), vp),
+            Some(Swipe::Previous)
+        );
+        assert_eq!(
+            decide_swipe(SwipeAxis::Across, (-50.0, 0.0), (0.0, 0.0), vp),
+            None
+        );
+        assert_eq!(
+            decide_swipe(SwipeAxis::Across, (-50.0, 0.0), (-1.2, 0.0), vp),
+            Some(Swipe::Next)
+        );
+        // ein Schwung zurück gegen die Zugrichtung blättert nicht
+        assert_eq!(
+            decide_swipe(SwipeAxis::Across, (-50.0, 0.0), (1.2, 0.0), vp),
+            None
+        );
+        assert_eq!(
+            decide_swipe(SwipeAxis::Down, (0.0, 200.0), (0.0, 0.0), vp),
+            Some(Swipe::Close)
+        );
+        assert_eq!(
+            decide_swipe(SwipeAxis::Down, (0.0, 40.0), (0.0, 0.1), vp),
+            None
+        );
+        assert_eq!(
+            decide_swipe(SwipeAxis::Down, (0.0, 40.0), (0.0, 0.9), vp),
+            Some(Swipe::Close)
+        );
+    }
+
+    #[test]
+    fn dismissing_shrinks_to_the_floor() {
+        assert!((dismiss_scale(0.0, 800.0) - 1.0).abs() < 1e-9);
+        assert!((dismiss_scale(-30.0, 800.0) - 1.0).abs() < 1e-9);
+        assert!((dismiss_scale(800.0, 800.0) - DISMISS_MIN_SCALE).abs() < 1e-9);
+        assert!((dismiss_scale(5000.0, 800.0) - DISMISS_MIN_SCALE).abs() < 1e-9);
     }
 
     fn close(a: (f64, f64), b: (f64, f64)) -> bool {

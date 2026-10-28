@@ -150,3 +150,30 @@ window.velum-photos .map-cluster-count {
 window.velum-photos .photos-info {
   background-color: var(--v-bg-sidebar);
 }
+
+/* ── Betrachter ────────────────────────────────────────────────────────── */
+window.velum-photos .photos-viewer { background-color: var(--v-bg-window); }
+/* Leiste per Tipp ausgeblendet (Tablet-Modus): nur noch das Foto. */
+window.velum-photos .photos-viewer.immersive { background-color: var(--v-bg-content); }
+
+/* ── Tablet-Modus (velum-touch): Fingergrößen aus --v-touch-* ──────────── */
+window.velum-photos.velum-touch headerbar {
+  min-height: calc(var(--v-touch-hit-min) + 2 * var(--v-sidebar-inset));
+}
+window.velum-photos.velum-touch headerbar button {
+  min-width: var(--v-touch-hit-min);
+  min-height: var(--v-touch-hit-min);
+}
+window.velum-photos.velum-touch .photos-sidebar list.navigation-sidebar > row {
+  min-height: var(--v-touch-metrics-row-height);
+}
+window.velum-photos.velum-touch .photos-sidebar list.navigation-sidebar > row.sidebar-section {
+  min-height: 0;
+}
+window.velum-photos.velum-touch popover.menu modelbutton {
+  min-height: var(--v-touch-metrics-menu-row);
+}
+window.velum-photos.velum-touch button.pill,
+window.velum-photos.velum-touch entry {
+  min-height: var(--v-touch-metrics-control-height);
+}

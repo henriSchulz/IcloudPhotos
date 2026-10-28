@@ -31,6 +31,52 @@ const PAGE_SIZE: u64 = 200;
 const PREFETCH_MARGIN: f64 = 600.0;
 
 const THUMB_SIZE: i32 = 180;
+/// Kachelgrößen, zwischen denen zwei Finger im Raster umschalten — wie in
+/// Photos auf dem iPad: zusammenziehen zeigt mehr Fotos, spreizen größere.
+/// `THUMB_SIZE` ist die mittlere.
+const TILE_STEPS: [i32; 5] = [96, 132, THUMB_SIZE, 240, 320];
+
+thread_local! {
+    /// Die Kachelgröße als eigenes Stylesheet: so ändert sie sich für alle
+    /// Kacheln auf einmal, auch für die, die das Raster gerade recycelt.
+    static TILE_CSS: RefCell<Option<gtk::CssProvider>> = const { RefCell::new(None) };
+    static TILE_SIZE: Cell<i32> = const { Cell::new(THUMB_SIZE) };
+}
+
+/// Setzt die Kachelgröße des Rasters.
+fn set_tile_size(size: i32) {
+    TILE_SIZE.set(size);
+    TILE_CSS.with_borrow_mut(|slot| {
+        let provider = slot.get_or_insert_with(|| {
+            let provider = gtk::CssProvider::new();
+            if let Some(display) = gdk::Display::default() {
+                gtk::style_context_add_provider_for_display(
+                    &display,
+                    &provider,
+                    gtk::STYLE_PROVIDER_PRIORITY_APPLICATION,
+                );
+            }
+            provider
+        });
+        provider.load_from_string(&format!(
+            "picture.photo-tile {{ min-width: {size}px; min-height: {size}px; }}"
+        ));
+    });
+}
+
+/// Die Stufe, die einer Pinch-Geste am nächsten liegt: `start` mal `scale`,
+/// gemessen auf logarithmischer Skala (eine Verdopplung ist überall gleich weit).
+fn tile_step_for(start: i32, scale: f64) -> i32 {
+    let want = (start as f64 * scale).max(1.0).ln();
+    *TILE_STEPS
+        .iter()
+        .min_by(|a, b| {
+            let da = ((**a as f64).ln() - want).abs();
+            let db = ((**b as f64).ln() - want).abs();
+            da.total_cmp(&db)
+        })
+        .unwrap_or(&THUMB_SIZE)
+}
 
 /// So oft zieht die Ansicht waehrend eines Syncs nach.
 const LIVE_REFRESH: std::time::Duration = std::time::Duration::from_secs(2);
@@ -734,6 +780,7 @@ pub fn build(app: &adw::Application, state: Rc<AppState>) {
         .default_height(760)
         .build();
     crate::velum::apply(&window);
+    crate::velum::follow_tablet(&window);
 
     let status = gtk::Label::builder()
         .label("")
@@ -763,6 +810,12 @@ pub fn build(app: &adw::Application, state: Rc<AppState>) {
         .visible(false)
         .build();
     header.pack_start(&back_to_map);
+    // Im Tablet-Modus läuft jede App im Vollbild; Fensterknöpfe gibt es auf
+    // dem iPad nicht.
+    crate::velum::on_tablet({
+        let header = header.clone();
+        move |on| header.set_show_end_title_buttons(!on)
+    });
     header.pack_start(manager.button());
     header.pack_end(&status);
 
@@ -773,6 +826,27 @@ pub fn build(app: &adw::Application, state: Rc<AppState>) {
         .vexpand(true)
         .child(&grid)
         .build();
+
+    // Zwei Finger ändern die Kachelgröße (Touchscreen und Touchpad). Sie
+    // springt zwischen festen Stufen, schon während der Geste — ein Raster,
+    // das jeden Zwischenwert neu umbricht, flackert nur.
+    set_tile_size(TILE_SIZE.get());
+    let pinch = gtk::GestureZoom::new();
+    let pinch_start = Rc::new(Cell::new(THUMB_SIZE));
+    pinch.connect_begin({
+        let pinch_start = pinch_start.clone();
+        move |_, _| pinch_start.set(TILE_SIZE.get())
+    });
+    pinch.connect_scale_changed({
+        let pinch_start = pinch_start.clone();
+        move |_, scale| {
+            let step = tile_step_for(pinch_start.get(), scale);
+            if step != TILE_SIZE.get() {
+                set_tile_size(step);
+            }
+        }
+    });
+    scroller.add_controller(pinch);
 
     // Mitlaufende Datumszeile. Ein GtkGridView kennt keine Abschnittsköpfe —
     // eine Zeile, die immer den Monat der obersten sichtbaren Reihe zeigt,
@@ -1481,8 +1555,6 @@ fn build_grid(state: &Rc<AppState>, window: &adw::ApplicationWindow) -> gtk::Gri
 
         let picture = gtk::Picture::builder()
             .content_fit(gtk::ContentFit::Cover)
-            .width_request(THUMB_SIZE)
-            .height_request(THUMB_SIZE)
             .build();
         picture.add_css_class("card");
         picture.add_css_class("photo-tile");
@@ -3029,5 +3101,19 @@ mod tests {
         state.syncing.set(false);
         state.sync_model();
         assert_eq!(ids(&state.model), ["b", "a"]);
+    }
+}
+
+#[cfg(test)]
+mod tile_tests {
+    use super::*;
+
+    #[test]
+    fn pinch_snaps_to_the_nearest_tile_step() {
+        assert_eq!(tile_step_for(THUMB_SIZE, 1.0), THUMB_SIZE);
+        assert_eq!(tile_step_for(THUMB_SIZE, 1.4), 240);
+        assert_eq!(tile_step_for(THUMB_SIZE, 0.7), 132);
+        assert_eq!(tile_step_for(THUMB_SIZE, 10.0), 320);
+        assert_eq!(tile_step_for(THUMB_SIZE, 0.01), 96);
     }
 }

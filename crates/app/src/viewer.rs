@@ -15,7 +15,7 @@ use crate::export;
 use crate::info_panel::InfoPanel;
 use crate::photo_object::PhotoObject;
 use crate::window::{AppState, UiAction};
-use crate::zoom_view::{ZOOM_STEP, ZoomView};
+use crate::zoom_view::{Swipe, ZOOM_STEP, ZoomView};
 
 /// So viele Nachbarn in jede Richtung werden im Voraus geholt. Einer reicht:
 /// er deckt den nächsten Tastendruck ab, ohne die Leitung vollzulaufen.
@@ -206,9 +206,43 @@ pub fn open(
         .build();
     content.add_breakpoint(narrow);
 
+    // Im Tablet-Modus blendet ein Tipp aufs Foto die Leiste aus und wieder
+    // ein, wie in Photos auf dem iPad; das Foto steht dann auf Schwarz.
+    let chrome = gtk::Revealer::builder()
+        .child(&header)
+        .reveal_child(true)
+        .transition_type(gtk::RevealerTransitionType::Crossfade)
+        .transition_duration(crate::velum::duration("fast"))
+        .build();
+    // Mit dem Finger wird gewischt; die Pfeile braucht es dann nicht.
+    crate::velum::on_tablet({
+        let navigation = navigation.downgrade();
+        move |on| {
+            if let Some(navigation) = navigation.upgrade() {
+                navigation.set_visible(!on);
+            }
+        }
+    });
     let page = gtk::Box::new(gtk::Orientation::Vertical, 0);
-    page.append(&header);
+    page.add_css_class("photos-viewer");
+    page.append(&chrome);
     page.append(&content);
+    picture.connect_tap({
+        let chrome = chrome.clone();
+        let page = page.clone();
+        move || {
+            if !crate::velum::tablet() {
+                return;
+            }
+            let show = !chrome.reveals_child();
+            chrome.set_reveal_child(show);
+            if show {
+                page.remove_css_class("immersive");
+            } else {
+                page.add_css_class("immersive");
+            }
+        }
+    });
     // Die Gruppe muss haengen, bevor die Seite ins Fenster kommt. Spaeter
     // eingehaengt, loest GTK die Aktionen zwar noch auf, das Menue erfaehrt
     // davon aber nichts und zeigt alle Eintraege ausgegraut. Die Aktionen
@@ -259,6 +293,26 @@ pub fn open(
         move |view| {
             label.set_visible(!view.is_fitted());
             label.set_label(&format!("{:.0} %", view.pixel_scale() * 100.0));
+        }
+    });
+    // Wischen wie in Photos auf dem iPad: zur Seite blättert, nach unten
+    // geht es zurück zur Übersicht. Geschlossen wird erst nach der Geste —
+    // mitten in ihr hängte das Schließen das Widget aus, das sie meldet.
+    picture.connect_swipe({
+        let weak = Rc::downgrade(&viewer);
+        move |swipe| {
+            let Some(viewer) = weak.upgrade() else {
+                return false;
+            };
+            match swipe {
+                Swipe::Next => viewer.try_step(1),
+                Swipe::Previous => viewer.try_step(-1),
+                Swipe::Close => {
+                    let weak = weak.clone();
+                    glib::idle_add_local_once(move || with(&weak, |viewer| viewer.close()));
+                    true
+                }
+            }
         }
     });
     connect_keys(&viewer);
@@ -377,6 +431,13 @@ impl Viewer {
         }
         self.position.set(target);
         self.show_current();
+    }
+
+    /// Blättert und sagt, ob es ein Foto weiter ging (am Rand nicht).
+    fn try_step(&self, delta: i32) -> bool {
+        let before = self.position.get();
+        self.step(delta);
+        self.position.get() != before
     }
 
     /// Zeigt das Foto an dieser Position.

@@ -938,3 +938,28 @@ wären die Variablen leer, deshalb gibt es dann gar nichts davon.
   light|dark [variant] [velum|plain]` startet `--demo` im Velum-Prüfstand
   (`VELUM_RIG_ID=photos ~/Projects/velum/shell/rig/rig.sh start`), Screenshot
   mit `WAYLAND_DISPLAY=<nested socket> grim` — `rig.sh shot` lieferte schwarz.
+
+### Tablet-Modus (iPad-artig)
+
+Steht in `$XDG_STATE_HOME/velum/settings.json` `tablet: true`, bekommt das
+Fenster die Klasse `velum-touch` (`velum::follow_tablet`, beobachtet das
+Verzeichnis, weil Velum die Datei per rename ersetzt). Größen kommen aus
+`--v-touch-*` (Velum erzeugt sie seit 2026-10-28 auch für GTK): 44-pt-Knöpfe,
+Seitenleistenzeilen mit Touch-Höhe. Fensterknöpfe und die Pfeile im Betrachter
+verschwinden dann (`velum::on_tablet`).
+
+- **Wischen im Betrachter** (immer, auch mit der Maus): eingepasst blättert
+  ein Zug zur Seite, nach unten schließt er; das Foto folgt dem Finger und
+  federt mit Velums `snappy` (`velum::spring` liest `Tokens.js`). Entscheidung
+  GTK-frei in `zoom_view::decide_swipe` (Weg 20 % oder 0,5 px/ms), getestet.
+- **Antippen** blendet im Tablet-Modus die Leiste aus (`Revealer`, Velums
+  Dauer `fast`); gemeldet erst nach der Doppelklickzeit, sonst stört es den
+  Doppeltipp-Zoom.
+- **Zwei Finger im Raster** schalten die Kachelgröße zwischen `TILE_STEPS`
+  (eigener CSS-Provider statt `width_request`, damit auch recycelte Kacheln
+  folgen). Nur mit Touchpad/Touchscreen prüfbar, im Prüfstand ungetestet.
+
+Prüfen: `OPEN=<id> ~/.cache/photos-velum-rig/run.sh light pearl velum touch`
+(eigenes `XDG_STATE_HOME`, nie das echte), Aufnahme über einen Headless-Ausgang
+`SHOT` im Prüfstand (`grim -o SHOT`), Gesten mit
+`~/Projects/velum/shell/henri.launchpad-v3/tests/vptr/vptr SHOT W H …`.
