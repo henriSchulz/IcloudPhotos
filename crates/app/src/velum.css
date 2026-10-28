@@ -1,0 +1,152 @@
+/* Velum-Optik (~/Projects/velum, Variante Pearl als Vorgabe). Nur Rollen:
+ * jede Farbe, jeder Radius, jeder Schatten ist eine --v-*-Variable aus der
+ * Velum-Schicht in ~/.config/gtk-4.0/gtk.css. Geladen wird diese Datei nur,
+ * wenn es die Schicht gibt (velum::active) — sonst blieben die Variablen leer.
+ * Die Fenster tragen die Klasse `velum-photos`; nichts hier reicht darüber
+ * hinaus. Zahlen nur für Haarlinien. */
+
+/* ── Fenster: eine Fläche, Kopfzeile ohne Kante (macOS-Werkzeugleiste) ── */
+window.velum-photos,
+window.velum-photos .photos-library {
+  background-color: var(--v-bg-window);
+}
+window.velum-photos headerbar {
+  background: none;
+  box-shadow: none;
+  border: none;
+  min-height: calc(var(--v-control-height) + 2 * var(--v-sidebar-inset) + var(--v-sidebar-inset));
+}
+window.velum-photos headerbar .title,
+window.velum-photos windowtitle .title {
+  font-size: var(--v-type-title);
+  font-weight: 700;
+}
+window.velum-photos headerbar button:not(.suggested-action) {
+  background: none;
+  box-shadow: none;
+  color: var(--v-ink-secondary);
+}
+window.velum-photos headerbar button:hover:not(.suggested-action) { background-color: var(--v-fill-hover); }
+window.velum-photos headerbar button:active:not(.suggested-action),
+window.velum-photos headerbar button:checked:not(.suggested-action) {
+  background-color: var(--v-fill-pressed);
+  color: var(--v-ink-primary);
+}
+
+/* ── Seitenleiste: schwebend, eingerückt, gerundet (Pearl) ─────────────── */
+window.velum-photos .photos-split > widget:not(.sidebar-pane) { background: none; }
+window.velum-photos .photos-split .sidebar-pane {
+  background: none;
+  border: none;
+  box-shadow: none;
+}
+window.velum-photos .photos-sidebar {
+  margin: var(--v-sidebar-inset) 0 var(--v-sidebar-inset) var(--v-sidebar-inset);
+  border-radius: var(--v-radius-sidebar);
+  background-color: var(--v-bg-sidebar);
+  box-shadow: var(--v-sidebar-shadow);
+}
+window.velum-photos .photos-sidebar scrolledwindow,
+window.velum-photos .photos-sidebar list.navigation-sidebar { background: none; }
+window.velum-photos .photos-sidebar list.navigation-sidebar {
+  padding: 0 var(--v-sidebar-inset);
+}
+/* Zeilen: kein Hover (macOS), die Wahl ist eine ruhige Fläche. */
+window.velum-photos .photos-sidebar list.navigation-sidebar > row {
+  min-height: var(--v-row-height);
+  border-radius: var(--v-radius-row);
+  color: var(--v-ink-primary);
+}
+window.velum-photos .photos-sidebar list.navigation-sidebar > row:hover { background: none; }
+window.velum-photos .photos-sidebar list.navigation-sidebar > row:selected,
+window.velum-photos .photos-sidebar list.navigation-sidebar > row:selected:hover {
+  background-color: var(--v-fill-selected);
+  color: var(--v-ink-primary);
+}
+window.velum-photos .photos-sidebar list.navigation-sidebar > row image {
+  color: var(--v-accent-base);
+}
+window.velum-photos .photos-sidebar list.navigation-sidebar > row image.dim-label {
+  color: var(--v-ink-tertiary);
+}
+window.velum-photos .photos-sidebar .sidebar-heading {
+  font-size: var(--v-type-small);
+  font-weight: 600;
+  color: var(--v-ink-tertiary);
+  opacity: 1;
+}
+window.velum-photos .photos-sidebar list.navigation-sidebar > row.sidebar-section,
+window.velum-photos .photos-sidebar list.navigation-sidebar > row.sidebar-section:hover {
+  background: none;
+}
+
+/* ── Raster: Fotos Kante an Kante, eine Haarlinie dazwischen, wie Photos ─ */
+window.velum-photos gridview.photo-grid {
+  background-color: var(--v-bg-window);
+  padding: 0 1px;
+}
+window.velum-photos gridview.photo-grid > child {
+  padding: 1px;
+  margin: 0;
+  border-radius: 0;
+  background: none;
+  box-shadow: none;
+  outline: none;
+}
+window.velum-photos gridview.photo-grid > child:hover,
+window.velum-photos gridview.photo-grid > child:selected { background: none; }
+window.velum-photos picture.photo-tile {
+  border-radius: 0;
+  box-shadow: none;
+  background-color: var(--v-fill-field);
+}
+window.velum-photos gridview.photo-grid > child:selected picture.photo-tile {
+  outline: 3px solid var(--v-accent-base);
+  outline-offset: -3px;
+}
+/* Skelett: ruhige Fläche, ohne Puls — Velum hält Schleifen fern. */
+window.velum-photos picture.photo-tile.photo-skeleton {
+  background-image: none;
+  background-color: var(--v-fill-field);
+  border-radius: 0;
+  animation: none;
+  opacity: 1;
+}
+
+/* Video-Kennzeichen und Datumszeile liegen auf Fotos: Tooltip- und Popover-
+ * Grund, damit sie auf jedem Bild lesbar bleiben. */
+window.velum-photos .photo-badge {
+  background-color: var(--v-tooltip-bg);
+  color: var(--v-tooltip-ink);
+  border-radius: var(--v-radius-chip);
+}
+window.velum-photos .photo-date {
+  background-color: var(--v-popover-bg-opaque);
+  color: var(--v-popover-ink);
+  box-shadow: var(--v-popover-shadow);
+  border-radius: var(--v-radius-chip);
+  font-size: var(--v-type-body);
+  font-weight: 600;
+}
+
+/* ── Karte: Markierungen mit Velum-Rand und -Schatten ──────────────────── */
+window.velum-photos .map-cluster-photo {
+  border-radius: var(--v-radius-control);
+  border-color: var(--v-line-rim);
+  box-shadow: var(--v-popover-shadow);
+}
+window.velum-photos .map-cluster:hover .map-cluster-photo,
+window.velum-photos .map-cluster:focus-visible .map-cluster-photo {
+  border-color: var(--v-accent-base);
+}
+window.velum-photos .map-cluster-count {
+  background-color: var(--v-accent-base);
+  color: var(--v-ink-on-accent);
+  border-radius: var(--v-radius-chip);
+  font-size: var(--v-type-small);
+}
+
+/* ── Betrachter: Kopfzeile wie die Bibliothek, Info-Panel als Seitenleiste ─ */
+window.velum-photos .photos-info {
+  background-color: var(--v-bg-sidebar);
+}

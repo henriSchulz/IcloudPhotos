@@ -13,6 +13,7 @@ mod photo_object;
 mod sidebar;
 mod sync_manager;
 mod sync_task;
+mod velum;
 mod viewer;
 mod window;
 mod zoom_view;

@@ -399,11 +399,12 @@ fn heading(title: &str) -> gtk::ListBoxRow {
     let label = gtk::Label::builder()
         .label(title)
         .xalign(0.0)
-        .css_classes(["heading", "dim-label"])
+        .css_classes(["heading", "dim-label", "sidebar-heading"])
         .margin_top(12)
         .build();
     gtk::ListBoxRow::builder()
         .child(&label)
+        .css_classes(["sidebar-section"])
         .selectable(false)
         .activatable(false)
         .can_focus(false)

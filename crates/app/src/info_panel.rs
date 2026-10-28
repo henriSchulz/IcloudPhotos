@@ -142,6 +142,7 @@ impl InfoPanel {
         let widget = gtk::ScrolledWindow::builder()
             .hscrollbar_policy(gtk::PolicyType::Never)
             .child(&column)
+            .css_classes(["photos-info"])
             .build();
 
         Rc::new(Self {

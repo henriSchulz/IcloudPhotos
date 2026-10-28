@@ -733,6 +733,7 @@ pub fn build(app: &adw::Application, state: Rc<AppState>) {
         .default_width(1100)
         .default_height(760)
         .build();
+    crate::velum::apply(&window);
 
     let status = gtk::Label::builder()
         .label("")
@@ -850,6 +851,7 @@ pub fn build(app: &adw::Application, state: Rc<AppState>) {
     stack.add_named(&map_view.widget, Some("map"));
 
     let library = gtk::Box::new(gtk::Orientation::Vertical, 0);
+    library.add_css_class("photos-library");
     library.append(&header);
     library.append(&stack);
 
@@ -866,11 +868,13 @@ pub fn build(app: &adw::Application, state: Rc<AppState>) {
             .build(),
     );
     sidebar_view.set_content(Some(&sidebar.widget));
+    sidebar_view.add_css_class("photos-sidebar");
     let split = adw::OverlaySplitView::builder()
         .sidebar(&sidebar_view)
         .content(&library)
         .min_sidebar_width(200.0)
         .max_sidebar_width(280.0)
+        .css_classes(["photos-split"])
         .build();
     let narrow = adw::Breakpoint::new(adw::BreakpointCondition::new_length(
         adw::BreakpointConditionLengthType::MaxWidth,
@@ -1481,6 +1485,7 @@ fn build_grid(state: &Rc<AppState>, window: &adw::ApplicationWindow) -> gtk::Gri
             .height_request(THUMB_SIZE)
             .build();
         picture.add_css_class("card");
+        picture.add_css_class("photo-tile");
 
         // Das Video-Kennzeichen liegt ueber der Kachel, nicht daneben: sonst
         // verschoebe es das Raster, sobald ein Video darin vorkommt.
@@ -1563,6 +1568,7 @@ fn build_grid(state: &Rc<AppState>, window: &adw::ApplicationWindow) -> gtk::Gri
         .factory(&factory)
         .max_columns(12)
         .min_columns(2)
+        .css_classes(["photo-grid"])
         .margin_top(12)
         .margin_bottom(12)
         .margin_start(12)
@@ -1642,7 +1648,8 @@ fn open_photo(state: &Rc<AppState>, window: &adw::ApplicationWindow, id: &str) {
             .and_downcast::<PhotoObject>()
             .is_some_and(|photo| photo.id() == id)
     });
-    let position = in_model.unwrap_or_else(|| u32::try_from(position).unwrap_or(count - 1).min(count - 1));
+    let position =
+        in_model.unwrap_or_else(|| u32::try_from(position).unwrap_or(count - 1).min(count - 1));
     tracing::info!(id, position, "Foto per Aktion geöffnet");
     open_viewer(state, window, position);
     window.present();
