@@ -53,6 +53,50 @@ enum SessionMessage {
         kind: String,
         message: String,
     },
+    /// Das Foto liegt in iCloud jetzt unter "Zuletzt gelöscht".
+    PhotoDeleted {
+        id: String,
+    },
+    DeleteFailed {
+        id: String,
+        message: String,
+        #[serde(default = "retryable")]
+        kind: String,
+    },
+    /// Die Datei ist in iCloud. `id` fehlt, solange iCloud sie noch nicht
+    /// indiziert hat (oder sie schon kannte) — der nächste Sync bringt sie.
+    Uploaded {
+        path: PathBuf,
+        #[serde(default)]
+        id: Option<String>,
+    },
+    UploadFailed {
+        path: PathBuf,
+        message: String,
+    },
+}
+
+/// Ein Auftrag an den Sidecar im Serve-Modus.
+#[derive(Debug, Clone)]
+pub enum Job {
+    /// Original holen; `master` spart einen CloudKit-Lookup.
+    Original {
+        id: String,
+        master: Option<String>,
+        dest: PathBuf,
+    },
+    /// In iCloud löschen (nach "Zuletzt gelöscht", 30 Tage zurückholbar).
+    Delete { id: String, master: Option<String> },
+    /// Eine Datei in die Mediathek laden.
+    Upload { path: PathBuf },
+}
+
+/// Was ein erledigter Auftrag ergibt.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Done {
+    Original(Original),
+    Deleted,
+    Uploaded { id: Option<String> },
 }
 
 /// Ein geladenes Original.
@@ -173,13 +217,37 @@ impl SidecarSession {
         master: Option<&str>,
         dest: &Path,
     ) -> Result<Original, SyncError> {
-        let command = serde_json::json!({
-            "cmd": "original",
-            "id": id,
-            "master": master,
-            "dest": dest.to_string_lossy(),
-        });
-        write_line(&mut self.stdin, &command.to_string()).await?;
+        let job = Job::Original {
+            id: id.to_string(),
+            master: master.map(str::to_string),
+            dest: dest.to_path_buf(),
+        };
+        match self.run(&job).await? {
+            Done::Original(original) => Ok(original),
+            _ => Err(SyncError::UnexpectedExit("falsche Antwort".into())),
+        }
+    }
+
+    /// Schickt einen Auftrag und wartet auf genau seine Antwort.
+    pub async fn run(&mut self, command: &Job) -> Result<Done, SyncError> {
+        let line = match command {
+            Job::Original { id, master, dest } => serde_json::json!({
+                "cmd": "original",
+                "id": id,
+                "master": master,
+                "dest": dest.to_string_lossy(),
+            }),
+            Job::Delete { id, master } => serde_json::json!({
+                "cmd": "delete",
+                "id": id,
+                "master": master,
+            }),
+            Job::Upload { path } => serde_json::json!({
+                "cmd": "upload",
+                "path": path.to_string_lossy(),
+            }),
+        };
+        write_line(&mut self.stdin, &line.to_string()).await?;
 
         loop {
             let Some(line) = self.lines.next_line().await? else {
@@ -196,25 +264,59 @@ impl SidecarSession {
                     source,
                 })?;
 
-            match message {
-                SessionMessage::Original {
-                    id: got,
-                    path,
-                    bytes,
-                } if got == id => return Ok(Original { path, bytes }),
-                SessionMessage::OriginalFailed {
-                    id: got,
-                    message,
-                    kind,
-                } if got == id => {
+            match (command, message) {
+                (
+                    Job::Original { id, .. },
+                    SessionMessage::Original {
+                        id: got,
+                        path,
+                        bytes,
+                    },
+                ) if &got == id => return Ok(Done::Original(Original { path, bytes })),
+                (
+                    Job::Original { id, .. },
+                    SessionMessage::OriginalFailed {
+                        id: got,
+                        message,
+                        kind,
+                    },
+                ) if &got == id => {
                     return Err(SyncError::Sidecar { kind, message });
                 }
-                SessionMessage::Error { kind, message } => {
+                (Job::Delete { id, .. }, SessionMessage::PhotoDeleted { id: got })
+                    if &got == id =>
+                {
+                    return Ok(Done::Deleted);
+                }
+                (
+                    Job::Delete { id, .. },
+                    SessionMessage::DeleteFailed {
+                        id: got,
+                        message,
+                        kind,
+                    },
+                ) if &got == id => {
+                    return Err(SyncError::Sidecar { kind, message });
+                }
+                (Job::Upload { path }, SessionMessage::Uploaded { path: got, id })
+                    if &got == path =>
+                {
+                    return Ok(Done::Uploaded { id });
+                }
+                (Job::Upload { path }, SessionMessage::UploadFailed { path: got, message })
+                    if &got == path =>
+                {
+                    return Err(SyncError::Sidecar {
+                        kind: "error".into(),
+                        message,
+                    });
+                }
+                (_, SessionMessage::Error { kind, message }) => {
                     return Err(SyncError::Sidecar { kind, message });
                 }
                 // Antwort auf einen anderen Befehl oder eine Statuszeile:
                 // weiterlesen, statt den Aufrufer mit Fremdem zu bedienen.
-                other => tracing::debug!(?other, "Zeile gehoert nicht zu dieser Anfrage"),
+                (_, other) => tracing::debug!(?other, "Zeile gehoert nicht zu dieser Anfrage"),
             }
         }
     }

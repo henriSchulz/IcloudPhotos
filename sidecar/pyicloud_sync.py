@@ -610,6 +610,11 @@ def run_changes(api: Any, thumbs: Path | None, since_token: str) -> int:
             )
             continue
 
+        if is_deleted(asset):
+            emit({"type": "deleted", "id": record_name})
+            count += 1
+            continue
+
         emit(record_for(asset))
         count += 1
         if thumbs is not None:
@@ -722,6 +727,37 @@ def original_failed(asset_id: str, message: str, kind: str = "error") -> dict[st
     return {"type": "original_failed", "id": asset_id, "kind": kind, "message": message}
 
 
+def is_deleted(asset: Any) -> bool:
+    """Ob ein Asset in iCloud geloescht ist (``isDeleted`` am Asset-Record).
+
+    Geloescht wird in iCloud per Update, nicht per Tombstone: das Foto liegt
+    30 Tage unter "Zuletzt geloescht" und kommt im Delta als gewoehnliche
+    Aenderung an. Ohne diese Pruefung holte der naechste Sync es zurueck.
+    """
+    record = getattr(asset, "_asset_record", None)
+    fields = record.get("fields") if isinstance(record, dict) else getattr(record, "fields", None)
+    if fields is None:
+        return False
+    value = fields.get("isDeleted") if isinstance(fields, dict) else getattr(fields, "isDeleted", None)
+    if isinstance(value, dict):
+        value = value.get("value")
+    else:
+        value = getattr(value, "value", value)
+    try:
+        return bool(int(value or 0))
+    except (TypeError, ValueError):
+        return False
+
+
+def delete_failed(asset_id: str, message: str, kind: str = "error") -> dict[str, Any]:
+    """Fehlschlag beim Loeschen; ``kind`` wie bei ``original_failed``."""
+    return {"type": "delete_failed", "id": asset_id, "kind": kind, "message": message}
+
+
+def upload_failed(path: str, message: str) -> dict[str, Any]:
+    return {"type": "upload_failed", "path": path, "message": message}
+
+
 def master_record_name(record: Any) -> str | None:
     """Name des CPLMaster-Records, auf den ein CPLAsset zeigt."""
     field = (getattr(record, "fields", None) or {}).get("masterRef")
@@ -808,8 +844,9 @@ def run_serve(username: str, cookie_dir: str | None) -> int:
     Fuer Originale auf Abruf: ein Prozessstart samt Anmeldung kostet Sekunden,
     das kann nicht bei jedem geoeffneten Foto anfallen.
 
-    Befehle sind JSON-Zeilen: ``{"cmd": "original", "id": ..., "dest": ...}``
-    und ``{"cmd": "quit"}``.
+    Befehle sind JSON-Zeilen: ``{"cmd": "original", "id": ..., "dest": ...}``,
+    ``{"cmd": "delete", "id": ..., "master": ...}`` (in iCloud nach "Zuletzt
+    geloescht"), ``{"cmd": "upload", "path": ...}`` und ``{"cmd": "quit"}``.
     """
     api = authenticate(username, cookie_dir)
     resolver = AssetResolver(api)
@@ -828,6 +865,12 @@ def run_serve(username: str, cookie_dir: str | None) -> int:
         name = command.get("cmd")
         if name == "quit":
             break
+        if name == "delete":
+            serve_delete(resolver, command)
+            continue
+        if name == "upload":
+            serve_upload(api, command)
+            continue
         if name != "original":
             emit({"type": "error", "kind": "protocol", "message": f"unknown command: {name}"})
             continue
@@ -851,6 +894,51 @@ def run_serve(username: str, cookie_dir: str | None) -> int:
         emit(download_original(asset, Path(dest)))
 
     return EXIT_OK
+
+
+def serve_delete(resolver: AssetResolver, command: dict[str, Any]) -> None:
+    """Loescht ein Foto in iCloud — es liegt danach 30 Tage unter "Zuletzt
+    geloescht", wie beim Loeschen in Photos auf dem iPhone."""
+    asset_id = command.get("id")
+    if not asset_id:
+        emit(delete_failed("", "id fehlt", kind="missing"))
+        return
+    try:
+        asset = resolver.get(asset_id, command.get("master"))
+    except Exception as exc:  # noqa: BLE001 - fremde API
+        emit(delete_failed(asset_id, f"{type(exc).__name__}: {exc}"))
+        return
+    if asset is None:
+        emit(delete_failed(asset_id, "Asset not found", kind="missing"))
+        return
+    try:
+        ok = asset.delete()
+    except Exception as exc:  # noqa: BLE001 - fremde API
+        emit(delete_failed(asset_id, f"{type(exc).__name__}: {exc}"))
+        return
+    # Die cloudkit-Variante gibt nichts zurueck und wirft bei Fehlern; nur ein
+    # ausdrueckliches False ist ein Fehlschlag.
+    if ok is False:
+        emit(delete_failed(asset_id, "iCloud refused the change"))
+        return
+    emit({"type": "photo_deleted", "id": asset_id})
+
+
+def serve_upload(api: Any, command: dict[str, Any]) -> None:
+    """Laedt eine Datei in die Mediathek. Das neue Foto kommt mit dem
+    naechsten Sync samt Vorschau in den Katalog; hier geht es nur um den
+    Upload selbst."""
+    path = command.get("path") or ""
+    if not path or not Path(path).is_file():
+        emit(upload_failed(path, "file not found"))
+        return
+    try:
+        asset = api.photos.upload(path)
+    except Exception as exc:  # noqa: BLE001 - fremde API
+        emit(upload_failed(path, f"{type(exc).__name__}: {exc}"))
+        return
+    # None heisst: angenommen, aber noch nicht indiziert (oder schon da).
+    emit({"type": "uploaded", "path": path, "id": getattr(asset, "id", None)})
 
 
 # Eine Asset-ID, die im ersten Prozess scheitert und im zweiten liefert.
@@ -878,6 +966,20 @@ def run_fake_serve(count: int, needs_password: bool, needs_terms: bool = False) 
         command = json.loads(line)
         if command.get("cmd") == "quit":
             break
+        if command.get("cmd") == "delete":
+            asset_id = command.get("id", "")
+            if asset_id.startswith(("fake-", "demo-")):
+                emit({"type": "photo_deleted", "id": asset_id})
+            else:
+                emit(delete_failed(asset_id, "Asset not found", kind="missing"))
+            continue
+        if command.get("cmd") == "upload":
+            path = command.get("path") or ""
+            if Path(path).is_file():
+                emit({"type": "uploaded", "path": path, "id": None})
+            else:
+                emit(upload_failed(path, "file not found"))
+            continue
         asset_id = command.get("id", "")
         dest = Path(command["dest"])
 

@@ -9,7 +9,8 @@ use chrono::Utc;
 use icloud_photos_cache::{Catalog, enforce_limit};
 use icloud_photos_core::Config;
 use icloud_photos_sync::{
-    Original, Prompts, SecretRequest, SidecarOptions, SidecarSession, SyncError, TermsRequest,
+    Done, Job, Original, Prompts, SecretRequest, SidecarOptions, SidecarSession, SyncError,
+    TermsRequest,
 };
 use tokio::sync::mpsc;
 
@@ -33,6 +34,23 @@ pub enum DownloadMessage {
     TermsRequired(TermsRequest),
     /// Die Eviction hat aufgeräumt; die Cache-Anzeige stimmt nicht mehr.
     CacheChanged,
+    /// In iCloud gelöscht und aus dem Katalog genommen.
+    Deleted {
+        id: String,
+    },
+    DeleteFailed {
+        id: String,
+        message: String,
+    },
+    /// Eine Datei ist in iCloud angekommen; der nächste Sync bringt sie samt
+    /// Vorschau in den Katalog.
+    Uploaded {
+        path: PathBuf,
+    },
+    UploadFailed {
+        path: PathBuf,
+        message: String,
+    },
 }
 
 /// Wozu ein Original geholt wird.
@@ -46,9 +64,10 @@ pub enum Purpose {
     Prefetch,
 }
 
-struct Request {
-    id: String,
-    purpose: Purpose,
+enum Request {
+    Original { id: String, purpose: Purpose },
+    Delete { id: String },
+    Upload { path: PathBuf },
 }
 
 /// Griff auf den Download-Thread.
@@ -68,9 +87,28 @@ impl Downloader {
     }
 
     fn send(&self, id: &str, purpose: Purpose) {
-        let _ = self.requests.send(Request {
+        let _ = self.requests.send(Request::Original {
             id: id.to_string(),
             purpose,
+        });
+    }
+
+    /// Ein zweiter Griff auf denselben Thread (die Warteschlange ist geteilt).
+    pub fn clone_handle(&self) -> Self {
+        Self {
+            requests: self.requests.clone(),
+        }
+    }
+
+    /// Löscht ein Foto in iCloud (dort 30 Tage unter "Zuletzt gelöscht").
+    pub fn delete(&self, id: &str) {
+        let _ = self.requests.send(Request::Delete { id: id.to_string() });
+    }
+
+    /// Lädt eine Datei in die Mediathek.
+    pub fn upload(&self, path: &Path) {
+        let _ = self.requests.send(Request::Upload {
+            path: path.to_path_buf(),
         });
     }
 }
@@ -162,7 +200,61 @@ pub fn spawn(
 
             let mut session: Option<SidecarSession> = None;
 
-            while let Some(Request { id, purpose }) = request_rx.recv().await {
+            while let Some(request) = request_rx.recv().await {
+                let (id, purpose) = match request {
+                    Request::Original { id, purpose } => (id, purpose),
+                    Request::Delete { id } => {
+                        let master = catalog
+                            .get(&id)
+                            .ok()
+                            .flatten()
+                            .and_then(|photo| photo.record.master_id);
+                        let job = Job::Delete {
+                            id: id.clone(),
+                            master,
+                        };
+                        let message = match run_job(&mut session, &options, &prompts, &job).await {
+                            Ok(_) => {
+                                // Gleich aus dem Katalog: der nächste Sync sähe
+                                // die Löschung zwar auch, bis dahin stünde das
+                                // Foto aber noch im Raster.
+                                match catalog.delete_photo(&id) {
+                                    Ok(files) => {
+                                        for file in files {
+                                            let _ = std::fs::remove_file(file);
+                                        }
+                                    }
+                                    Err(error) => tracing::error!(%id, %error, "Geloeschtes Foto bleibt im Katalog"),
+                                }
+                                DownloadMessage::Deleted { id }
+                            }
+                            Err(error) => {
+                                tracing::warn!(%id, %error, "Foto nicht loeschbar");
+                                DownloadMessage::DeleteFailed {
+                                    id,
+                                    message: error.to_string(),
+                                }
+                            }
+                        };
+                        let _ = message_tx.send(message);
+                        continue;
+                    }
+                    Request::Upload { path } => {
+                        let job = Job::Upload { path: path.clone() };
+                        let message = match run_job(&mut session, &options, &prompts, &job).await {
+                            Ok(_) => DownloadMessage::Uploaded { path },
+                            Err(error) => {
+                                tracing::warn!(path = %path.display(), %error, "Upload gescheitert");
+                                DownloadMessage::UploadFailed {
+                                    path,
+                                    message: error.to_string(),
+                                }
+                            }
+                        };
+                        let _ = message_tx.send(message);
+                        continue;
+                    }
+                };
                 let dest = destination(&catalog, &full_res_dir, &id);
                 // Der Master-Record aus dem Katalog spart einen CloudKit-Lookup.
                 let master = catalog
@@ -272,6 +364,27 @@ async fn fetch(
     master: Option<&str>,
     dest: &Path,
 ) -> Result<Original, SyncError> {
+    let job = Job::Original {
+        id: id.to_string(),
+        master: master.map(str::to_string),
+        dest: dest.to_path_buf(),
+    };
+    match run_job(session, options, prompts, &job).await? {
+        Done::Original(original) => Ok(original),
+        _ => Err(SyncError::UnexpectedExit("falsche Antwort".into())),
+    }
+}
+
+/// Führt einen Auftrag aus und setzt bei einem Fehlschlag einmal mit frischer
+/// Anmeldung neu auf (siehe `fetch`). Gilt auch fürs Löschen und Hochladen:
+/// beide sind wiederholbar — ein zweites Löschen desselben Fotos ändert
+/// nichts, und eine Datei, die iCloud schon hat, kommt als Duplikat zurück.
+async fn run_job(
+    session: &mut Option<SidecarSession>,
+    options: &SidecarOptions,
+    prompts: &Prompts,
+    job: &Job,
+) -> Result<Done, SyncError> {
     let mut last: Option<SyncError> = None;
 
     for attempt in 1..=ATTEMPTS {
@@ -294,17 +407,17 @@ async fn fetch(
         let Some(active) = session.as_mut() else {
             continue;
         };
-        match active.fetch_original(id, master, dest).await {
-            Ok(original) => return Ok(original),
+        match active.run(job).await {
+            Ok(done) => return Ok(done),
             Err(error) => {
                 if is_final(&error) {
                     return Err(error);
                 }
                 tracing::warn!(
-                    %id,
+                    ?job,
                     %error,
                     attempt,
-                    "Original nicht ladbar — Sitzung wird erneuert"
+                    "Auftrag gescheitert — Sitzung wird erneuert"
                 );
                 // Die Sitzung kann abgelaufen oder tot sein; sie wegzuwerfen
                 // ist der einzige Weg, das von hier aus herauszufinden.

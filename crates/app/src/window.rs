@@ -1476,6 +1476,7 @@ fn start_downloader(
     let stack = stack.clone();
     let window = window.clone();
     let toasts = toasts.clone();
+    TOASTS.with_borrow_mut(|slot| *slot = Some(toasts.clone()));
 
     glib::spawn_future_local(async move {
         while let Some(message) = messages.recv().await {
@@ -1489,6 +1490,51 @@ fn start_downloader(
                     tracing::warn!(%id, %message, "Original nicht ladbar");
                     state.deliver_failure(&id);
                     advance_job(&state, &window, &status, &toasts);
+                }
+                DownloadMessage::Deleted { id } => {
+                    tracing::info!(%id, "in iCloud geloescht");
+                    state.sync_model();
+                    update_status(&state, &status, &stack);
+                    let (pending, done) = DELETES.get();
+                    let (pending, done) = (pending.saturating_sub(1), done + 1);
+                    DELETES.set((pending, done));
+                    if pending == 0 {
+                        DELETES.set((0, 0));
+                        toast(&format!("Deleted {}", photos_word(done)));
+                    }
+                }
+                DownloadMessage::DeleteFailed { id, message } => {
+                    tracing::warn!(%id, %message, "Loeschen gescheitert");
+                    let (pending, done) = DELETES.get();
+                    DELETES.set((pending.saturating_sub(1), done));
+                    toast(&format!("A photo couldn’t be deleted: {message}"));
+                }
+                DownloadMessage::Uploaded { path } => {
+                    tracing::info!(path = %path.display(), "hochgeladen");
+                    let (pending, done) = UPLOADS.get();
+                    let (pending, done) = (pending.saturating_sub(1), done + 1);
+                    UPLOADS.set((pending, done));
+                    if pending == 0 {
+                        UPLOADS.set((0, 0));
+                        toast(&format!("Added {}", photos_word(done)));
+                        // Der Sync bringt die neuen Fotos samt Vorschau.
+                        let _ = WidgetExt::activate_action(&window, "photos.sync", None);
+                    }
+                }
+                DownloadMessage::UploadFailed { path, message } => {
+                    tracing::warn!(path = %path.display(), %message, "Upload gescheitert");
+                    let (pending, done) = UPLOADS.get();
+                    let pending = pending.saturating_sub(1);
+                    UPLOADS.set((pending, done));
+                    let name = path
+                        .file_name()
+                        .map(|n| n.to_string_lossy().into_owned())
+                        .unwrap_or_default();
+                    toast(&format!("“{name}” couldn’t be added: {message}"));
+                    if pending == 0 && done > 0 {
+                        UPLOADS.set((0, 0));
+                        let _ = WidgetExt::activate_action(&window, "photos.sync", None);
+                    }
                 }
                 DownloadMessage::CacheChanged => {
                     // Die Belegung in der Kopfzeile stimmt nach einer Eviction
@@ -2408,6 +2454,132 @@ fn jump_to(state: &Rc<AppState>, grid: &gtk::GridView, offset: u64) {
 }
 
 // ---------------------------------------------------------------------------
+// Löschen und Hinzufügen
+// ---------------------------------------------------------------------------
+
+thread_local! {
+    /// Wohin Meldungen über Löschen und Hochladen gehen.
+    static TOASTS: RefCell<Option<adw::ToastOverlay>> = const { RefCell::new(None) };
+    /// Laufende Aufträge und was davon geklappt hat — für eine Meldung pro
+    /// Stapel statt einer pro Foto.
+    static DELETES: Cell<(u32, u32)> = const { Cell::new((0, 0)) };
+    static UPLOADS: Cell<(u32, u32)> = const { Cell::new((0, 0)) };
+}
+
+fn toast(text: &str) {
+    TOASTS.with_borrow(|toasts| {
+        if let Some(toasts) = toasts {
+            toasts.add_toast(adw::Toast::new(text));
+        }
+    });
+}
+
+fn photos_word(n: u32) -> String {
+    if n == 1 {
+        "1 photo".into()
+    } else {
+        format!("{} photos", thousands(n as u64))
+    }
+}
+
+/// Fragt nach und löscht dann in iCloud. Wie in Photos: das Foto verschwindet
+/// auf allen Geräten und liegt 30 Tage unter „Zuletzt gelöscht". `confirmed`
+/// läuft nach dem Ja, bevor die Aufträge rausgehen (der Betrachter schließt).
+pub fn delete_photos(
+    state: &Rc<AppState>,
+    parent: &impl IsA<gtk::Widget>,
+    ids: Vec<String>,
+    confirmed: impl FnOnce() + 'static,
+) {
+    if ids.is_empty() {
+        return;
+    }
+    let n = ids.len() as u32;
+    let (heading, body) = if n == 1 {
+        (
+            "Delete Photo?".to_string(),
+            "This photo will be deleted from iCloud Photos on all your devices. \
+             It stays in Recently Deleted for 30 days."
+                .to_string(),
+        )
+    } else {
+        (
+            format!("Delete {}?", photos_word(n).replace("photos", "Photos")),
+            "These photos will be deleted from iCloud Photos on all your devices. \
+             They stay in Recently Deleted for 30 days."
+                .to_string(),
+        )
+    };
+    let dialog = adw::AlertDialog::new(Some(&heading), Some(&body));
+    dialog.add_response("cancel", "Cancel");
+    dialog.add_response("delete", "Delete");
+    dialog.set_response_appearance("delete", adw::ResponseAppearance::Destructive);
+    dialog.set_default_response(Some("cancel"));
+    dialog.set_close_response("cancel");
+    let state = state.clone();
+    let parent = parent.as_ref().clone();
+    glib::spawn_future_local(async move {
+        if dialog.choose_future(Some(&parent)).await != "delete" {
+            return;
+        }
+        confirmed();
+        let Some(downloader) = state.downloader.borrow().as_ref().map(|d| d.clone_handle()) else {
+            return;
+        };
+        let (pending, done) = DELETES.get();
+        DELETES.set((pending + n, done));
+        for id in &ids {
+            downloader.delete(id);
+        }
+    });
+}
+
+/// Lädt Dateien in die Mediathek; danach holt ein Sync sie samt Vorschau.
+pub fn upload_files(state: &Rc<AppState>, files: Vec<std::path::PathBuf>) {
+    let files: Vec<_> = files.into_iter().filter(|f| f.is_file()).collect();
+    if files.is_empty() {
+        return;
+    }
+    let Some(downloader) = state.downloader.borrow().as_ref().map(|d| d.clone_handle()) else {
+        return;
+    };
+    let n = files.len() as u32;
+    let (pending, done) = UPLOADS.get();
+    UPLOADS.set((pending + n, done));
+    toast(&format!("Adding {}…", photos_word(n)));
+    for file in &files {
+        downloader.upload(file);
+    }
+}
+
+/// Dateiauswahl für Fotos und Videos.
+fn choose_uploads(state: &Rc<AppState>, window: &adw::ApplicationWindow) {
+    let filter = gtk::FileFilter::new();
+    filter.set_name(Some("Photos and Videos"));
+    filter.add_mime_type("image/*");
+    filter.add_mime_type("video/*");
+    let filters = gio::ListStore::new::<gtk::FileFilter>();
+    filters.append(&filter);
+    let dialog = gtk::FileDialog::builder()
+        .title("Add to iCloud Photos")
+        .accept_label("Add")
+        .filters(&filters)
+        .default_filter(&filter)
+        .build();
+    let state = state.clone();
+    dialog.open_multiple(Some(window), gio::Cancellable::NONE, move |result| {
+        let Ok(list) = result else {
+            return;
+        };
+        let files = (0..list.n_items())
+            .filter_map(|i| list.item(i).and_downcast::<gio::File>())
+            .filter_map(|file| file.path())
+            .collect();
+        upload_files(&state, files);
+    });
+}
+
+// ---------------------------------------------------------------------------
 // Auswahl: sichern, kopieren, öffnen
 // ---------------------------------------------------------------------------
 
@@ -2436,13 +2608,24 @@ fn build_selection_actions(
         .tooltip_text("Open in Default App")
         .sensitive(false)
         .build();
+    let delete = gtk::Button::builder()
+        .icon_name("user-trash-symbolic")
+        .tooltip_text("Delete Selection (Del)")
+        .sensitive(false)
+        .build();
+    let add = gtk::Button::builder()
+        .icon_name("list-add-symbolic")
+        .tooltip_text("Add Photos… (Ctrl+Shift+I)")
+        .build();
 
     let actions = gtk::Box::new(gtk::Orientation::Horizontal, 0);
     actions.add_css_class("linked");
     for button in [&save, &copy, &open] {
         actions.append(button);
     }
+    header.pack_end(&delete);
     header.pack_end(&actions);
+    header.pack_end(&add);
 
     // Die Aktionsstelle: der Betrachter greift über sie auf dieselbe
     // Warteschlange zu wie das Raster.
@@ -2487,15 +2670,69 @@ fn build_selection_actions(
         }
     }
 
+    // Löschen (Entf) mit Rückfrage, Hinzufügen (Strg+Umschalt+I) über die
+    // Dateiauswahl — wie „Import" in Photos.
+    let delete_action = gio::SimpleAction::new("delete", None);
+    delete_action.connect_activate({
+        let state = state.clone();
+        let grid = grid.clone();
+        let window = window.clone();
+        move |_, _| {
+            let ids = selected_items(&grid)
+                .into_iter()
+                .map(|item| item.id)
+                .collect();
+            delete_photos(&state, &window, ids, || {});
+        }
+    });
+    group.add_action(&delete_action);
+    delete.connect_clicked({
+        let entry = delete_action.clone();
+        move |_| entry.activate(None)
+    });
+    let add_action = gio::SimpleAction::new("add", None);
+    add_action.connect_activate({
+        let state = state.clone();
+        let window = window.clone();
+        move |_, _| choose_uploads(&state, &window)
+    });
+    group.add_action(&add_action);
+    add.connect_clicked({
+        let entry = add_action.clone();
+        move |_| entry.activate(None)
+    });
+    if let Some(app) = window.application() {
+        app.set_accels_for_action("photos.delete", &["Delete"]);
+        app.set_accels_for_action("photos.add", &["<Control><Shift>i"]);
+    }
+
+    // Dateien ins Fenster ziehen fügt sie hinzu.
+    let drop = gtk::DropTarget::new(gdk::FileList::static_type(), gdk::DragAction::COPY);
+    drop.connect_drop({
+        let state = state.clone();
+        move |_, value, _, _| {
+            let Ok(list) = value.get::<gdk::FileList>() else {
+                return false;
+            };
+            let files: Vec<_> = list.files().iter().filter_map(|file| file.path()).collect();
+            let any = !files.is_empty();
+            upload_files(&state, files);
+            any
+        }
+    });
+    window.add_controller(drop);
+
     // Ohne Auswahl gibt es nichts zu sichern.
     if let Some(model) = grid.model() {
         model.connect_selection_changed({
+            let delete = delete.clone();
             let save = save.clone();
             let copy = copy.clone();
             let open = open.clone();
             let grid = grid.clone();
             move |_, _, _| {
                 let count = selected_items(&grid).len();
+                delete.set_sensitive(count > 0);
                 save.set_sensitive(count > 0);
                 copy.set_sensitive(count > 0);
                 // Mehrere Fotos gleichzeitig zu öffnen ergibt keinen Sinn.

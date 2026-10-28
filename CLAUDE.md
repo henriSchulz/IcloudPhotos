@@ -18,8 +18,9 @@ Alben samt Seitenleiste und Collections, Karte, Start über den Launcher.
 - [x] Periodischer Metadaten-Sync (kein Bulk-Download aller Originale)
 - [x] Thumbnail-first UI, Full-Res on demand
 - [x] Konfigurierbares Full-Res-Cache-Limit in GB mit LRU-Eviction
-- [ ] Explizit NICHT in v1: Schreibzugriff, Shared Albums, Live Photos/Videos,
-      Multi-Account
+- [ ] Explizit NICHT in v1: Shared Albums, Live Photos/Videos, Multi-Account
+- [x] Schreibzugriff seit 2026-10-28 (Henris Wunsch): Fotos löschen und
+      hinzufügen — siehe „Löschen und Hinzufügen". Sonst bleibt alles lesend.
 
 ## Tech-Stack
 
@@ -905,6 +906,31 @@ Verzeichnisse schreibt.
 - Commit-Messages: konventionell (`feat:`, `fix:`, `refactor:`, ...)
 - Keine Secrets (iCloud-Passwort, Session-Cookies) ins Repo — gehören in
   Keyring bzw. `config.toml` (in `.gitignore`)
+
+## Löschen und Hinzufügen
+
+Beides läuft über den dauerhaften `--serve`-Sidecar (Befehle `delete` und
+`upload`, Antworten `photo_deleted`/`delete_failed` und
+`uploaded`/`upload_failed`), in derselben Warteschlange wie die Originale
+(`downloader.rs`, `Job::Delete`/`Job::Upload`, mit demselben zweiten Anlauf
+über eine frische Anmeldung — beide Aufträge sind wiederholbar).
+
+- **Löschen** (Papierkorb in der Kopfzeile, Entf, im Betrachter ⋮ → Delete…
+  oder Entf) fragt immer nach (`window::delete_photos`). In iCloud setzt es
+  `isDeleted`: das Foto verschwindet auf allen Geräten und liegt 30 Tage unter
+  „Zuletzt gelöscht". Danach sofort raus aus Katalog und Raster
+  (`Catalog::delete_photo`), nicht erst beim nächsten Sync.
+- **Gelöscht kommt im Delta als Änderung an, nicht als Tombstone.**
+  `run_changes` prüft deshalb `is_deleted(asset)` und meldet `deleted` —
+  sonst holte der nächste Sync jedes anderswo gelöschte Foto zurück.
+- **Hinzufügen** (+ in der Kopfzeile, Strg+Umschalt+I, Dateien ins Fenster
+  ziehen) lädt per `api.photos.upload(path)`. Ins Raster kommen die Fotos erst
+  mit dem Sync, den das Ende eines Stapels anstößt — iCloud indiziert ein
+  hochgeladenes Asset nicht sofort, und so kommt die Vorschau gleich mit.
+  Eine Datei, die iCloud schon kennt, gilt als hochgeladen (Duplikat).
+
+Gegen die echte API zuerst mit einem Wegwerf-Foto prüfen, nicht mit einem
+echten: Löschen wirkt auf allen Geräten.
 
 ## Ein Foto von außen öffnen (`--open <id>`)
 

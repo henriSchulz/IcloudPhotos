@@ -157,6 +157,9 @@ pub fn open(
     menu.append(Some("Export…"), Some("viewer.save"));
     menu.append(Some("Copy"), Some("viewer.copy"));
     menu.append(Some("Open With…"), Some("viewer.open"));
+    let danger = gio::Menu::new();
+    danger.append(Some("Delete…"), Some("viewer.delete"));
+    menu.append_section(None, &danger);
     let menu_button = gtk::MenuButton::builder()
         .icon_name("view-more-symbolic")
         .menu_model(&menu)
@@ -737,6 +740,10 @@ fn connect_keys(viewer: &Rc<Viewer>) {
                 gdk::Key::_1 | gdk::Key::KP_1 => viewer.picture.actual_size(None),
                 gdk::Key::f | gdk::Key::F11 => viewer.toggle_fullscreen(),
                 gdk::Key::i | gdk::Key::I => viewer.toggle_info(),
+                // Vor dem Kürzel des Rasters: im Betrachter gilt das offene Foto.
+                gdk::Key::Delete | gdk::Key::KP_Delete => {
+                    let _ = WidgetExt::activate_action(&viewer.page, "viewer.delete", None);
+                }
                 gdk::Key::Escape => {
                     // Erst was über dem Foto liegt, dann das Vollbild, dann
                     // zurueck ins Raster — sonst waere das Foto weg, bevor man
@@ -782,6 +789,25 @@ fn connect_actions(viewer: &Rc<Viewer>, group: &gio::SimpleActionGroup) {
         });
         group.add_action(&entry);
     }
+
+    // Löschen: nachfragen, dann zurück ins Raster und in iCloud löschen.
+    let delete = gio::SimpleAction::new("delete", None);
+    delete.connect_activate({
+        let weak = Rc::downgrade(viewer);
+        move |_, _| {
+            with(&weak, |viewer| {
+                let Some(item) = viewer.item() else {
+                    return;
+                };
+                let close = {
+                    let weak = weak.clone();
+                    move || with(&weak, |viewer| viewer.close())
+                };
+                crate::window::delete_photos(&viewer.state, &viewer.window, vec![item.id], close);
+            });
+        }
+    });
+    group.add_action(&delete);
 }
 
 /// Erklaert, warum ein Video nicht laeuft.

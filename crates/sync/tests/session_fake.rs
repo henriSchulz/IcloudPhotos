@@ -4,7 +4,9 @@ use std::path::PathBuf;
 
 use icloud_photos_cache::{Catalog, enforce_limit};
 use icloud_photos_core::config::Cache as CacheConfig;
-use icloud_photos_sync::{Prompts, SecretRequest, SidecarOptions, SidecarSession, SyncError};
+use icloud_photos_sync::{
+    Done, Job, Prompts, SecretRequest, SidecarOptions, SidecarSession, SyncError,
+};
 use tokio::sync::mpsc;
 
 fn script() -> PathBuf {
@@ -184,4 +186,59 @@ async fn downloads_fill_the_cache_until_eviction_kicks_in() {
     // Die zuerst geladenen Originale fliegen zuerst — echtes LRU.
     assert!(!paths[0].is_file());
     assert!(paths[5].is_file(), "das zuletzt benutzte bleibt");
+}
+
+#[tokio::test]
+async fn deletes_and_uploads_through_the_same_process() {
+    let python = python_or_skip!();
+    let dir = tempfile::tempdir().unwrap();
+    let mut session = SidecarSession::start(&options(&python, 10), &Prompts::default())
+        .await
+        .unwrap();
+
+    let done = session
+        .run(&Job::Delete {
+            id: "fake-00001".into(),
+            master: None,
+        })
+        .await
+        .unwrap();
+    assert_eq!(done, Done::Deleted);
+
+    // Unbekanntes Foto: endgültig, kein zweiter Anlauf.
+    match session
+        .run(&Job::Delete {
+            id: "nope".into(),
+            master: None,
+        })
+        .await
+    {
+        Err(SyncError::Sidecar { kind, .. }) => assert_eq!(kind, "missing"),
+        other => panic!("erwartet missing, bekam {other:?}"),
+    }
+
+    let file = dir.path().join("IMG_0001.JPG");
+    std::fs::write(&file, b"jpeg").unwrap();
+    let done = session.run(&Job::Upload { path: file }).await.unwrap();
+    assert_eq!(done, Done::Uploaded { id: None });
+
+    // Eine fehlende Datei ist ein Fehlschlag, kein Hänger.
+    assert!(
+        session
+            .run(&Job::Upload {
+                path: dir.path().join("missing.jpg"),
+            })
+            .await
+            .is_err()
+    );
+
+    // Und danach liefert derselbe Prozess weiter Originale.
+    let dest = dir.path().join("fake-00002.png");
+    assert!(
+        session
+            .fetch_original("fake-00002", None, &dest)
+            .await
+            .is_ok()
+    );
+    session.shutdown().await;
 }

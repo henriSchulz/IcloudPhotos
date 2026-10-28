@@ -6,7 +6,7 @@ pub mod session;
 pub mod sidecar;
 
 pub use protocol::{SidecarMessage, SyncEvent};
-pub use session::{Original, SidecarSession};
+pub use session::{Done, Job, Original, SidecarSession};
 pub use sidecar::{
     Prompts, RECONCILE_AFTER, SecretRequest, SidecarOptions, SyncSummary, TermsRequest, run_sync,
 };
