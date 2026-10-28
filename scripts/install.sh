@@ -76,14 +76,21 @@ if [[ -f $config/icon.svg ]]; then
     rm -f "$png_dir/$APP_ID.png"
     echo "Eigenes Icon: $config/icon.svg"
 elif [[ -f $config/icon.png ]]; then
-    # Das Symbol aus scalable/ gewönne sonst gegen die Rastergrafik.
-    rm -f "$icon_dir/$APP_ID.svg"
-    mkdir -p "$png_dir"
+    mkdir -p "$png_dir" "$icon_dir"
     if command -v magick >/dev/null; then
         magick "$config/icon.png" -resize 512x512 "$png_dir/$APP_ID.png"
     else
         install -m 0644 "$config/icon.png" "$png_dir/$APP_ID.png"
     fi
+    # Ein SVG in scalable/ gewinnt gegen jede Rastergrafik — auch das des
+    # Arch-Pakets unter /usr/share. Deshalb dieselbe Grafik als SVG-Hülle
+    # hier ablegen; sie verdeckt das System-Symbol.
+    {
+        printf '<svg xmlns="http://www.w3.org/2000/svg" xmlns:xlink="http://www.w3.org/1999/xlink" width="512" height="512" viewBox="0 0 512 512">'
+        printf '<image width="512" height="512" xlink:href="data:image/png;base64,'
+        base64 -w0 "$png_dir/$APP_ID.png"
+        printf '"/></svg>\n'
+    } > "$icon_dir/$APP_ID.svg"
     echo "Eigenes Icon: $config/icon.png"
 else
     install -D -m 0644 "$repo/data/icons/$APP_ID.svg" "$icon_dir/$APP_ID.svg"
