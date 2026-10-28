@@ -725,9 +725,12 @@ Strg+J gibt es, weil `GtkGridView` die Tabulatortaste für seine Kacheln behält
 - [x] **Betrachter, Raster und Aktionen aus Phase 2** — siehe „Bedienung".
       Sortierung nach Aufnahmedatum (Schema 4), Blättern/Zoom/Vollbild,
       Videowiedergabe, Mehrfachauswahl, Sichern/Kopieren/Öffnen.
-- [ ] `change_unresolved` beobachten: welche `record_type`-Werte in der Zone
-      auftauchen, die kein Asset sind. Bislang nur gegen den Fake-Sidecar
-      geprüft, nicht gegen die echte API.
+- [x] `change_unresolved` beobachtet (2026-10-28, echte API): neben
+      `CPLAsset` kommen `CPLMaster` und `CPLLibraryInfo`. `run_changes` schlägt
+      nur `CPLAsset` nach, und zwar über `AssetResolver` ohne Album-Rückfall —
+      `photos.all.get` lief für jeden Master die ganze Bibliothek durch, ein
+      Delta mit 55 neuen Fotos hing Stunden und der Album-Lauf danach kam nie
+      (Katalog: 0 Alben). Jetzt 17 s.
 - [x] **Abgelaufene Sitzung beim Full-Res-Download.** Der `--serve`-Prozess
       lebt so lange wie die App; lief seine Sitzung ab, meldete Apple das als
       gewöhnlichen Fehlschlag, und die tote Sitzung blieb stehen — ab da

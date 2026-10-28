@@ -547,8 +547,14 @@ def run_changes(api: Any, thumbs: Path | None, since_token: str) -> int:
     """Nur die Aenderungen seit ``since_token`` — der Normalfall.
 
     Kosten haengen an der Zahl der Aenderungen, nicht an der Bibliotheksgroesse.
+
+    Aufgeloest wird ueber ``AssetResolver`` ohne Album-Rueckfall, nicht ueber
+    ``photos.all.get``: das laeuft bei jedem Record, den seine Abfrage nicht
+    findet, die ganze Bibliothek durch (~15 s bei 19.600 Fotos). Ein Delta mit
+    55 neuen Fotos und ihren Master-Records hing so am 2026-10-28 ueber sieben
+    Stunden — und mit ihm der Album-Lauf, der erst danach kommt.
     """
-    album = api.photos.all
+    resolver = AssetResolver(api, album_fallback=False)
     count = 0
     for event in api.photos.iter_changes(since=since_token):
         record_name = event.record_name
@@ -565,8 +571,21 @@ def run_changes(api: Any, thumbs: Path | None, since_token: str) -> int:
             count += 1
             continue
 
+        # Nur CPLAsset ist ein Foto. Masters, Alben und Hilfsrecords kommen
+        # mit, kosten aber keinen Lookup.
+        if event.record_type and event.record_type != "CPLAsset":
+            emit(
+                {
+                    "type": "change_unresolved",
+                    "id": record_name,
+                    "record_type": event.record_type,
+                    "message": "not an asset",
+                }
+            )
+            continue
+
         try:
-            asset = album.get(record_name)
+            asset = resolver.get(record_name)
         except Exception as exc:  # noqa: BLE001 - fremde API
             emit(
                 {
