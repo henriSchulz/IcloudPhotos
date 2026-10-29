@@ -338,8 +338,9 @@ bei jedem Sync anfallen:
 
 Die Seitenleiste steckt in einer `AdwOverlaySplitView`, nicht in einer
 `NavigationSplitView` — nur jene lässt sich auch im breiten Fenster
-ausblenden (Knopf ganz links in der Kopfzeile, F9). Unter 600 sp legt sie sich
-über den Inhalt und schließt nach einer Wahl von selbst.
+ausblenden (F9, ⋯ → Show Sidebar). Unter `drawerBelow` (620 px) legt sie sich
+über den Inhalt (Knopf neben dem Titel) und schließt nach einer Wahl von
+selbst; darüber bis `railBelow` (900 px) zeigt sie nur Symbole.
 
 Die Seitenleiste (`crates/app/src/sidebar.rs`) ist aufgebaut wie in Photos:
 Library, Collections, dann „Pinned" (Favorites, Map, Videos), „Albums" als Baum
@@ -355,8 +356,11 @@ bekommt bewusst keinen — nur so liest SQLite ihre Seiten direkt aus
 `idx_photos_capture`. Skelette gibt es nur in der Bibliothek; in einem Album
 weiß niemand, wie viele Fotos noch hinein gehören.
 
-Was rechts neben der Seitenleiste steht, hält `AppState::content` (`Grid`,
-`Collections`, `Map`) — früher ein einzelner Merker `showing_collections`.
+Was rechts neben der Seitenleiste steht, hält `AppState::content` (`Home`,
+`Grid`, `Years`, `Months`, `Collections`, `Map`) — früher ein einzelner Merker
+`showing_collections`. Ein fester Ausschnitt (`Scope::Photos`) trägt in
+`AppState::subset` dazu, was er ist (Kartenstelle, Suche, ein Tag) — davon
+hängt der Kopf ab.
 
 ## Karte
 
@@ -746,7 +750,7 @@ Strg+J gibt es, weil `GtkGridView` die Tabulatortaste für seine Kacheln behält
       am `PhotoAsset` (das hat keins). Siehe „Alben".
 - [x] Alben-Seitenleiste — siehe „Alben".
 - [x] Info-Panel mit EXIF — siehe „Bedienung".
-- [ ] Suche
+- [x] Suche — Dateiname, bekannter Ortsname, Monat, Jahr (siehe „Home")
 - [x] Karte mit gruppierten Aufnahmeorten — siehe „Karte".
 - [ ] Karte: Gruppen über die Datumsgrenze (180°) hinweg werden nicht
       verschmolzen, und „Collections" zeigt die Karte noch nicht als Karte
@@ -820,8 +824,8 @@ python3 -m venv .venv && .venv/bin/pip install -r sidecar/requirements.txt
 # Tests (brauchen nur python3, kein Apple-Konto)
 cargo test --workspace
 
-# UI ohne Apple-Konto ausprobieren: erzeugt 240 Fotos mit Thumbnails,
-# zwei Drittel davon mit Ort in vier Städten (für die Karte)
+# UI ohne Apple-Konto ausprobieren: eine kleine Bibliothek mit Tagen, Orten,
+# Videos, Favoriten und Alben (siehe „Home und Rahmen"); synchronisiert nicht
 cargo run -p icloud-photos-app -- --demo
 
 # Sync gegen synthetische Daten statt iCloud — erzeugt echte Thumbnail-Dateien
@@ -949,6 +953,95 @@ Bild, das es gerade zeigt. Die ID ist `photos.id` aus `catalog.sqlite`.
   Ausschnitt ein, lädt das Raster bis dorthin nach (wie der Monatssprung) und
   öffnet den Betrachter; `window.present()` holt das Fenster nach vorn
   (Hyprland: `misc.focus_on_activate`).
+
+## Home und Rahmen (Vorschlag A des Velum-Labs)
+
+Seit 2026-10-29 (Branch `home`) folgt die App Vorschlag A von
+`~/Projects/velum/lab/web/photos.html` (`?p=a`): eine Startseite aus Karten wie
+System Settings und Finder, dann die Bibliothek; Opal als Vorgabe.
+
+- **Kein `AdwHeaderBar` mehr in der Bibliothek.** Jede Seite hat einen Kopf
+  (`chrome::PageHead`, ein `GtkWindowHandle`): Brotkrume, großer Titel,
+  Unterzeile, rechts ein Knopfsatz je Seite (`home`, `library`, `album`,
+  `simple`, `select`) und die Fensterknöpfe (im Tablet-Modus weg). Den Kopf
+  schreibt `AppState::refresh_head`, aufgerufen aus `update_page` — einmal pro
+  Zustandswechsel, nicht verstreut. Fortschritt eines Auftrags steht klein im
+  Bibliothekskopf (`job-status`).
+- **Seitenleiste**: Suche oben, Home, Library (mit Zahl), Collections, Pinned,
+  Albums (eigene Alben mit Titelbild, `RatioBox::fixed`), Media Types, unten
+  die Sync-Zeile (`chrome::SyncRow`, Stand aus `SyncManager::connect_status`;
+  Klick = Manager, Knopf = Sync Now). Akzentstrich links an der Wahl.
+- **Umbrüche** aus Velum `surface.photos` (Fensterbreite): unter `railBelow`
+  (900) nur Symbole (`Sidebar::set_rail`, die Suche wird ein Knopf mit
+  Popover, Ordner öffnen sich in Collections), unter `drawerBelow` (620) eine
+  Schublade über der Seite (Knopf neben dem Titel, Scrim). Die Seite selbst hat
+  eine `AdwBreakpointBin` (`compactBelow` 640): kleinerer Kopf, Knöpfe unter
+  dem Titel (`PageHead::set_compact`). Breiten gibt das Stylesheet vor
+  (`.photos-sidebar` min-width), die `OverlaySplitView` hat Anteil 0.
+- **Home** (`home.rs`, Daten aus `cache/src/home.rs`): On This Day
+  (`Catalog::on_this_day` — jüngstes frühere Jahr, Tag am nächsten an heute,
+  ±`onThisDayWindow` Tage, lokale Kalendertage; wie `velum-photo-picks`, nur aus
+  den Vorschauen), Recent Days (`recent_days`, läuft rückwärts durch den Index),
+  iCloud (Sync-Stand, „vor N Min.", Fotos hier, „in iCloud" nur wenn ein
+  Erstaufbau es gemeldet hat, Originale-Cache mit Balken, Sync Now/Details —
+  **kein iCloud-Speicher**, den kennt die App nicht), Add Photos, Pinned
+  (Favorites-Album, Fotos mit Ort, Videos), Albums der obersten Ebene, Media
+  Types. Zwei Spalten ab `twoColumnsFrom` (`layout::Columns`). Ein Foto öffnet
+  den Betrachter der Bibliothek; Zurück führt nach Home (`home_return`), der
+  Knopf heißt dann „Photos". „Show All" und ein Tagesname zeigen den Tag als
+  Ausschnitt.
+- **Bibliothek**: Years · Months · All im Kopf (`overview.rs`, aus
+  `month_groups`; ein Klick springt im Raster dorthin). „Days" aus dem Lab
+  fehlt: `GtkGridView` hat keine Abschnittsköpfe. Fuge 2 px, Auswahlring 3 px
+  innen.
+- **Auswahlmodus** (Select im Kopf, „Select Photos" im ⋯-Menü, Esc/Done
+  beendet): ein Klick nimmt ein Foto dazu oder heraus, Umschalt bis zum
+  letzten (`GestureClick` in der Erfassungsphase je Kachel). Ringe oben rechts
+  (`gridview.selecting`). Die schwebende Aktionsleiste (Export, Copy, Open,
+  Retouch, Delete) steht im Modus und bei ≥ 2 gewählten Fotos.
+- **Kontextmenü** (Rechtsklick auf eine Kachel; wählt sie, wenn sie es noch
+  nicht ist): oben eine Reihe großer Knöpfe (Export, Copy, Info, Delete —
+  `PopoverMenu` mit `custom`-Eintrag), darunter Open, Open in Default App, Edit
+  in Retouch, Show Info, Select, Export As…. Öffnet ohne Übergang.
+- **Alben/Karte/Suche/Tag** bekommen eine Brotkrume zurück (Albums bzw. der
+  Ordner, Pinned, Map, Photos) und eine Unterzeile aus `Catalog::summary_in`
+  („62 photos · 4 videos · October 10 – 12, 2026").
+- **Suche** (`Catalog::search_ids`): jedes Wort muss treffen — Dateiname,
+  bekannter Ortsname (nur geöffnete Fotos haben einen), Monatsname, Jahr.
+  Ergebnis als `Scope::Photos`, höchstens 5.000.
+- **Betrachter**: Zurück mit dem Namen der Herkunft, ‹ ›, Titel mittig, rechts
+  Retouch, Export, ⋯, Info, Vollbild. Das Foto auf einer gerundeten Bühne
+  (`.photos-stage`), Info als Karte rechts (290 px) mit eigenem Schließen;
+  unter `compactBelow` ein Sheet unten über dem Foto (höchstens `sheetShare`
+  der Höhe) — die Karte wandert dafür aus der Teilung ins Overlay
+  (`Viewer::set_narrow`). Das Info-Panel zeigt Angaben als Zeilen
+  Bezeichnung … Wert (`info_panel::Fact`) statt Adw-Zeilen.
+- **Edit in Retouch** (`retouch.rs`; Kontextmenü, Aktionsleiste, Betrachter,
+  `E`): erst die Originale über denselben Auftragsweg wie Sichern laden, dann
+  Retouchs Server sicherstellen (wie `bin/foto`, ohne Fenster), je Foto `POST
+  /api/icloud/import`, dann `bin/foto` fürs Fenster. Ohne `~/Projects/foto-app`
+  fehlt der Eintrag. `ICLOUD_PHOTOS_RETOUCH=<prog>` ersetzt den Weg (bekommt die
+  IDs; Prüfstand).
+- **Favorit setzen gibt es nicht**: das Lab zeigt einen Stern-Knopf, dafür
+  müsste die App in iCloud schreiben (`isFavorite`) — nicht ohne Henris Ja.
+
+Geometrie, die keine Velum-Rolle ist, steht in Velum als `surface.photos`
+(`tokens/surfaces/photos.tokens.json`): das Stylesheet liest `--v-photos-*` aus
+`dist/gtk4`, Rust liest Umbrüche und Zahlen über `velum::photos(name,
+fallback)` aus `qml/Velum/Tokens.js` (wie die Federn; `VELUM_HOME` zeigt im
+Prüfstand auf einen Worktree). Die Rückfallwerte im Code sind dieselben Zahlen.
+
+**Prüfstand** (`~/.cache/photos-home-work/rig/run.sh`, nicht im Repo): nested
+Hyprland aus dem Velum-Worktree (`lab/rig/rig.sh start`), darin der
+Headless-Ausgang `SHOT` in genau der Fenstergröße, eigene XDG-Verzeichnisse,
+eigener D-Bus, `--demo`. `ICLOUD_PHOTOS_SHOW=library|years|months|album[:id]|
+map|collections|search:WORT|library,select|library,menu|sync|viewer|info|nav`
+stellt einen Zustand ohne Maus her (`show_for_rig`); `ICLOUD_PHOTOS_OFFLINE=1`
+schickt nichts ins Netz (kein Nominatim, Karte ohne Kacheln). Klicks mit
+`~/Projects/velum/shell/henri.launchpad-v3/tests/vptr/vptr SHOT W H …`.
+`--demo` synchronisiert nicht von selbst und baut eine echte Bibliothek nach
+(Tage, Reise, derselbe Tag im Vorjahr, Videos, Favoriten, Alben samt Ordner,
+Bildschirmfotos, benannte Orte).
 
 ## Velum-Optik
 
