@@ -3,12 +3,14 @@
 pub mod albums;
 pub mod db;
 pub mod evict;
+pub mod home;
 pub mod housekeeping;
 pub mod located;
 
 pub use albums::{Album, AlbumContent, Scope};
 pub use db::{Catalog, DateGroup, SyncState, place_cell};
 pub use evict::{EvictionReport, enforce_limit};
+pub use home::{Day, Memory, Summary};
 pub use located::LocatedPhoto;
 
 /// Fehler aus Katalog- und Cache-Operationen.

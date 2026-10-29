@@ -784,7 +784,7 @@ fn decode_ts(raw: &str) -> Result<DateTime<Utc>, CacheError> {
 
 /// `rusqlite` erlaubt in der Mapper-Closure nur `rusqlite::Error`, deshalb
 /// reicht die Zeile das Zeitstempel-Ergebnis nach außen durch.
-fn row_to_photo(row: &Row<'_>) -> rusqlite::Result<Result<Photo, CacheError>> {
+pub(crate) fn row_to_photo(row: &Row<'_>) -> rusqlite::Result<Result<Photo, CacheError>> {
     Ok(build_photo(row))
 }
 
