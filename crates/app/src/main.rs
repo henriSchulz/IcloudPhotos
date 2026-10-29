@@ -1,5 +1,6 @@
 //! iCloud Photos — nativer Client für Omarchy.
 
+mod chrome;
 mod cluster;
 mod collections;
 mod demo;
@@ -7,9 +8,13 @@ mod downloader;
 mod exif_info;
 mod export;
 mod geocode;
+mod home;
 mod info_panel;
+mod layout;
 mod map_view;
+mod overview;
 mod photo_object;
+mod retouch;
 mod sidebar;
 mod sync_manager;
 mod sync_task;
@@ -47,7 +52,7 @@ fn main() -> anyhow::Result<()> {
     std::fs::create_dir_all(&config.paths.thumbnail_dir)?;
     std::fs::create_dir_all(&config.paths.full_res_dir)?;
 
-    let catalog = Catalog::open(&config.paths.db_path)?;
+    let mut catalog = Catalog::open(&config.paths.db_path)?;
 
     // Einmal beim Start aufräumen, damit die Cache-Summe stimmt, bevor die
     // erste Eviction darauf rechnet.
@@ -64,7 +69,7 @@ fn main() -> anyhow::Result<()> {
     }
 
     if std::env::args().any(|arg| arg == "--demo") {
-        demo::seed(&catalog, &config)?;
+        demo::seed(&mut catalog, &config)?;
     }
 
     let state = window::AppState::new(config, config_path, catalog);
@@ -117,6 +122,12 @@ fn main() -> anyhow::Result<()> {
     // GTK soll `--demo` und `--open` nicht als eigene Argumente deuten.
     app.run_with_args::<&str>(&[]);
     Ok(())
+}
+
+/// Ob nichts ins Netz darf — gesetzt im Prüfstand (`ICLOUD_PHOTOS_OFFLINE`):
+/// keine Ortsnamen von Nominatim, keine Kartenkacheln.
+pub fn offline() -> bool {
+    std::env::var_os("ICLOUD_PHOTOS_OFFLINE").is_some()
 }
 
 /// Die Foto-ID hinter `--open`, falls angegeben.

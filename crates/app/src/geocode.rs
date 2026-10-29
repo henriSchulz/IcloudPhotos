@@ -104,6 +104,11 @@ pub fn spawn(db_path: PathBuf) -> (Geocoder, mpsc::UnboundedReceiver<Resolved>) 
                 }
             }
 
+            // Im Prüfstand (`ICLOUD_PHOTOS_OFFLINE`) geht keine Anfrage ins Netz.
+            if crate::offline() {
+                continue;
+            }
+
             // Eine Anfrage pro Sekunde, wie die Nutzungsregeln es verlangen.
             if let Some(last) = last_call {
                 let waited = last.elapsed();

@@ -200,7 +200,16 @@ impl MapView {
         let simple = shumate::SimpleMap::new();
         simple.set_hexpand(true);
         simple.set_vexpand(true);
+        // Im Prüfstand (`ICLOUD_PHOTOS_OFFLINE`) ohne Kacheln: keine Anfrage
+        // an den Kachelserver, nur die Markierungen auf leerem Grund.
         match registry.by_id(shumate::MAP_SOURCE_OSM_MAPNIK) {
+            Some(_) if crate::offline() => {
+                // Eine Quelle ohne Netz, damit die Karte ihre Projektion hat
+                // und die Markierungen stehen; die Kacheln bleiben leer.
+                let blank =
+                    shumate::RasterRenderer::from_url("file:///nonexistent/{z}/{x}/{y}.png");
+                simple.set_map_source(Some(&blank));
+            }
             Some(source) => simple.set_map_source(Some(&source)),
             None => tracing::error!("Kartenquelle OSM Mapnik fehlt in libshumate"),
         }
@@ -358,14 +367,14 @@ impl MapView {
         let count = cluster.members.len();
         let picture = gtk::Picture::builder()
             .content_fit(gtk::ContentFit::Cover)
-            .width_request(MARKER_SIZE)
-            .height_request(MARKER_SIZE)
-            .css_classes(["map-cluster-photo"])
-            // Platz für die Anzahl, die über die Ecke hinausragt.
-            .margin_top(8)
-            .margin_end(8)
             .build();
-        picture.set_overflow(gtk::Overflow::Hidden);
+        // Fest in Markierungsgröße: ein Picture meldet sonst die Größe seiner
+        // Textur als Wunsch, und die Markierung wüchse auf 160 px.
+        let frame = crate::layout::RatioBox::fixed(&picture, 1.0, MARKER_SIZE);
+        frame.add_css_class("map-cluster-photo");
+        // Platz für die Anzahl, die über die Ecke hinausragt.
+        frame.set_margin_top(8);
+        frame.set_margin_end(8);
         // Titelbild ist das neueste Foto mit Vorschau — wie bei den Alben.
         if let Some(path) = cluster
             .members
@@ -376,7 +385,7 @@ impl MapView {
         }
 
         let overlay = gtk::Overlay::new();
-        overlay.set_child(Some(&picture));
+        overlay.set_child(Some(&frame));
         if count > 1 {
             let badge = gtk::Label::builder()
                 .label(thousands(count as u64))
