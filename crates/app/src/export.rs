@@ -91,6 +91,8 @@ pub enum Action {
     Clipboard,
     /// Mit der Standardanwendung öffnen.
     Open,
+    /// An Retouch übergeben („Edit in Retouch").
+    Retouch,
 }
 
 impl Action {
@@ -100,6 +102,7 @@ impl Action {
             Action::SaveTo(..) => "Exporting",
             Action::Clipboard => "Copying",
             Action::Open => "Opening",
+            Action::Retouch => "Preparing for Retouch",
         }
     }
 }

@@ -1,59 +1,64 @@
-/* Velum-Optik (~/Projects/velum, Variante Pearl als Vorgabe). Nur Rollen:
- * jede Farbe, jeder Radius, jeder Schatten ist eine --v-*-Variable aus der
- * Velum-Schicht in ~/.config/gtk-4.0/gtk.css. Geladen wird diese Datei nur,
- * wenn es die Schicht gibt (velum::active) — sonst blieben die Variablen leer.
- * Die Fenster tragen die Klasse `velum-photos`; nichts hier reicht darüber
- * hinaus. Zahlen nur für Haarlinien. */
+/* Velum-Optik (~/Projects/velum), Vorschlag A des Labs lab/web/photos.html (Home mit Karten, dann die
+ * Bibliothek; Opal als Vorgabe). Nur Rollen: jede Farbe, jeder Radius, jeder Schatten ist eine
+ * --v-*-Variable aus der Velum-Schicht in ~/.config/gtk-4.0/gtk.css; die eigene Geometrie der App
+ * steht als surface.photos in Velum (tokens/surfaces/photos.tokens.json → --v-photos-*).
+ * Geladen wird diese Datei nur, wenn es die Schicht gibt (velum::active) — sonst blieben die
+ * Variablen leer. Die Fenster tragen die Klasse `velum-photos`; nichts hier reicht darüber hinaus.
+ * GTK kann hinter Teilen eines Fensters nicht weichzeichnen: was im Lab Glas über Fotos ist
+ * (Bildunterschriften, Kennzeichen, die Datumszeile), nimmt den deckenden Popover-Ton
+ * (--v-popover-bg-opaque) mit den Lichtkanten aus --v-popover-shadow. Zahlen nur für 0/1px. */
 
-/* ── Fenster: eine Fläche, Kopfzeile ohne Kante (macOS-Werkzeugleiste) ── */
+/* ── Fenster: eine Fläche; die Seite rechts eine Stufe heller ─────────────── */
 window.velum-photos,
-window.velum-photos .photos-library {
+window.velum-photos .photos-split {
   background-color: var(--v-bg-window);
 }
-window.velum-photos headerbar {
-  background: none;
-  box-shadow: none;
-  border: none;
-  min-height: calc(var(--v-control-height) + 2 * var(--v-sidebar-inset) + var(--v-sidebar-inset));
-}
-window.velum-photos headerbar .title,
-window.velum-photos windowtitle .title {
-  font-size: var(--v-type-title);
-  font-weight: 700;
-}
-window.velum-photos headerbar button:not(.suggested-action) {
-  background: none;
-  box-shadow: none;
-  color: var(--v-ink-secondary);
-}
-window.velum-photos headerbar button:hover:not(.suggested-action) { background-color: var(--v-fill-hover); }
-window.velum-photos headerbar button:active:not(.suggested-action),
-window.velum-photos headerbar button:checked:not(.suggested-action) {
-  background-color: var(--v-fill-pressed);
-  color: var(--v-ink-primary);
-}
-
-/* ── Seitenleiste: schwebend, eingerückt, gerundet (Pearl) ─────────────── */
 window.velum-photos .photos-split > widget:not(.sidebar-pane) { background: none; }
 window.velum-photos .photos-split .sidebar-pane {
   background: none;
   border: none;
   box-shadow: none;
 }
+/* Hinter der Schublade: Velums Scrim. */
+window.velum-photos .photos-split > dimming { background-color: var(--v-scrim); }
+window.velum-photos .photos-main {
+  background-color: var(--v-bg-content);
+}
+
+/* ── Seitenleiste: schwebend, eingerückt, gerundet ──────────────────────── */
 window.velum-photos .photos-sidebar {
-  margin: var(--v-sidebar-inset) 0 var(--v-sidebar-inset) var(--v-sidebar-inset);
+  margin: var(--v-sidebar-inset);
+  margin-right: 0;
+  padding: var(--v-space-10) var(--v-space-8);
   border-radius: var(--v-radius-sidebar);
   background-color: var(--v-bg-sidebar);
   box-shadow: var(--v-sidebar-shadow);
+  min-width: calc(var(--v-sidebar-width) + var(--v-photos-side-extra));
+}
+window.velum-photos .photos-sidebar.rail {
+  min-width: var(--v-photos-rail);
+  padding: var(--v-space-10) var(--v-space-6);
+}
+/* Als Schublade über der Seite: mit dem Schatten eines Sheets. */
+window.velum-photos .photos-sidebar.drawer {
+  min-width: var(--v-photos-drawer);
+  margin-right: var(--v-sidebar-inset);
+  box-shadow: var(--v-shadow-sheet);
 }
 window.velum-photos .photos-sidebar scrolledwindow,
 window.velum-photos .photos-sidebar list.navigation-sidebar { background: none; }
-window.velum-photos .photos-sidebar list.navigation-sidebar {
-  padding: 0 var(--v-sidebar-inset);
+window.velum-photos .photos-sidebar list.navigation-sidebar { padding: 0; }
+window.velum-photos .photos-search {
+  margin: 0 var(--v-space-2) var(--v-space-6);
+  min-height: var(--v-control-height);
 }
-/* Zeilen: kein Hover (macOS), die Wahl ist eine ruhige Fläche. */
+window.velum-photos .rail-search { margin-bottom: var(--v-space-6); }
+
+/* Zeilen: kein Hover (macOS), die Wahl ist eine ruhige Fläche mit dem Akzentstrich links. */
 window.velum-photos .photos-sidebar list.navigation-sidebar > row {
-  min-height: var(--v-row-height);
+  min-height: calc(var(--v-row-height) + 1px);
+  margin: 0 0 1px;
+  padding: 0 var(--v-space-8) 0 var(--v-photos-nav-bar);
   border-radius: var(--v-radius-row);
   color: var(--v-ink-primary);
 }
@@ -63,30 +68,164 @@ window.velum-photos .photos-sidebar list.navigation-sidebar > row:selected:hover
   background-color: var(--v-fill-selected);
   color: var(--v-ink-primary);
 }
-window.velum-photos .photos-sidebar list.navigation-sidebar > row image {
-  color: var(--v-accent-base);
+window.velum-photos .sidebar-entry { border-spacing: 0; }
+window.velum-photos .sidebar-entry .row-glyph,
+window.velum-photos .sidebar-entry .disclosure { margin-right: var(--v-space-8); }
+window.velum-photos .sidebar-entry .row-count { margin-left: var(--v-space-8); }
+/* Der Strich sitzt nav-bar vom Rand der Zeile; das Symbol dahinter bei space-8 wie im Lab. */
+window.velum-photos .sidebar-entry .nav-bar {
+  min-width: var(--v-photos-nav-bar);
+  min-height: calc(var(--v-row-height) * 0.4);
+  margin-right: calc(var(--v-space-8) - 2 * var(--v-photos-nav-bar));
+  border-radius: var(--v-photos-nav-bar);
+  background: none;
 }
-window.velum-photos .photos-sidebar list.navigation-sidebar > row image.dim-label {
+window.velum-photos list.navigation-sidebar > row:selected .nav-bar { background-color: var(--v-accent-base); }
+window.velum-photos .photos-sidebar list.navigation-sidebar > row image.row-glyph {
+  color: var(--v-ink-sidebar-glyph);
+  -gtk-icon-size: var(--v-layout-icon-regular);
+}
+window.velum-photos .photos-sidebar list.navigation-sidebar > row:selected image.row-glyph { color: var(--v-accent-base); }
+window.velum-photos .photos-sidebar list.navigation-sidebar > row image.disclosure {
   color: var(--v-ink-tertiary);
+  -gtk-icon-size: var(--v-type-caption);
+}
+window.velum-photos .album-cover {
+  min-width: var(--v-photos-cover);
+  border-radius: var(--v-photos-cover-radius);
+}
+window.velum-photos .row-count {
+  color: var(--v-ink-tertiary);
+  font-size: var(--v-type-small);
+  opacity: 1;
 }
 window.velum-photos .photos-sidebar .sidebar-heading {
+  margin: var(--v-space-12) 0 var(--v-space-4);
+  padding: 0 var(--v-space-8);
   font-size: var(--v-type-small);
-  font-weight: 600;
+  font-weight: var(--v-weight-semibold);
   color: var(--v-ink-tertiary);
   opacity: 1;
 }
 window.velum-photos .photos-sidebar list.navigation-sidebar > row.sidebar-section,
 window.velum-photos .photos-sidebar list.navigation-sidebar > row.sidebar-section:hover {
+  min-height: 0;
+  padding: 0;
   background: none;
 }
+/* Die Leiste: nur Symbole, zentriert, Abschnitte als kurze Striche. */
+window.velum-photos list.navigation-sidebar.rail > row.rail-row {
+  min-width: var(--v-photos-rail-row);
+  padding: 0;
+}
+window.velum-photos list.navigation-sidebar.rail .sidebar-entry .nav-bar { margin-right: 0; }
+window.velum-photos list.navigation-sidebar.rail .sidebar-entry .row-glyph { margin-right: var(--v-photos-nav-bar); margin-left: var(--v-photos-nav-bar); }
+window.velum-photos .rail-separator {
+  min-width: calc(var(--v-space-24));
+  margin: var(--v-space-6) 0;
+  background-color: var(--v-line-base);
+  min-height: 1px;
+}
 
-/* ── Raster: Fotos Kante an Kante, eine Haarlinie dazwischen, wie Photos ─ */
+/* Sync-Zeile unten: Stand, „vor 4 Min.", der kleine Knopf synchronisiert. */
+window.velum-photos .photos-syncrow {
+  margin-top: var(--v-space-8);
+  padding: var(--v-space-8);
+  border-radius: var(--v-radius-row);
+  background-color: var(--v-bg-content);
+  border-spacing: var(--v-space-10);
+}
+window.velum-photos .photos-syncrow.rail { padding: var(--v-space-8) 0; }
+window.velum-photos .photos-syncrow .sync-glyph { color: var(--v-accent-text); }
+window.velum-photos .photos-syncrow.failed .sync-glyph { color: var(--v-warning); }
+window.velum-photos .photos-syncrow .sync-title {
+  font-size: var(--v-type-small);
+  font-weight: var(--v-weight-semibold);
+}
+window.velum-photos .photos-syncrow .sync-detail {
+  font-size: var(--v-type-caption);
+  color: var(--v-ink-tertiary);
+}
+window.velum-photos .photos-syncrow button.sync-now {
+  min-height: calc(var(--v-control-height) - var(--v-space-4));
+  min-width: calc(var(--v-control-height) - var(--v-space-4));
+  padding: 0;
+}
+
+/* ── Seitenkopf: großer Titel, Unterzeile, rechts die Knöpfe ──────────── */
+window.velum-photos .photos-head {
+  padding: var(--v-space-16) var(--v-space-24) var(--v-space-12);
+  border-spacing: var(--v-space-16);
+}
+window.velum-photos .photos-main.compact .photos-head {
+  padding: var(--v-space-12) var(--v-space-16) var(--v-space-10);
+}
+window.velum-photos .photos-head .title-row { border-spacing: var(--v-space-10); }
+window.velum-photos .photos-head .page-title {
+  font-size: var(--v-type-large-title);
+  font-weight: var(--v-weight-semibold);
+}
+window.velum-photos .photos-main.compact .photos-head .page-title { font-size: var(--v-type-title1); }
+window.velum-photos .photos-head .page-subtitle {
+  margin-top: var(--v-space-2);
+  font-size: var(--v-type-small);
+  color: var(--v-ink-tertiary);
+}
+window.velum-photos .photos-head .crumb {
+  margin-bottom: var(--v-space-2);
+  border-spacing: var(--v-space-4);
+  font-size: var(--v-type-small);
+  color: var(--v-ink-tertiary);
+}
+window.velum-photos .photos-head .crumb button.crumb-back {
+  min-height: var(--v-space-20);
+  min-width: var(--v-space-20);
+  padding: 0;
+  color: var(--v-ink-secondary);
+  -gtk-icon-size: var(--v-type-small);
+}
+window.velum-photos .photos-head .control-row { border-spacing: var(--v-space-6); }
+window.velum-photos .photos-head .page-controls.below { margin-top: var(--v-space-10); }
+window.velum-photos .photos-head .job-status { font-size: var(--v-type-small); }
+window.velum-photos .photos-main.compact .photos-head .wide-only { opacity: 0; min-width: 0; padding: 0; margin: 0; }
+
+/* Years · Months · All: Velums Segment (Spur, Plättchen). */
+window.velum-photos .photos-segment {
+  padding: var(--v-segment-pad);
+  border-radius: var(--v-radius-segment);
+  background-color: var(--v-segment-track);
+  border-spacing: 0;
+}
+window.velum-photos .photos-segment > button {
+  min-height: calc(var(--v-control-height) - 2 * var(--v-segment-pad));
+  padding: 0 var(--v-space-10);
+  border-radius: var(--v-radius-segment-plate);
+  background: none;
+  box-shadow: none;
+  border: none;
+  color: var(--v-ink-secondary);
+  font-size: var(--v-type-small);
+  font-weight: var(--v-weight-medium);
+}
+window.velum-photos .photos-segment > button:checked {
+  background-color: var(--v-segment-plate);
+  color: var(--v-ink-primary);
+  box-shadow: var(--v-segment-plate-shadow);
+}
+
+/* ── Inhalt: eingerückt im Fenster ─────────────────────────────────────── */
+window.velum-photos .photos-content { padding: 0 var(--v-space-12) var(--v-space-12); }
+window.velum-photos .photos-main.compact .photos-content { padding: 0 var(--v-space-6) var(--v-space-6); }
+window.velum-photos .photos-pane,
+window.velum-photos .photos-pane > viewport { background: none; }
+
+/* ── Raster: Fotos mit schmaler Fuge, wie im Lab ───────────────────────── */
 window.velum-photos gridview.photo-grid {
-  background-color: var(--v-bg-window);
-  padding: 0 1px;
+  background: none;
+  padding: 0 var(--v-space-12) var(--v-space-16);
 }
 window.velum-photos gridview.photo-grid > child {
-  padding: 1px;
+  padding: calc(var(--v-photos-tile-gap) / 2);
   margin: 0;
   border-radius: 0;
   background: none;
@@ -98,42 +237,352 @@ window.velum-photos gridview.photo-grid > child:selected { background: none; }
 window.velum-photos picture.photo-tile {
   border-radius: 0;
   box-shadow: none;
-  background-color: var(--v-fill-field);
+  background-color: var(--v-fill-pressed);
 }
 window.velum-photos gridview.photo-grid > child:selected picture.photo-tile {
-  outline: 3px solid var(--v-accent-base);
-  outline-offset: -3px;
+  outline: var(--v-photos-ring) solid var(--v-accent-base);
+  outline-offset: calc(-1 * var(--v-photos-ring));
 }
 /* Skelett: ruhige Fläche, ohne Puls — Velum hält Schleifen fern. */
 window.velum-photos picture.photo-tile.photo-skeleton {
   background-image: none;
-  background-color: var(--v-fill-field);
+  background-color: var(--v-fill-hover);
   border-radius: 0;
   animation: none;
   opacity: 1;
 }
-
-/* Video-Kennzeichen und Datumszeile liegen auf Fotos: Tooltip- und Popover-
- * Grund, damit sie auf jedem Bild lesbar bleiben. */
-window.velum-photos .photo-badge {
-  background-color: var(--v-tooltip-bg);
-  color: var(--v-tooltip-ink);
-  border-radius: var(--v-radius-chip);
+/* Der Auswahlring: nur im Auswahlmodus, gefüllt mit dem Akzent, wenn gewählt. */
+window.velum-photos .photo-check {
+  margin: var(--v-space-6);
+  min-width: var(--v-photos-check);
+  min-height: var(--v-photos-check);
+  border-radius: var(--v-radius-pill);
+  background-color: var(--v-popover-bg-opaque);
+  box-shadow: var(--v-popover-shadow);
+  color: transparent;
+  -gtk-icon-size: var(--v-type-small);
+  opacity: 0;
 }
-window.velum-photos .photo-date {
+window.velum-photos gridview.selecting .photo-check { opacity: 1; }
+window.velum-photos gridview.selecting > child:selected .photo-check {
+  background-color: var(--v-accent-base);
+  color: var(--v-ink-on-accent);
+  box-shadow: 0 0 0 var(--v-size-focus-ring) var(--v-bg-raised);
+}
+window.velum-photos.velum-touch .photo-check {
+  min-width: var(--v-photos-check-touch);
+  min-height: var(--v-photos-check-touch);
+}
+
+/* Video-Kennzeichen und Datumszeile liegen auf Fotos: deckender Popover-Ton. */
+window.velum-photos .photo-badge {
+  margin: var(--v-photos-badge-inset);
+  min-height: var(--v-photos-badge);
+  min-width: var(--v-photos-badge);
+  padding: 0;
   background-color: var(--v-popover-bg-opaque);
   color: var(--v-popover-ink);
   box-shadow: var(--v-popover-shadow);
   border-radius: var(--v-radius-chip);
-  font-size: var(--v-type-body);
-  font-weight: 600;
+  -gtk-icon-size: var(--v-type-caption);
 }
+window.velum-photos .photo-date {
+  padding: var(--v-space-6) var(--v-space-12);
+  background-color: var(--v-popover-bg-opaque);
+  color: var(--v-popover-ink);
+  box-shadow: var(--v-popover-shadow);
+  border-radius: var(--v-radius-pill);
+  font-size: var(--v-type-callout);
+  font-weight: var(--v-weight-semibold);
+}
+
+/* Die schwebende Aktionsleiste der Auswahl. */
+window.velum-photos .photos-actionbar {
+  margin-bottom: var(--v-space-20);
+  padding: var(--v-space-6);
+  border-radius: var(--v-radius-panel);
+  background-color: var(--v-bg-raised);
+  box-shadow: var(--v-shadow-sheet);
+  border-spacing: var(--v-space-4);
+}
+window.velum-photos button.bar-button {
+  padding: var(--v-space-6) var(--v-space-10);
+  min-height: 0;
+  border-radius: var(--v-radius-row);
+  color: var(--v-ink-primary);
+}
+window.velum-photos button.bar-button > box { border-spacing: var(--v-space-2); }
+window.velum-photos button.bar-button image { -gtk-icon-size: var(--v-layout-icon-large); }
+window.velum-photos button.bar-button .bar-label {
+  font-size: var(--v-type-caption);
+  color: var(--v-ink-secondary);
+}
+window.velum-photos button.bar-button.danger,
+window.velum-photos button.bar-button.danger .bar-label { color: var(--v-danger); }
+window.velum-photos .photos-actionbar > separator {
+  margin: var(--v-space-6) var(--v-space-4);
+  min-width: 1px;
+  background-color: var(--v-line-base);
+}
+
+/* Kontextmenü: oben die Reihe großer Knöpfe (wie im Finder), darunter die Liste. */
+window.velum-photos popover.photos-context .menu-actions {
+  padding: var(--v-space-2) var(--v-space-2) var(--v-space-4);
+  border-spacing: var(--v-space-4);
+}
+window.velum-photos popover.photos-context button.menu-action {
+  padding: var(--v-space-6) 0 var(--v-space-4);
+  border-radius: var(--v-radius-menu-row);
+  /* die Tönung des Labs (color-mix menu-ink 6 %) */
+  background-color: alpha(var(--v-menu-ink), 0.06);
+  color: var(--v-menu-ink);
+}
+window.velum-photos popover.photos-context button.menu-action:hover {
+  background-color: var(--v-menu-highlight);
+  color: var(--v-menu-highlight-ink);
+}
+window.velum-photos popover.photos-context button.menu-action image { -gtk-icon-size: var(--v-layout-icon-regular); }
+window.velum-photos popover.photos-context button.menu-action .bar-label {
+  font-size: var(--v-type-caption);
+  color: inherit;
+}
+window.velum-photos popover.photos-context button.menu-action.danger { color: var(--v-menu-danger); }
+
+/* ── Home: Karten ─────────────────────────────────────────────────────── */
+window.velum-photos .photos-home { padding: 0 var(--v-space-4) var(--v-space-16); }
+window.velum-photos .home-column { border-spacing: var(--v-photos-card-gap); }
+window.velum-photos .home-card {
+  padding: var(--v-space-16);
+  border-radius: var(--v-radius-panel);
+  background-color: var(--v-bg-raised);
+  box-shadow: var(--v-card-shadow);
+}
+window.velum-photos .home-card .card-head { border-spacing: var(--v-space-8); }
+window.velum-photos .card-title {
+  font-size: var(--v-type-headline);
+  font-weight: var(--v-weight-semibold);
+}
+window.velum-photos .card-sub {
+  font-size: var(--v-type-small);
+  color: var(--v-ink-tertiary);
+}
+window.velum-photos .home-card > .card-sub { margin: var(--v-space-2) 0 var(--v-space-12); }
+window.velum-photos button.more-link {
+  min-height: 0;
+  padding: 0;
+  background: none;
+  box-shadow: none;
+  color: var(--v-accent-text);
+  font-size: var(--v-type-small);
+  font-weight: var(--v-weight-medium);
+}
+window.velum-photos button.more-link:hover { text-decoration: underline; }
+
+/* Fotos als Knöpfe: nur das Bild, beschnitten, gerundet. */
+window.velum-photos button.photo-button,
+window.velum-photos button.tile-button,
+window.velum-photos button.day-link {
+  padding: 0;
+  min-height: 0;
+  min-width: 0;
+  border-radius: 0;
+  background: none;
+  box-shadow: none;
+}
+window.velum-photos ratiobox.thumb {
+  background-color: var(--v-fill-pressed);
+  border-radius: var(--v-radius-chip);
+}
+window.velum-photos .hero ratiobox.thumb { border-radius: var(--v-radius-row); }
+window.velum-photos .hero-caption {
+  margin: var(--v-photos-caption-inset);
+  padding: var(--v-space-6) var(--v-space-12);
+  border-radius: var(--v-radius-popover);
+  background-color: var(--v-popover-bg-opaque);
+  box-shadow: var(--v-popover-shadow);
+  color: var(--v-popover-ink);
+}
+window.velum-photos .caption-title { font-weight: var(--v-weight-semibold); }
+window.velum-photos .caption-sub {
+  font-size: var(--v-type-small);
+  color: var(--v-popover-ink-secondary);
+}
+window.velum-photos .strip {
+  margin-top: var(--v-space-8);
+  border-spacing: var(--v-space-4);
+}
+window.velum-photos .day-row {
+  padding: var(--v-space-8) 0;
+  border-top: var(--v-layout-hairline) solid var(--v-line-base);
+  border-spacing: var(--v-space-12);
+}
+window.velum-photos .day-row.first { border-top: none; }
+window.velum-photos .day-row .strip { margin: 0; }
+window.velum-photos .day-title { font-weight: var(--v-weight-medium); }
+
+/* iCloud-Karte */
+window.velum-photos .stat { border-spacing: var(--v-space-12); }
+window.velum-photos .stat-glyph {
+  min-width: var(--v-photos-stat-glyph);
+  min-height: var(--v-photos-stat-glyph);
+  border-radius: var(--v-radius-pill);
+  background-color: var(--v-fill-selected);
+  color: var(--v-accent-text);
+  -gtk-icon-size: var(--v-layout-icon-large);
+}
+window.velum-photos .stat-title { font-weight: var(--v-weight-semibold); }
+window.velum-photos .cloud-card .facts {
+  margin: var(--v-space-12) 0 var(--v-space-4);
+  border-spacing: var(--v-space-4) var(--v-space-12);
+}
+window.velum-photos .fact-name {
+  font-size: var(--v-type-small);
+  color: var(--v-ink-secondary);
+}
+window.velum-photos .fact-value {
+  font-size: var(--v-type-small);
+  color: var(--v-ink-primary);
+  font-feature-settings: "tnum";
+}
+window.velum-photos levelbar.cache-meter { margin: var(--v-space-6) 0 var(--v-space-4); }
+window.velum-photos levelbar.cache-meter trough {
+  min-height: var(--v-layout-meter-bar);
+  padding: 0;
+  border-radius: var(--v-layout-meter-bar);
+  background-color: var(--v-fill-pressed);
+  border: none;
+  box-shadow: none;
+}
+window.velum-photos levelbar.cache-meter block {
+  min-height: var(--v-layout-meter-bar);
+  border-radius: var(--v-layout-meter-bar);
+  border: none;
+}
+window.velum-photos levelbar.cache-meter block.filled { background-color: var(--v-accent-base); }
+window.velum-photos levelbar.cache-meter block.empty { background: none; }
+window.velum-photos .card-buttons {
+  margin-top: var(--v-space-12);
+  border-spacing: var(--v-space-8);
+}
+
+/* Add Photos */
+window.velum-photos .add-card {
+  padding: var(--v-space-12) var(--v-space-16);
+  border-spacing: var(--v-space-12);
+}
+window.velum-photos .add-glyph {
+  min-width: var(--v-photos-add-glyph);
+  min-height: var(--v-photos-add-glyph);
+  border-radius: var(--v-radius-row);
+  background-color: var(--v-bg-content);
+  box-shadow: inset 0 0 0 1px var(--v-line-strong);
+  color: var(--v-ink-secondary);
+  -gtk-icon-size: var(--v-layout-icon-large);
+}
+window.velum-photos .add-title { font-weight: var(--v-weight-medium); }
+
+/* Pinned */
+window.velum-photos .pins { border-spacing: var(--v-space-8); }
+window.velum-photos .pin-cover { border-radius: var(--v-radius-row); }
+window.velum-photos .pin-cover ratiobox.thumb,
+window.velum-photos .quad ratiobox.thumb { border-radius: 0; }
+window.velum-photos .quad { border-spacing: var(--v-photos-tile-gap); }
+window.velum-photos .pin-title {
+  margin-top: var(--v-space-6);
+  font-size: var(--v-type-callout);
+  font-weight: var(--v-weight-medium);
+}
+window.velum-photos .cover-badge {
+  margin: var(--v-space-6);
+  min-width: var(--v-photos-cover-badge);
+  min-height: var(--v-photos-cover-badge);
+  border-radius: var(--v-radius-pill);
+  background-color: var(--v-popover-bg-opaque);
+  box-shadow: var(--v-popover-shadow);
+  color: var(--v-popover-ink);
+  -gtk-icon-size: var(--v-type-callout);
+}
+
+/* Alben und Medientypen unter den Karten */
+window.velum-photos .section-head {
+  margin: var(--v-space-24) var(--v-space-4) var(--v-space-12);
+  border-spacing: var(--v-space-8);
+}
+window.velum-photos .section-title {
+  font-size: var(--v-type-title3);
+  font-weight: var(--v-weight-semibold);
+}
+window.velum-photos .section-summary {
+  font-size: var(--v-type-small);
+  color: var(--v-ink-tertiary);
+}
+window.velum-photos flowbox.album-grid > flowboxchild,
+window.velum-photos flowbox.chips > flowboxchild,
+window.velum-photos flowbox.overview-grid > flowboxchild { padding: 0; background: none; }
+window.velum-photos .album-cover-large {
+  border-radius: var(--v-radius-row);
+  box-shadow: 0 0 0 var(--v-layout-hairline) var(--v-line-base);
+}
+window.velum-photos .album-cover-large ratiobox.thumb { border-radius: 0; }
+window.velum-photos .folder-cover {
+  padding: var(--v-space-6);
+  border-spacing: var(--v-space-2);
+  background-color: var(--v-bg-content);
+  box-shadow: inset 0 0 0 1px var(--v-line-base);
+}
+window.velum-photos .folder-cover ratiobox.thumb { border-radius: var(--v-space-4); }
+window.velum-photos .album-name {
+  margin-top: var(--v-space-6);
+  font-size: var(--v-type-callout);
+  font-weight: var(--v-weight-medium);
+}
+window.velum-photos button.chip {
+  min-height: var(--v-control-height);
+  padding: 0 var(--v-space-10);
+  border-radius: var(--v-radius-chip);
+  border: none;
+  background-color: var(--v-bg-raised);
+  box-shadow: var(--v-card-shadow);
+  color: var(--v-ink-primary);
+}
+window.velum-photos button.chip > box { border-spacing: var(--v-space-6); }
+window.velum-photos button.chip image { color: var(--v-ink-secondary); -gtk-icon-size: var(--v-type-callout); }
+window.velum-photos .chip-name { font-size: var(--v-type-small); font-weight: var(--v-weight-medium); }
+window.velum-photos .chip-count { font-size: var(--v-type-small); color: var(--v-ink-tertiary); }
+
+/* Years und Months */
+window.velum-photos flowbox.overview-grid { padding: 0 var(--v-space-12) var(--v-space-16); }
+window.velum-photos .year-cover,
+window.velum-photos .year-cover ratiobox.thumb { border-radius: var(--v-radius-panel); }
+window.velum-photos .year-caption {
+  margin: var(--v-photos-caption-inset);
+  padding: var(--v-space-6) var(--v-space-12);
+  border-radius: var(--v-radius-popover);
+  background-color: var(--v-popover-bg-opaque);
+  box-shadow: var(--v-popover-shadow);
+  color: var(--v-popover-ink);
+  border-spacing: var(--v-space-8);
+}
+window.velum-photos .year-title {
+  font-size: var(--v-type-title2);
+  font-weight: var(--v-weight-bold);
+}
+window.velum-photos button.month-card {
+  border-radius: var(--v-radius-panel);
+  background-color: var(--v-bg-raised);
+  box-shadow: var(--v-card-shadow);
+}
+window.velum-photos .month-cover { border-radius: var(--v-radius-panel) var(--v-radius-panel) 0 0; }
+window.velum-photos .month-cover ratiobox.thumb { border-radius: 0; }
+window.velum-photos .tri { border-spacing: var(--v-photos-tile-gap); }
+window.velum-photos .month-caption { padding: var(--v-space-10) var(--v-space-12) var(--v-space-12); }
+window.velum-photos .month-title { font-weight: var(--v-weight-semibold); }
 
 /* ── Karte: Markierungen mit Velum-Rand und -Schatten ──────────────────── */
 window.velum-photos .map-cluster-photo {
-  border-radius: var(--v-radius-control);
-  border-color: var(--v-line-rim);
-  box-shadow: var(--v-popover-shadow);
+  border-radius: var(--v-radius-row);
+  border-color: var(--v-bg-raised);
+  box-shadow: var(--v-card-shadow);
 }
 window.velum-photos .map-cluster:hover .map-cluster-photo,
 window.velum-photos .map-cluster:focus-visible .map-cluster-photo {
@@ -142,37 +591,134 @@ window.velum-photos .map-cluster:focus-visible .map-cluster-photo {
 window.velum-photos .map-cluster-count {
   background-color: var(--v-accent-base);
   color: var(--v-ink-on-accent);
-  border-radius: var(--v-radius-chip);
-  font-size: var(--v-type-small);
+  border-radius: var(--v-radius-pill);
+  font-size: var(--v-type-caption);
+  font-weight: var(--v-weight-semibold);
 }
 
-/* ── Betrachter: Kopfzeile wie die Bibliothek, Info-Panel als Seitenleiste ─ */
-window.velum-photos .photos-info {
-  background-color: var(--v-bg-sidebar);
-}
-
-/* ── Betrachter ────────────────────────────────────────────────────────── */
+/* ── Betrachter: Kopf, Bühne als ruhige Fläche, Info als Karte ─────────── */
 window.velum-photos .photos-viewer { background-color: var(--v-bg-window); }
-/* Leiste per Tipp ausgeblendet (Tablet-Modus): nur noch das Foto. */
+window.velum-photos .photos-viewer headerbar {
+  background: none;
+  box-shadow: none;
+  border: none;
+  min-height: var(--v-photos-viewer-head);
+  padding: 0 var(--v-space-12);
+}
+window.velum-photos .photos-viewer headerbar button:not(.suggested-action) {
+  background: none;
+  box-shadow: none;
+  border: none;
+  color: var(--v-ink-secondary);
+}
+window.velum-photos .photos-viewer headerbar button:hover:not(.suggested-action) { background-color: var(--v-fill-hover); }
+window.velum-photos .photos-viewer headerbar button:checked:not(.suggested-action) {
+  background-color: var(--v-fill-selected);
+  color: var(--v-accent-text);
+}
+window.velum-photos .photos-viewer headerbar button.back { color: var(--v-ink-primary); }
+window.velum-photos .photos-viewer headerbar windowtitle .title { font-weight: var(--v-weight-semibold); }
+window.velum-photos .photos-viewer headerbar windowtitle .subtitle {
+  font-size: var(--v-type-small);
+  color: var(--v-ink-tertiary);
+  opacity: 1;
+}
+window.velum-photos .photos-viewer .head-separator {
+  min-width: 1px;
+  min-height: var(--v-space-20);
+  margin: 0 var(--v-space-4);
+  background-color: var(--v-line-base);
+}
+window.velum-photos .photos-stage {
+  margin: 0 var(--v-space-12) var(--v-space-12);
+  padding: var(--v-space-24);
+  border-radius: var(--v-radius-panel);
+  background-color: var(--v-bg-content);
+}
+window.velum-photos .photos-viewer.narrow .photos-stage {
+  margin: 0 var(--v-space-6) var(--v-space-6);
+  padding: var(--v-space-12);
+}
 window.velum-photos .photos-viewer.immersive { background-color: var(--v-bg-content); }
+window.velum-photos .photos-viewer.immersive .photos-stage { margin: 0; border-radius: 0; }
+window.velum-photos .photos-inspector {
+  margin: 0 var(--v-space-12) var(--v-space-12) 0;
+  min-width: var(--v-photos-inspector);
+  border-radius: var(--v-radius-panel);
+  background-color: var(--v-bg-raised);
+  box-shadow: var(--v-card-shadow);
+}
+/* Schmal ein Sheet über dem Foto, unten. */
+window.velum-photos .photos-viewer.narrow .photos-inspector {
+  margin: var(--v-space-8);
+  min-width: 0;
+  box-shadow: var(--v-shadow-sheet);
+}
+window.velum-photos .photos-inspector .inspector-head {
+  padding: var(--v-space-12) var(--v-space-12) 0 var(--v-space-16);
+  font-size: var(--v-type-small);
+  font-weight: var(--v-weight-semibold);
+  color: var(--v-ink-secondary);
+}
+window.velum-photos .photos-inspector .inspector-head button {
+  min-height: calc(var(--v-control-height) - var(--v-space-6));
+  min-width: calc(var(--v-control-height) - var(--v-space-6));
+  padding: 0;
+  -gtk-icon-size: var(--v-type-small);
+}
+window.velum-photos .photos-info,
+window.velum-photos .photos-viewer-split > widget { background: none; }
+window.velum-photos .photos-viewer-split .sidebar-pane { background: none; border: none; box-shadow: none; }
+window.velum-photos .photos-viewer.narrow headerbar .wide-only { opacity: 0; min-width: 0; padding: 0; margin: 0; }
+window.velum-photos .info-column {
+  padding: var(--v-space-8) var(--v-space-16) var(--v-space-16);
+  border-spacing: var(--v-space-12);
+}
+window.velum-photos .info-heading { border-spacing: var(--v-space-2); }
+window.velum-photos .info-title {
+  font-size: var(--v-type-headline);
+  font-weight: var(--v-weight-semibold);
+}
+window.velum-photos .info-when {
+  font-size: var(--v-type-small);
+  color: var(--v-ink-secondary);
+}
+window.velum-photos .facts { border-spacing: var(--v-space-4); }
+window.velum-photos .facts-title {
+  font-size: var(--v-type-callout);
+  font-weight: var(--v-weight-semibold);
+}
+window.velum-photos .fact { border-spacing: var(--v-space-12); }
+window.velum-photos .fact .fact-name {
+  font-size: var(--v-type-small);
+  color: var(--v-ink-secondary);
+}
+window.velum-photos .fact .fact-value {
+  font-size: var(--v-type-small);
+  color: var(--v-ink-primary);
+  font-feature-settings: "tnum";
+}
+window.velum-photos .fact-note {
+  font-size: var(--v-type-small);
+  color: var(--v-ink-tertiary);
+}
 
 /* ── Tablet-Modus (velum-touch): Fingergrößen aus --v-touch-* ──────────── */
-window.velum-photos.velum-touch headerbar {
-  min-height: calc(var(--v-touch-hit-min) + 2 * var(--v-sidebar-inset));
-}
-window.velum-photos.velum-touch headerbar button {
+window.velum-photos.velum-touch .photos-head button,
+window.velum-photos.velum-touch .photos-viewer headerbar button {
   min-width: var(--v-touch-hit-min);
   min-height: var(--v-touch-hit-min);
 }
+window.velum-photos.velum-touch .photos-segment > button { min-height: calc(var(--v-touch-metrics-control-height) - 2 * var(--v-segment-pad)); }
+window.velum-photos.velum-touch .photos-viewer headerbar { min-height: calc(var(--v-touch-hit-min) + 2 * var(--v-sidebar-inset)); }
 window.velum-photos.velum-touch .photos-sidebar list.navigation-sidebar > row {
   min-height: var(--v-touch-metrics-row-height);
 }
-window.velum-photos.velum-touch .photos-sidebar list.navigation-sidebar > row.sidebar-section {
-  min-height: 0;
-}
-window.velum-photos.velum-touch popover.menu modelbutton {
-  min-height: var(--v-touch-metrics-menu-row);
-}
+window.velum-photos.velum-touch .photos-sidebar list.navigation-sidebar > row.sidebar-section { min-height: 0; }
+window.velum-photos.velum-touch .photos-sidebar list.navigation-sidebar > row image.row-glyph { -gtk-icon-size: var(--v-touch-layout-icon-regular); }
+window.velum-photos.velum-touch .photos-search { min-height: var(--v-touch-metrics-control-height); }
+window.velum-photos.velum-touch popover.menu modelbutton { min-height: var(--v-touch-metrics-menu-row); }
+window.velum-photos.velum-touch button.bar-button image { -gtk-icon-size: var(--v-touch-layout-icon-large); }
 window.velum-photos.velum-touch button.pill,
 window.velum-photos.velum-touch entry {
   min-height: var(--v-touch-metrics-control-height);

@@ -21,26 +21,26 @@ pub struct InfoPanel {
     title: gtk::Label,
     captured: gtk::Label,
 
-    details: adw::PreferencesGroup,
-    filename_row: adw::ActionRow,
-    kind_row: adw::ActionRow,
-    dimensions_row: adw::ActionRow,
-    size_row: adw::ActionRow,
+    details: gtk::Box,
+    filename_row: Fact,
+    kind_row: Fact,
+    dimensions_row: Fact,
+    size_row: Fact,
 
-    camera: adw::PreferencesGroup,
-    camera_row: adw::ActionRow,
-    lens_row: adw::ActionRow,
-    focal_row: adw::ActionRow,
-    aperture_row: adw::ActionRow,
-    shutter_row: adw::ActionRow,
-    iso_row: adw::ActionRow,
-    flash_row: adw::ActionRow,
+    camera: gtk::Box,
+    camera_row: Fact,
+    lens_row: Fact,
+    focal_row: Fact,
+    aperture_row: Fact,
+    shutter_row: Fact,
+    iso_row: Fact,
+    flash_row: Fact,
     /// Hinweis, solange das Original — und damit EXIF — noch fehlt.
-    pending_row: adw::ActionRow,
+    pending_row: Fact,
 
-    location: adw::PreferencesGroup,
-    place_row: adw::ActionRow,
-    coordinates_row: adw::ActionRow,
+    location: gtk::Box,
+    place_row: Fact,
+    coordinates_row: Fact,
 
     /// Das gezeigte Foto: ID und ob es ein Video ist.
     current: RefCell<Option<Shown>>,
@@ -57,44 +57,35 @@ struct Shown {
 impl InfoPanel {
     pub fn new() -> Rc<Self> {
         let title = gtk::Label::builder()
-            .css_classes(["title-3"])
+            .css_classes(["info-title"])
             .xalign(0.0)
             .wrap(true)
             .wrap_mode(gtk::pango::WrapMode::WordChar)
             .build();
         let captured = gtk::Label::builder()
-            .css_classes(["dim-label"])
+            .css_classes(["info-when"])
             .xalign(0.0)
             .wrap(true)
             .build();
-        let heading = gtk::Box::new(gtk::Orientation::Vertical, 4);
-        heading.set_margin_start(6);
-        heading.set_margin_end(6);
+        let heading = gtk::Box::builder()
+            .orientation(gtk::Orientation::Vertical)
+            .css_classes(["info-heading"])
+            .build();
         heading.append(&title);
         heading.append(&captured);
 
-        // „property" stellt den Wert in den Vordergrund und die Bezeichnung
-        // klein darüber — wie im Sync-Manager. Kein Markup: Dateinamen und
-        // Ortsnamen kommen von außen, ein „&" darin wäre sonst ein Fehler.
-        let row = |title: &str| {
-            adw::ActionRow::builder()
-                .title(title)
-                .use_markup(false)
-                .subtitle_selectable(true)
-                .css_classes(["property"])
-                .visible(false)
-                .build()
-        };
+        // Wie im Lab: Bezeichnung links, Wert rechts, eine Zeile je Angabe.
+        // Kein Markup: Dateinamen und Ortsnamen kommen von außen.
+        let row = |title: &str| Fact::new(title);
 
         let filename_row = row("Filename");
         let kind_row = row("Type");
         let dimensions_row = row("Dimensions");
         let size_row = row("File Size");
-        let details = adw::PreferencesGroup::builder().title("Details").build();
-        details.add(&filename_row);
-        details.add(&kind_row);
-        details.add(&dimensions_row);
-        details.add(&size_row);
+        let details = group("Details");
+        for row in [&filename_row, &kind_row, &dimensions_row, &size_row] {
+            details.append(&row.row);
+        }
 
         let camera_row = row("Camera");
         let lens_row = row("Lens");
@@ -103,13 +94,8 @@ impl InfoPanel {
         let shutter_row = row("Shutter Speed");
         let iso_row = row("ISO");
         let flash_row = row("Flash");
-        let pending_row = adw::ActionRow::builder()
-            .title("Camera details appear when the original has loaded")
-            .use_markup(false)
-            .css_classes(["dim-label"])
-            .visible(false)
-            .build();
-        let camera = adw::PreferencesGroup::builder().title("Camera").build();
+        let pending_row = Fact::note("Camera details appear when the original has loaded");
+        let camera = group("Camera");
         for row in [
             &camera_row,
             &lens_row,
@@ -120,20 +106,19 @@ impl InfoPanel {
             &flash_row,
             &pending_row,
         ] {
-            camera.add(row);
+            camera.append(&row.row);
         }
 
         let place_row = row("Place");
         let coordinates_row = row("Coordinates");
-        let location = adw::PreferencesGroup::builder().title("Location").build();
-        location.add(&place_row);
-        location.add(&coordinates_row);
+        let location = group("Location");
+        location.append(&place_row.row);
+        location.append(&coordinates_row.row);
 
-        let column = gtk::Box::new(gtk::Orientation::Vertical, 18);
-        column.set_margin_top(12);
-        column.set_margin_bottom(24);
-        column.set_margin_start(12);
-        column.set_margin_end(12);
+        let column = gtk::Box::builder()
+            .orientation(gtk::Orientation::Vertical)
+            .css_classes(["info-column"])
+            .build();
         column.append(&heading);
         column.append(&details);
         column.append(&camera);
@@ -348,12 +333,84 @@ fn camera_visible(panel: &InfoPanel) -> bool {
 }
 
 /// Setzt den Wert einer Zeile; ohne Wert verschwindet die Zeile.
-fn set(row: &adw::ActionRow, value: Option<&str>) {
+fn set(row: &Fact, value: Option<&str>) {
     match value {
         Some(value) if !value.is_empty() => {
-            row.set_subtitle(value);
+            row.value.set_label(value);
             row.set_visible(true);
         }
         _ => row.set_visible(false),
     }
+}
+
+/// Eine Angabe: Bezeichnung links, Wert rechts (wählbar, bricht um).
+#[derive(Clone)]
+struct Fact {
+    row: gtk::Box,
+    value: gtk::Label,
+}
+
+impl Fact {
+    fn new(title: &str) -> Self {
+        let name = gtk::Label::builder()
+            .label(title)
+            .xalign(0.0)
+            .valign(gtk::Align::Start)
+            .css_classes(["fact-name"])
+            .build();
+        let value = gtk::Label::builder()
+            .xalign(1.0)
+            .hexpand(true)
+            .wrap(true)
+            .wrap_mode(gtk::pango::WrapMode::WordChar)
+            .justify(gtk::Justification::Right)
+            .selectable(true)
+            .css_classes(["fact-value"])
+            .build();
+        let row = gtk::Box::builder()
+            .orientation(gtk::Orientation::Horizontal)
+            .css_classes(["fact"])
+            .visible(false)
+            .build();
+        row.append(&name);
+        row.append(&value);
+        Self { row, value }
+    }
+
+    /// Ein Hinweis über die ganze Breite statt einer Angabe.
+    fn note(text: &str) -> Self {
+        let value = gtk::Label::builder()
+            .label(text)
+            .xalign(0.0)
+            .wrap(true)
+            .css_classes(["fact-note"])
+            .build();
+        let row = gtk::Box::builder().visible(false).build();
+        row.append(&value);
+        Self { row, value }
+    }
+
+    fn is_visible(&self) -> bool {
+        self.row.is_visible()
+    }
+
+    fn set_visible(&self, visible: bool) {
+        self.row.set_visible(visible);
+    }
+}
+
+/// Eine Gruppe mit Überschrift (Details, Camera, Location).
+fn group(title: &str) -> gtk::Box {
+    let group = gtk::Box::builder()
+        .orientation(gtk::Orientation::Vertical)
+        .css_classes(["facts"])
+        .build();
+    group.append(
+        &gtk::Label::builder()
+            .label(title)
+            .xalign(0.0)
+            .css_classes(["facts-title"])
+            .build(),
+    );
+    group
 }

@@ -33,6 +33,19 @@ pub struct Overview {
     pub full_res_dir: PathBuf,
 }
 
+/// Wie es um die Synchronisation steht — für die Zeile unten in der
+/// Seitenleiste und die iCloud-Karte der Startseite.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SyncStatus {
+    pub running: bool,
+    /// Der letzte Lauf ist gescheitert (bis zum nächsten gelungenen).
+    pub failed: bool,
+    /// Was gerade geschieht, wie es der Manager oben zeigt.
+    pub phase: String,
+}
+
+type StatusListener = Rc<dyn Fn(&SyncStatus)>;
+
 /// Der Sync-Manager samt Kopfzeilen-Knopf.
 pub struct SyncManager {
     dialog: adw::Dialog,
@@ -78,6 +91,10 @@ pub struct SyncManager {
     /// Ob der letzte Lauf gescheitert ist und das noch niemand gesehen hat.
     unseen_error: Cell<bool>,
     on_sync: RefCell<Option<Rc<dyn Fn()>>>,
+    /// Ob der letzte Lauf scheiterte — anders als `unseen_error` auch dann
+    /// noch, wenn jemand hineingesehen hat.
+    last_failed: Cell<bool>,
+    listeners: RefCell<Vec<StatusListener>>,
 }
 
 impl SyncManager {
@@ -246,6 +263,8 @@ impl SyncManager {
             reached: Cell::new(0),
             unseen_error: Cell::new(false),
             on_sync: RefCell::new(None),
+            last_failed: Cell::new(false),
+            listeners: RefCell::new(Vec::new()),
         });
 
         manager.sync_now.connect_clicked({
@@ -299,6 +318,13 @@ impl SyncManager {
 
     /// Bestand, Zeitpunkte und Speicher — was auch ohne laufenden Sync gilt.
     pub fn show_overview(&self, overview: &Overview) {
+        // Vor dem ersten Lauf dieser Sitzung: der Stand des letzten.
+        if !self.spinner.is_visible()
+            && self.title.label() == "Ready"
+            && overview.last_sync.is_some()
+        {
+            self.title.set_label("Up to Date");
+        }
         self.photos_row.set_subtitle(&thousands(overview.photos));
         self.last_sync_row
             .set_subtitle(overview.last_sync.as_deref().unwrap_or("never"));
@@ -314,6 +340,29 @@ impl SyncManager {
             } else {
                 &overview.apple_id
             });
+    }
+
+    /// Der Stand jetzt.
+    pub fn status(&self) -> SyncStatus {
+        let running = self.spinner.is_visible();
+        SyncStatus {
+            running,
+            failed: self.last_failed.get() && !running,
+            phase: self.title.label().to_string(),
+        }
+    }
+
+    /// Ruft `f` bei jedem Wechsel von Lauf, Phase oder Fehler.
+    pub fn connect_status(&self, f: impl Fn(&SyncStatus) + 'static) {
+        self.listeners.borrow_mut().push(Rc::new(f));
+    }
+
+    fn notify(&self) {
+        let status = self.status();
+        let listeners = self.listeners.borrow().clone();
+        for listener in listeners {
+            listener(&status);
+        }
     }
 
     fn update_button(&self, running: bool) {
@@ -333,6 +382,7 @@ impl SyncManager {
         } else {
             "Sync (Ctrl+Shift+R)"
         }));
+        self.notify();
     }
 
     fn set_running(&self, running: bool) {
@@ -469,6 +519,7 @@ impl SyncManager {
 
     /// Der Lauf ist durch.
     pub fn finished(&self, message: &str) {
+        self.last_failed.set(false);
         self.set_running(false);
         self.title.set_label("Up to Date");
         self.detail.set_label("");
@@ -481,6 +532,7 @@ impl SyncManager {
     /// Kopfzeile zeigt ein Warnzeichen, bis jemand hineingesehen hat.
     pub fn failed(&self, message: &str, detail: &str) {
         self.unseen_error.set(true);
+        self.last_failed.set(true);
         self.set_running(false);
         self.title.set_label(message);
         self.detail.set_label("");
