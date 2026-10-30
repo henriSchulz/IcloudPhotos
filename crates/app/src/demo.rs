@@ -171,9 +171,65 @@ pub fn seed(catalog: &mut Catalog, config: &Config) -> anyhow::Result<()> {
         }
     }
 
+    seed_large(catalog, &shots)?;
     seed_albums(catalog, &shots)?;
     catalog.set_last_sync(Utc::now() - TimeDelta::minutes(4))?;
     tracing::info!(total = catalog.count()?, "Demo-Daten angelegt");
+    Ok(())
+}
+
+/// `ICLOUD_PHOTOS_DEMO_SIZE=N`: N weitere Fotos über drei Jahre, ein gutes
+/// Dutzend am Tag — eine Bibliothek in echter Größe, um „Days" und das Raster
+/// beim Scrollen zu messen. Die Vorschauen teilen sich die Dateien der
+/// kleinen Demo, sonst dauerte das Anlegen Minuten.
+fn seed_large(catalog: &mut Catalog, shots: &[Shot]) -> anyhow::Result<()> {
+    let count: usize = std::env::var("ICLOUD_PHOTOS_DEMO_SIZE")
+        .ok()
+        .and_then(|value| value.parse().ok())
+        .unwrap_or(0);
+    if count == 0 {
+        return Ok(());
+    }
+    let thumbs: Vec<(std::path::PathBuf, u64)> = shots
+        .iter()
+        .filter_map(|shot| catalog.get(&shot.id).ok().flatten())
+        .filter_map(|photo| Some((photo.thumb_path?, photo.thumb_bytes.unwrap_or(0))))
+        .collect();
+    if thumbs.is_empty() {
+        return Ok(());
+    }
+    let start = Utc::now() - TimeDelta::days(1000);
+    let mut records = Vec::with_capacity(count);
+    let mut thumb_rows = Vec::with_capacity(count);
+    for index in 0..count {
+        let id = format!("demo-big-{index:05}");
+        // ~13 am Tag, über den Tag verteilt.
+        let taken =
+            start + TimeDelta::minutes((index as i64 / 13) * 1440 + (index as i64 % 13) * 47 + 540);
+        let video = index % 23 == 0;
+        records.push(PhotoRecord {
+            id: id.clone(),
+            master_id: None,
+            filename: format!(
+                "IMG_{:05}.{}",
+                10_000 + index,
+                if video { "MOV" } else { "HEIC" }
+            ),
+            added_date: taken,
+            asset_date: Some(taken),
+            checksum: None,
+            width: Some(4032),
+            height: Some(3024),
+            lat: None,
+            lon: None,
+            item_type: Some(if video { "movie" } else { "image" }.into()),
+        });
+        let (path, bytes) = &thumbs[index % thumbs.len()];
+        thumb_rows.push((id, path.clone(), *bytes));
+    }
+    catalog.upsert_batch(&records)?;
+    catalog.set_thumbnails(&thumb_rows)?;
+    tracing::info!(count, "große Demo-Bibliothek angelegt");
     Ok(())
 }
 

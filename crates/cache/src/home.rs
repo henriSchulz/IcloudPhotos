@@ -55,6 +55,19 @@ pub struct Day {
     pub place: Option<String>,
 }
 
+/// Ein Tag der Ansicht „Days": wo er im Raster beginnt und wie viele
+/// Fotos er hat.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DayGroup {
+    /// `YYYY-MM-DD` wie gelesen (auch wenn es kein gültiges Datum ist).
+    pub key: String,
+    pub day: Option<NaiveDate>,
+    pub count: u64,
+    pub offset: u64,
+    /// Der erste bekannte Ortsname des Tages.
+    pub place: Option<String>,
+}
+
 /// Zahlen eines Ausschnitts für die Unterzeile einer Seite.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub struct Summary {
@@ -208,6 +221,53 @@ impl Catalog {
             Some(row) => Some(row.get(0)?),
             None => None,
         })
+    }
+
+    /// Die Tage eines Ausschnitts, neueste zuerst: Tag, Anzahl und die
+    /// Rasterposition seines ersten Fotos — die Abschnitte der Ansicht
+    /// „Days". Tage sind lokale Kalendertage; Positionen folgen derselben
+    /// Reihenfolge wie `page_in` (die Sortierung nach dem UTC-Zeitstempel),
+    /// deshalb wird über die Zeilen in Rasterreihenfolge gezählt statt mit
+    /// `GROUP BY` — ein Tag, der in UTC über Mitternacht reicht, bliebe sonst
+    /// nicht zusammen.
+    pub fn day_groups_in(&self, scope: &Scope) -> Result<Vec<DayGroup>, CacheError> {
+        let (source, value) = scope.source(1);
+        let local = local_day();
+        // Der Ort kommt im selben Durchgang mit (ein Blick in `places` je
+        // Foto mit Ort) — einzeln je Tag nachgefragt, kostete jeder Tag einen
+        // Lauf über die ganze Tabelle, und schnelles Scrollen stockte.
+        let sql = format!(
+            "SELECT {local}, places.name FROM {source}              LEFT JOIN places ON photos.lat IS NOT NULL                AND places.cell = printf('%.3f,%.3f', photos.lat, photos.lon)              ORDER BY {SORT_KEY} DESC, photos.id DESC"
+        );
+        let mut stmt = self.conn.prepare(&sql)?;
+        let read = |row: &rusqlite::Row<'_>| {
+            Ok((row.get::<_, String>(0)?, row.get::<_, Option<String>>(1)?))
+        };
+        let days: Vec<(String, Option<String>)> = match value {
+            Some(value) => stmt
+                .query_map([value.as_ref()], read)?
+                .collect::<Result<_, _>>()?,
+            None => stmt.query_map([], read)?.collect::<Result<_, _>>()?,
+        };
+        let mut groups: Vec<DayGroup> = Vec::new();
+        for (index, (raw, place)) in days.into_iter().enumerate() {
+            match groups.last_mut() {
+                Some(group) if group.key == raw => {
+                    group.count += 1;
+                    if group.place.is_none() {
+                        group.place = place;
+                    }
+                }
+                _ => groups.push(DayGroup {
+                    day: parse_day(&raw),
+                    key: raw,
+                    count: 1,
+                    offset: index as u64,
+                    place,
+                }),
+            }
+        }
+        Ok(groups)
     }
 
     /// Wie viele Videos im Katalog liegen.
@@ -429,6 +489,28 @@ mod tests {
             ]
         );
         assert_eq!(days[0].photos[0].id(), "a");
+    }
+
+    #[test]
+    fn day_groups_follow_the_grid_order() {
+        let catalog = catalog(&[
+            ("a", "2026-10-29T12:00:00Z", "A.HEIC"),
+            ("b", "2026-10-29T11:00:00Z", "B.HEIC"),
+            ("c", "2026-10-27T12:00:00Z", "C.HEIC"),
+        ]);
+        let groups = catalog.day_groups_in(&Scope::Library).unwrap();
+        let got: Vec<(Option<NaiveDate>, u64, u64)> =
+            groups.iter().map(|g| (g.day, g.count, g.offset)).collect();
+        assert_eq!(
+            got,
+            [
+                (Some(day("2026-10-29")), 2, 0),
+                (Some(day("2026-10-27")), 1, 2)
+            ]
+        );
+        // Die Positionen stimmen mit der Seite überein.
+        let page = catalog.page_in(&Scope::Library, 2, 1).unwrap();
+        assert_eq!(page[0].id(), "c");
     }
 
     #[test]
