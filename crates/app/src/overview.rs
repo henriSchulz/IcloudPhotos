@@ -43,6 +43,8 @@ impl Overview {
             .selection_mode(gtk::SelectionMode::None)
             .max_children_per_line(8)
             .valign(gtk::Align::Start)
+            .row_spacing(velum::photos("cardGap", 12.0) as u32)
+            .column_spacing(velum::photos("cardGap", 12.0) as u32)
             .css_classes(["overview-grid"])
             .build();
         let widget = gtk::ScrolledWindow::builder()

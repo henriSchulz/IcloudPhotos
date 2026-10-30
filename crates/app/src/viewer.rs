@@ -12,7 +12,9 @@ use adw::prelude::*;
 use gtk::{gdk, gio, glib};
 
 use crate::export;
+use crate::icons::Weight;
 use crate::info_panel::InfoPanel;
+use crate::menu;
 use crate::photo_object::PhotoObject;
 use crate::window::{AppState, UiAction};
 use crate::zoom_view::{Swipe, ZOOM_STEP, ZoomView};
@@ -68,6 +70,8 @@ pub struct Viewer {
     stage: gtk::Overlay,
     narrow: Cell<bool>,
     info_toggle: gtk::ToggleButton,
+    favorite: gtk::ToggleButton,
+    menu_button: gtk::MenuButton,
     /// Position im Modell des Rasters.
     position: Cell<u32>,
 }
@@ -142,12 +146,11 @@ pub fn open(
         back_label
     };
     let back = gtk::Button::builder()
-        .child(
-            &adw::ButtonContent::builder()
-                .icon_name("go-previous-symbolic")
-                .label(&back_label)
-                .build(),
-        )
+        .child(&crate::icons::content(
+            "chevron.left",
+            "go-previous-symbolic",
+            Some(&back_label),
+        ))
         .tooltip_text(format!("Back to {back_label} (Esc)"))
         .css_classes(["back"])
         .build();
@@ -163,11 +166,11 @@ pub fn open(
     header.pack_start(&nav_separator);
 
     let previous = gtk::Button::builder()
-        .icon_name("go-previous-symbolic")
+        .child(&crate::icons::icon("chevron.left", Weight::Bold))
         .tooltip_text("Previous Photo (←)")
         .build();
     let next = gtk::Button::builder()
-        .icon_name("go-next-symbolic")
+        .child(&crate::icons::icon("chevron.right", Weight::Bold))
         .tooltip_text("Next Photo (→)")
         .build();
     let navigation = gtk::Box::new(gtk::Orientation::Horizontal, 0);
@@ -176,37 +179,65 @@ pub fn open(
     header.pack_start(&navigation);
 
     let fullscreen = gtk::Button::builder()
-        .icon_name("view-fullscreen-symbolic")
+        .child(&crate::icons::icon("fullscreen", Weight::Regular))
         .tooltip_text("Full Screen (F)")
         .build();
     header.pack_end(&fullscreen);
 
     let info_toggle = gtk::ToggleButton::builder()
-        .icon_name("dialog-information-symbolic")
+        .child(&crate::icons::icon("callout", Weight::Regular))
         .tooltip_text("Info (I)")
         .active(INFO_OPEN.get())
         .build();
     header.pack_end(&info_toggle);
     header.pack_end(&head_separator());
 
-    let menu = gio::Menu::new();
-    menu.append(Some("Export…"), Some("viewer.save"));
-    menu.append(Some("Copy"), Some("viewer.copy"));
-    menu.append(Some("Open in Default App"), Some("viewer.open"));
+    let mut entries = vec![
+        menu::item(
+            "share",
+            "document-save-symbolic",
+            "Export…",
+            "viewer.save",
+            Some("Ctrl+S"),
+        ),
+        menu::item(
+            "duplicate",
+            "edit-copy-symbolic",
+            "Copy",
+            "viewer.copy",
+            Some("Ctrl+C"),
+        ),
+        menu::item(
+            "open.external",
+            "document-open-symbolic",
+            "Open in Default App",
+            "viewer.open",
+            Some("Ctrl+O"),
+        ),
+    ];
     if crate::retouch::available() {
-        menu.append(Some("Edit in Retouch"), Some("viewer.retouch"));
+        entries.push(menu::item(
+            "editor",
+            "document-edit-symbolic",
+            "Edit in Retouch",
+            "viewer.retouch",
+            Some("E"),
+        ));
     }
-    let danger = gio::Menu::new();
-    danger.append(Some("Delete…"), Some("viewer.delete"));
-    menu.append_section(None, &danger);
-    let menu_button = gtk::MenuButton::builder()
-        .icon_name("view-more-symbolic")
-        .menu_model(&menu)
-        .tooltip_text("Actions")
-        .build();
+    entries.push(menu::Entry::Separator);
+    entries.push(menu::danger(
+        "trash",
+        "user-trash-symbolic",
+        "Delete…",
+        "viewer.delete",
+        Some("Del"),
+    ));
+    let actions_menu = menu::build(&[], &entries);
+    let menu_button = crate::icons::menu_button("more", "view-more-symbolic", "Actions");
+    menu_button.set_popover(Some(&actions_menu.popover));
     header.pack_end(&menu_button);
     let export = gtk::Button::builder()
-        .icon_name("document-save-symbolic")
+        .child(&crate::icons::icon("share", Weight::Regular))
         .tooltip_text("Export… (Ctrl+S)")
         .action_name("viewer.save")
         .css_classes(["wide-only"])
@@ -215,13 +246,21 @@ pub fn open(
     if crate::retouch::available() {
         header.pack_end(
             &gtk::Button::builder()
-                .icon_name("document-edit-symbolic")
+                .child(&crate::icons::icon("editor", Weight::Regular))
                 .tooltip_text("Edit in Retouch (E)")
                 .action_name("viewer.retouch")
                 .css_classes(["wide-only"])
                 .build(),
         );
     }
+    // Favorit: das Herz, voll und im Akzent, solange das Foto einer ist.
+    let favorite = gtk::ToggleButton::builder()
+        .child(&crate::icons::icon("heart", Weight::Regular))
+        .tooltip_text("Favorite (.)")
+        .action_name("viewer.favorite")
+        .css_classes(["favorite"])
+        .build();
+    header.pack_end(&favorite);
 
     let zoom_label = gtk::Label::builder()
         .css_classes(["dim-label", "numeric"])
@@ -243,7 +282,7 @@ pub fn open(
     // Info als Karte: Kopf „Info" mit Schließen, darunter das Panel.
     let info = InfoPanel::new();
     let close_info = gtk::Button::builder()
-        .icon_name("window-close-symbolic")
+        .child(&crate::icons::icon("close", Weight::Bold))
         .tooltip_text("Hide Info (I)")
         .css_classes(["flat"])
         .build();
@@ -366,6 +405,8 @@ pub fn open(
         stage: stage.clone(),
         narrow: Cell::new(false),
         info_toggle: info_toggle.clone(),
+        favorite: favorite.clone(),
+        menu_button: menu_button.clone(),
         position: Cell::new(position),
     });
 
@@ -588,6 +629,7 @@ impl Viewer {
         self.stop_video();
         self.picture.reset();
         self.refresh_info();
+        self.refresh_favorite();
 
         let Some(photo) = self.current() else {
             self.stack.set_visible_child_name("failed");
@@ -776,6 +818,28 @@ impl Viewer {
             .show(&row, &photo.captured_label(), place.as_deref());
     }
 
+    /// Öffnet das ⋯-Menü (Prüfstand).
+    pub fn popup_menu(&self) {
+        self.menu_button.popup();
+    }
+
+    /// Das Herz im Kopf auf den Stand des gezeigten Fotos.
+    pub fn refresh_favorite(&self) {
+        let on = self
+            .current()
+            .filter(|photo| !photo.is_placeholder())
+            .is_some_and(|photo| crate::window::is_favorite(&photo.id()));
+        if self.favorite.is_active() != on {
+            self.favorite.set_active(on);
+        }
+        if let Some(glyph) = self.favorite.child() {
+            let weight = if on { Weight::Fill } else { Weight::Regular };
+            crate::icons::set_glyph(&glyph, "heart", weight, crate::icons::fallback("heart"));
+        }
+        self.favorite
+            .set_tooltip_text(Some(if on { "Unfavorite (.)" } else { "Favorite (.)" }));
+    }
+
     fn toggle_info(&self) {
         self.set_info(!INFO_OPEN.get());
     }
@@ -919,6 +983,10 @@ fn connect_keys(viewer: &Rc<Viewer>) {
                 gdk::Key::_1 | gdk::Key::KP_1 => viewer.picture.actual_size(None),
                 gdk::Key::f | gdk::Key::F11 => viewer.toggle_fullscreen(),
                 gdk::Key::i | gdk::Key::I => viewer.toggle_info(),
+                // Wie in Photos: „." legt das Foto zu den Favoriten.
+                gdk::Key::period => {
+                    let _ = WidgetExt::activate_action(&viewer.page, "viewer.favorite", None);
+                }
                 gdk::Key::e | gdk::Key::E if crate::retouch::available() => {
                     let _ = WidgetExt::activate_action(&viewer.page, "viewer.retouch", None);
                 }
@@ -972,6 +1040,20 @@ fn connect_actions(viewer: &Rc<Viewer>, group: &gio::SimpleActionGroup) {
         });
         group.add_action(&entry);
     }
+
+    // Favorit an/aus für das gezeigte Foto (Herz im Kopf, Taste „.").
+    let favorite = gio::SimpleAction::new("favorite", None);
+    favorite.connect_activate({
+        let weak = Rc::downgrade(viewer);
+        move |_, _| {
+            with(&weak, |viewer| {
+                if let Some(item) = viewer.item() {
+                    viewer.state.toggle_favorite(vec![item.id]);
+                }
+            });
+        }
+    });
+    group.add_action(&favorite);
 
     // Löschen: nachfragen, dann zurück ins Raster und in iCloud löschen.
     let delete = gio::SimpleAction::new("delete", None);

@@ -23,6 +23,9 @@ mod imp {
         /// Fest so breit wie `natural` (Titelbild in einer Zeile), statt
         /// mit dem Platz zu wachsen und zu schrumpfen.
         pub fixed: Cell<bool>,
+        /// Mindestbreite — eine Kachel in einem `FlowBox`, das aus ihr die
+        /// Spaltenzahl rechnet.
+        pub min_width: Cell<i32>,
     }
 
     impl Default for RatioBox {
@@ -31,6 +34,7 @@ mod imp {
                 ratio: Cell::new(1.0),
                 natural: Cell::new(0),
                 fixed: Cell::new(false),
+                min_width: Cell::new(0),
             }
         }
     }
@@ -64,7 +68,10 @@ mod imp {
             let fixed = self.fixed.get();
             match orientation {
                 gtk::Orientation::Horizontal if fixed => (natural, natural, -1, -1),
-                gtk::Orientation::Horizontal => (0, natural, -1, -1),
+                gtk::Orientation::Horizontal => {
+                    let min = self.min_width.get();
+                    (min, natural.max(min), -1, -1)
+                }
                 _ => {
                     let width = if for_size >= 0 && !fixed {
                         for_size
@@ -76,7 +83,10 @@ mod imp {
                     // und Wunsch mit verschiedenen Breiten — ein Minimum über
                     // dem Wunsch wäre ein Fehler. Gezeichnet wird in Spalten,
                     // die ohnehin die Wunschhöhe vergeben.
-                    (if fixed { height } else { 0 }, height, -1, -1)
+                    // Mit Mindestbreite (Kachel in „Days") gilt auch die
+                    // Höhe als Minimum: Listenzeilen vergeben nur das.
+                    let strict = fixed || self.min_width.get() > 0;
+                    (if strict { height } else { 0 }, height, -1, -1)
                 }
             }
         }
@@ -231,6 +241,147 @@ mod imp {
             }
         }
     }
+
+    pub struct TileGrid {
+        /// Kleinste Kachel; daraus folgt die Spaltenzahl.
+        pub tile: Cell<i32>,
+        pub gap: Cell<i32>,
+    }
+
+    impl Default for TileGrid {
+        fn default() -> Self {
+            Self {
+                tile: Cell::new(120),
+                gap: Cell::new(2),
+            }
+        }
+    }
+
+    #[glib::object_subclass]
+    impl ObjectSubclass for TileGrid {
+        const NAME: &'static str = "PhotosTileGrid";
+        type Type = super::TileGrid;
+        type ParentType = gtk::Widget;
+
+        fn class_init(klass: &mut Self::Class) {
+            klass.set_css_name("tilegrid");
+        }
+    }
+
+    impl ObjectImpl for TileGrid {
+        fn dispose(&self) {
+            while let Some(child) = self.obj().first_child() {
+                child.unparent();
+            }
+        }
+    }
+
+    impl TileGrid {
+        fn count(&self) -> i32 {
+            let mut n = 0;
+            let mut child = self.obj().first_child();
+            while let Some(widget) = child {
+                n += 1;
+                child = widget.next_sibling();
+            }
+            n
+        }
+
+        /// Spalten und Kantenlänge für eine Breite.
+        fn layout(&self, width: i32) -> (i32, i32) {
+            let gap = self.gap.get();
+            let tile = self.tile.get().max(1);
+            let columns = ((width + gap) / (tile + gap)).max(1);
+            let size = (width - gap * (columns - 1)) / columns;
+            (columns, size.max(1))
+        }
+    }
+
+    impl WidgetImpl for TileGrid {
+        fn request_mode(&self) -> gtk::SizeRequestMode {
+            gtk::SizeRequestMode::HeightForWidth
+        }
+
+        // Ohne die Kinder zu fragen: alle Kacheln sind gleich groß und
+        // quadratisch. Das hält das Messen billig — eine Liste aus Tagen misst
+        // bei jedem Bild jede gebundene Zeile.
+        fn measure(&self, orientation: gtk::Orientation, for_size: i32) -> (i32, i32, i32, i32) {
+            let n = self.count();
+            let gap = self.gap.get();
+            match orientation {
+                gtk::Orientation::Horizontal => {
+                    let tile = self.tile.get();
+                    (tile, (tile + gap) * n.max(1) - gap, -1, -1)
+                }
+                _ => {
+                    if n == 0 {
+                        return (0, 0, -1, -1);
+                    }
+                    let width = if for_size >= 0 {
+                        for_size
+                    } else {
+                        self.tile.get() * n
+                    };
+                    let (columns, size) = self.layout(width);
+                    let rows = (n + columns - 1) / columns;
+                    let height = rows * size + (rows - 1) * gap;
+                    (height, height, -1, -1)
+                }
+            }
+        }
+
+        fn size_allocate(&self, width: i32, _height: i32, _baseline: i32) {
+            let (columns, size) = self.layout(width);
+            let gap = self.gap.get();
+            let mut index = 0;
+            let mut child = self.obj().first_child();
+            while let Some(widget) = child {
+                let (column, row) = (index % columns, index / columns);
+                let transform = gsk::Transform::new().translate(&graphene::Point::new(
+                    (column * (size + gap)) as f32,
+                    (row * (size + gap)) as f32,
+                ));
+                widget.allocate(size, size, -1, Some(transform));
+                index += 1;
+                child = widget.next_sibling();
+            }
+        }
+    }
+}
+
+glib::wrapper! {
+    /// Gleich große, quadratische Kacheln in so vielen Spalten, wie die
+    /// Breite bei `tile` hergibt — „Days".
+    pub struct TileGrid(ObjectSubclass<imp::TileGrid>)
+        @extends gtk::Widget,
+        @implements gtk::Accessible, gtk::Buildable, gtk::ConstraintTarget;
+}
+
+impl TileGrid {
+    pub fn new(tile: i32, gap: i32) -> Self {
+        let this: Self = glib::Object::new();
+        this.imp().tile.set(tile);
+        this.imp().gap.set(gap);
+        this
+    }
+
+    pub fn append(&self, child: &impl IsA<gtk::Widget>) {
+        child.set_parent(self);
+        self.queue_resize();
+    }
+
+    pub fn remove_all(&self) {
+        while let Some(child) = self.first_child() {
+            child.unparent();
+        }
+        self.queue_resize();
+    }
+
+    pub fn set_tile(&self, tile: i32) {
+        if self.imp().tile.replace(tile) != tile {
+            self.queue_resize();
+        }
+    }
 }
 
 glib::wrapper! {
@@ -256,6 +407,14 @@ impl RatioBox {
         let this = Self::new(child, ratio, size);
         this.imp().fixed.set(true);
         this
+    }
+
+    /// Mindestens so breit (Kachel im Tagesraster).
+    pub fn set_min_width(&self, width: i32) {
+        if self.imp().min_width.replace(width) != width {
+            self.imp().natural.set(width);
+            self.queue_resize();
+        }
     }
 
     /// Ein weiteres Kind darüber, etwa ein Kennzeichen in der Ecke. Es wird

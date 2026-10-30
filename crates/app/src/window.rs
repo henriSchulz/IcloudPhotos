@@ -13,11 +13,14 @@ use std::path::PathBuf;
 
 use crate::chrome::{self, PageHead, SyncRow};
 use crate::collections::{Collections, Pick};
+use crate::days::{self, DaysView};
 use crate::downloader::{self, DownloadMessage, Downloader};
 use crate::export;
 use crate::geocode::{self, Geocoder};
 use crate::home::Home;
+use crate::icons::Weight;
 use crate::map_view::{self, MapView};
+use crate::menu;
 use crate::overview::Overview as Overviews;
 use crate::photo_object::PhotoObject;
 use crate::sidebar::{Sidebar, Target, display_name};
@@ -46,9 +49,26 @@ thread_local! {
     static TILE_SIZE: Cell<i32> = const { Cell::new(THUMB_SIZE) };
 }
 
+thread_local! {
+    /// Die Favoriten (Album „Favorites") — für das Herz auf den Kacheln.
+    static FAVORITES: RefCell<HashSet<String>> = RefCell::default();
+    /// Das Suchfeld der Seitenleiste (der Prüfstand tippt hinein).
+    static SEARCH: RefCell<Option<Rc<chrome::SearchField>>> = const { RefCell::new(None) };
+    /// „Days", damit eine neue Kachelgröße auch dort ankommt.
+    static DAYS_VIEW: RefCell<Option<std::rc::Weak<DaysView>>> = const { RefCell::new(None) };
+}
+
+/// Ob ein Foto Favorit ist.
+pub fn is_favorite(id: &str) -> bool {
+    FAVORITES.with_borrow(|set| set.contains(id))
+}
+
 /// Setzt die Kachelgröße des Rasters.
 fn set_tile_size(size: i32) {
     TILE_SIZE.set(size);
+    if let Some(days) = DAYS_VIEW.with_borrow(|weak| weak.as_ref().and_then(|w| w.upgrade())) {
+        days.set_tile_size(size);
+    }
     TILE_CSS.with_borrow_mut(|slot| {
         let provider = slot.get_or_insert_with(|| {
             let provider = gtk::CssProvider::new();
@@ -213,7 +233,15 @@ pub struct AppState {
     home_return: Cell<bool>,
     /// Beschriftung des Zurück-Knopfs im Betrachter („Library", Albumname …).
     pub viewer_back: RefCell<String>,
-    context_menu: RefCell<Option<gtk::PopoverMenu>>,
+    context_menu: RefCell<Option<Rc<menu::Menu>>>,
+    days_menu: RefCell<Option<Rc<menu::Menu>>>,
+    days: RefCell<Option<Rc<DaysView>>>,
+    /// Bestand, mit dem „Days" zuletzt gebaut wurde.
+    days_built: Cell<Option<u64>>,
+    /// Die Favorit-Knöpfe (Aktionsleiste), umbeschriftet je Auswahl.
+    favorite_buttons: RefCell<Vec<gtk::Button>>,
+    /// Anker für Umschalt-Klick in „Days".
+    days_anchor: Cell<Option<u32>>,
 }
 
 /// Was statt der Anmeldung im Inhaltsbereich steht.
@@ -223,6 +251,8 @@ enum Content {
     Home,
     /// Das Raster — Bibliothek, Album oder ein Ort von der Karte.
     Grid,
+    /// Die Bibliothek nach Tagen, mit Kopf je Tag.
+    Days,
     /// Die Bibliothek nach Jahren.
     Years,
     /// Die Bibliothek nach Monaten.
@@ -238,6 +268,7 @@ enum Content {
 pub enum Zoom {
     Years,
     Months,
+    Days,
     All,
 }
 
@@ -324,12 +355,17 @@ impl AppState {
             sync_row: RefCell::new(None),
             place_title: RefCell::new(None),
             subset: RefCell::new(None),
-            zoom: Cell::new(Zoom::All),
+            zoom: Cell::new(Zoom::Days),
             zoom_toggles: RefCell::new(Vec::new()),
             selecting: Cell::new(false),
             home_return: Cell::new(false),
             viewer_back: RefCell::new(String::new()),
             context_menu: RefCell::new(None),
+            days_menu: RefCell::new(None),
+            days: RefCell::new(None),
+            days_built: Cell::new(None),
+            favorite_buttons: RefCell::new(Vec::new()),
+            days_anchor: Cell::new(None),
         })
     }
 
@@ -366,6 +402,7 @@ impl AppState {
     /// Liest die Alben neu — nach einem Album-Sync und nach jedem Lauf, weil
     /// sich mit neuen Fotos auch die Zahlen in den Alben ändern.
     fn refresh_albums(&self) {
+        self.reload_favorites();
         let albums = match self.catalog.borrow().albums() {
             Ok(albums) => albums,
             Err(error) => {
@@ -477,6 +514,8 @@ impl AppState {
             // Eine leere Bibliothek hat keine Startseite — nur den Hinweis.
             Content::Home if total == 0 && !self.syncing.get() => return "empty",
             Content::Home => return "home",
+            Content::Days if total == 0 && !self.syncing.get() => return "empty",
+            Content::Days => return "days",
             Content::Years | Content::Months => return "overview",
             Content::Collections => return "collections",
             Content::Map => return "map",
@@ -583,6 +622,12 @@ impl AppState {
         let Some(grid) = self.grid.borrow().clone() else {
             return;
         };
+        if self.content.get() == Content::Days {
+            if let Some(days) = self.days.borrow().as_ref() {
+                days.scroll_to_offset(u64::from(position));
+            }
+            return;
+        }
         if position < self.model.n_items() {
             grid.scroll_to(position, gtk::ListScrollFlags::FOCUS, None);
         }
@@ -845,7 +890,7 @@ impl AppState {
                 );
                 controls = "home";
             }
-            Content::Years | Content::Months => {
+            Content::Days | Content::Years | Content::Months => {
                 head.set("Library", &library_line());
                 controls = "library";
             }
@@ -1051,10 +1096,168 @@ impl AppState {
                 }
             }
         }
+        if let Some(days) = self.days.borrow().as_ref() {
+            days.set_selecting(on);
+        }
         self.refresh_action_bar();
         if was != on {
             self.refresh_head();
         }
+    }
+
+    /// Liest die Favoriten neu aus dem Katalog.
+    fn reload_favorites(&self) {
+        let ids = self.catalog.borrow().favorite_ids().unwrap_or_default();
+        FAVORITES.with_borrow_mut(|set| *set = ids);
+    }
+
+    /// Favorit an oder aus für diese Fotos: sind alle schon Favoriten, gehen
+    /// sie heraus, sonst kommen alle hinein — wie in Photos. Sofort im
+    /// Katalog und auf dem Bildschirm, dann in iCloud; lehnt iCloud ab, nimmt
+    /// `favorite_failed` es zurück.
+    pub fn toggle_favorite(self: &Rc<Self>, ids: Vec<String>) {
+        if ids.is_empty() {
+            return;
+        }
+        let value = !ids.iter().all(|id| is_favorite(id));
+        self.apply_favorite(&ids, value);
+        if let Some(downloader) = self.downloader.borrow().as_ref() {
+            for id in &ids {
+                downloader.favorite(id, value);
+            }
+        }
+    }
+
+    /// iCloud hat abgelehnt: den alten Stand zurück.
+    fn favorite_failed(self: &Rc<Self>, id: &str, value: bool) {
+        self.apply_favorite(&[id.to_string()], !value);
+    }
+
+    fn apply_favorite(self: &Rc<Self>, ids: &[String], value: bool) {
+        for id in ids {
+            if let Err(error) = self.catalog.borrow().set_favorite(id, value) {
+                tracing::error!(%id, %error, "Favorit nicht im Katalog vermerkt");
+            }
+        }
+        FAVORITES.with_borrow_mut(|set| {
+            for id in ids {
+                if value {
+                    set.insert(id.clone());
+                } else {
+                    set.remove(id);
+                }
+            }
+        });
+        // Kacheln des Rasters: über die Eigenschaft, an der ihre Bindung hängt.
+        let wanted: HashSet<&str> = ids.iter().map(String::as_str).collect();
+        for index in 0..self.model.n_items() {
+            if let Some(object) = self.model.item(index).and_downcast::<PhotoObject>()
+                && wanted.contains(object.id().as_str())
+            {
+                object.notify("thumb-path");
+            }
+        }
+        self.refresh_days_marks();
+        self.refresh_albums();
+        self.refresh_favorite_buttons();
+        if self.content.get() == Content::Home {
+            self.refresh_home();
+        }
+        let viewer = self.viewer.borrow().clone();
+        if let Some(viewer) = viewer {
+            viewer.refresh_favorite();
+        }
+        // Ein Favoriten-Album im Blick zählt neu.
+        if matches!(&*self.scope.borrow(), Scope::Album(id) if id == "Favorites") {
+            let state = self.clone();
+            glib::idle_add_local_once(move || {
+                state.sync_model();
+                state.refresh_ui();
+            });
+        }
+    }
+
+    /// „Favorite" oder „Unfavorite" je nach Auswahl.
+    fn refresh_favorite_buttons(&self) {
+        let ids: Vec<String> = self
+            .grid
+            .borrow()
+            .as_ref()
+            .map(|grid| {
+                selected_items(grid)
+                    .into_iter()
+                    .map(|item| item.id)
+                    .collect()
+            })
+            .unwrap_or_default();
+        let all = !ids.is_empty() && ids.iter().all(|id| is_favorite(id));
+        let label = if all { "Unfavorite" } else { "Favorite" };
+        let weight = if all { Weight::Fill } else { Weight::Regular };
+        let mut buttons = self.favorite_buttons.borrow().clone();
+        for menu in [
+            self.context_menu.borrow().clone(),
+            self.days_menu.borrow().clone(),
+        ]
+        .into_iter()
+        .flatten()
+        {
+            buttons.extend(
+                menu.big
+                    .iter()
+                    .filter(|b| b.action_name().as_deref() == Some("photos.favorite"))
+                    .cloned(),
+            );
+        }
+        for button in buttons {
+            menu::relabel(
+                &button,
+                "heart",
+                weight,
+                crate::icons::fallback("heart"),
+                label,
+            );
+        }
+    }
+
+    /// Ringe und Herzen der sichtbaren Kacheln in „Days".
+    fn refresh_days_marks(&self) {
+        let Some(days) = self.days.borrow().clone() else {
+            return;
+        };
+        let selection = self.grid.borrow().as_ref().and_then(|grid| grid.model());
+        let selected = |position: u32| {
+            selection
+                .as_ref()
+                .is_some_and(|model| position < model.n_items() && model.is_selected(position))
+        };
+        days.refresh_marks(&selected, &is_favorite);
+    }
+
+    /// Baut „Days", wenn es zu sehen ist und sich der Bestand geändert hat.
+    fn refresh_days(&self) {
+        if self.content.get() != Content::Days {
+            return;
+        }
+        let total = self.catalog.borrow().count().unwrap_or(0);
+        if self.days_built.get() == Some(total) {
+            return;
+        }
+        let Some(days) = self.days.borrow().clone() else {
+            return;
+        };
+        let groups = self
+            .catalog
+            .borrow()
+            .day_groups_in(&Scope::Library)
+            .unwrap_or_default();
+        days.show(groups);
+        self.days_built.set(Some(total));
+    }
+
+    /// Lädt das Modell bis zu dieser Rasterposition — „Days" zeigt Fotos, die
+    /// das Raster noch nicht geladen hat.
+    fn load_until(&self, position: u32) {
+        while self.model.n_items() <= position && self.load_next_page() {}
     }
 
     /// Die Aktionsleiste steht im Auswahlmodus und bei mehreren gewählten
@@ -1067,7 +1270,7 @@ impl AppState {
             .map(|grid| selected_items(grid).len())
             .unwrap_or(0);
         if let Some(bar) = self.action_bar.borrow().as_ref() {
-            let in_grid = self.content.get() == Content::Grid;
+            let in_grid = matches!(self.content.get(), Content::Grid | Content::Days);
             bar.set_visible(in_grid && (self.selecting.get() || count >= 2));
             bar.set_sensitive(count > 0);
         }
@@ -1233,22 +1436,7 @@ pub fn build(app: &adw::Application, state: Rc<AppState>) {
         };
         set_tile_size(tile_step_for(want as i32, 1.0));
     });
-    let pinch = gtk::GestureZoom::new();
-    let pinch_start = Rc::new(Cell::new(THUMB_SIZE));
-    pinch.connect_begin({
-        let pinch_start = pinch_start.clone();
-        move |_, _| pinch_start.set(TILE_SIZE.get())
-    });
-    pinch.connect_scale_changed({
-        let pinch_start = pinch_start.clone();
-        move |_, scale| {
-            let step = tile_step_for(pinch_start.get(), scale);
-            if step != TILE_SIZE.get() {
-                set_tile_size(step);
-            }
-        }
-    });
-    scroller.add_controller(pinch);
+    add_pinch(&scroller);
 
     // Mitlaufende Datumszeile. Ein GtkGridView kennt keine Abschnittsköpfe —
     // eine Zeile, die immer den Monat der obersten sichtbaren Reihe zeigt,
@@ -1323,15 +1511,22 @@ pub fn build(app: &adw::Application, state: Rc<AppState>) {
     // Years und Months: ein Klick springt im Raster dorthin.
     let overview = Overviews::new({
         let state = state.clone();
-        let grid = grid.clone();
         move |offset| {
-            state.content.set(Content::Grid);
+            // Aus einem Jahr oder Monat hinein in die Tage, dort wo er beginnt.
+            state.zoom.set(Zoom::Days);
+            state.content.set(Content::Days);
             state.refresh_ui();
-            jump_to(&state, &grid, offset);
-            grid.grab_focus();
+            if let Some(days) = state.days.borrow().as_ref() {
+                days.scroll_to_offset(offset);
+            }
         }
     });
     *state.overview.borrow_mut() = Some(overview.clone());
+
+    // „Days": Tage mit Kopf; Positionen und Auswahl sind die des Rasters.
+    let days_view = build_days(&state, &window, &grid);
+    DAYS_VIEW.with_borrow_mut(|slot| *slot = Some(Rc::downgrade(&days_view)));
+    add_pinch(&days_view.widget);
 
     let stack = gtk::Stack::builder()
         .transition_type(gtk::StackTransitionType::Crossfade)
@@ -1342,6 +1537,7 @@ pub fn build(app: &adw::Application, state: Rc<AppState>) {
     stack.add_named(&collections.widget, Some("collections"));
     stack.add_named(&map_view.widget, Some("map"));
     stack.add_named(&overview.widget, Some("overview"));
+    stack.add_named(&days_view.widget, Some("days"));
     *state.stack.borrow_mut() = Some(stack.clone());
 
     // Die schwebende Aktionsleiste der Auswahl, unten in der Mitte.
@@ -1354,29 +1550,34 @@ pub fn build(app: &adw::Application, state: Rc<AppState>) {
         .build();
     for (icon, label, tooltip, action) in [
         (
-            "document-save-symbolic",
+            "share",
             "Export…",
             "Export Selection… (Ctrl+S)",
             "photos.save",
         ),
         (
-            "edit-copy-symbolic",
+            "duplicate",
             "Copy",
             "Copy Selection (Ctrl+C)",
             "photos.copy",
         ),
         (
-            "document-open-symbolic",
+            "open.external",
             "Open",
             "Open in Default App (Ctrl+O)",
             "photos.open",
         ),
+        ("heart", "Favorite", "Favorite", "photos.favorite"),
     ] {
-        action_bar.append(&chrome::bar_button(icon, label, tooltip, action));
+        let button = chrome::bar_button(icon, label, tooltip, action);
+        if action == "photos.favorite" {
+            state.favorite_buttons.borrow_mut().push(button.clone());
+        }
+        action_bar.append(&button);
     }
     if crate::retouch::available() {
         action_bar.append(&chrome::bar_button(
-            "document-edit-symbolic",
+            "editor",
             "Retouch",
             "Edit in Retouch",
             "photos.retouch",
@@ -1384,7 +1585,7 @@ pub fn build(app: &adw::Application, state: Rc<AppState>) {
     }
     action_bar.append(&gtk::Separator::new(gtk::Orientation::Vertical));
     let delete_button = chrome::bar_button(
-        "user-trash-symbolic",
+        "trash",
         "Delete…",
         "Delete Selection (Del)",
         "photos.delete",
@@ -1440,23 +1641,20 @@ pub fn build(app: &adw::Application, state: Rc<AppState>) {
     // Die Seitenleiste: Suche, die Ziele, unten der Stand der Synchronisation.
     let sidebar = Sidebar::new();
     *state.sidebar.borrow_mut() = Some(sidebar.clone());
-    let search = gtk::SearchEntry::builder()
-        .placeholder_text("Search Photos")
-        .css_classes(["photos-search"])
-        .build();
+    let search = chrome::SearchField::new("Search Photos");
+    SEARCH.with_borrow_mut(|slot| *slot = Some(search.clone()));
     // In der schmalen Leiste ein Knopf; die Suche öffnet sich dann darüber.
-    let search_button = gtk::MenuButton::builder()
-        .icon_name("system-search-symbolic")
-        .tooltip_text("Search Photos")
-        .css_classes(["flat", "rail-search"])
-        .halign(gtk::Align::Center)
-        .visible(false)
-        .build();
-    let rail_search = gtk::SearchEntry::builder()
-        .placeholder_text("Search Photos")
-        .width_chars(22)
-        .build();
-    search_button.set_popover(Some(&gtk::Popover::builder().child(&rail_search).build()));
+    let search_button =
+        crate::icons::menu_button("search", "system-search-symbolic", "Search Photos");
+    search_button.add_css_class("flat");
+    search_button.add_css_class("rail-search");
+    search_button.set_halign(gtk::Align::Center);
+    search_button.set_visible(false);
+    let rail_search = chrome::SearchField::new("Search Photos");
+    rail_search.widget.set_width_request(220);
+    search_button.set_popover(Some(
+        &gtk::Popover::builder().child(&rail_search.widget).build(),
+    ));
     let sync_row = chrome::SyncRow::new(
         {
             let window = window.clone();
@@ -1476,7 +1674,7 @@ pub fn build(app: &adw::Application, state: Rc<AppState>) {
         .orientation(gtk::Orientation::Vertical)
         .css_classes(["photos-sidebar"])
         .build();
-    panel.append(&search);
+    panel.append(&search.widget);
     panel.append(&search_button);
     panel.append(&sidebar.widget);
     panel.append(&sync_row.widget);
@@ -1506,7 +1704,7 @@ pub fn build(app: &adw::Application, state: Rc<AppState>) {
         move |rail: bool| {
             sidebar.set_rail(rail);
             sync_row.set_rail(rail);
-            search.set_visible(!rail);
+            search.widget.set_visible(!rail);
             search_button.set_visible(rail);
             if rail {
                 panel.add_css_class("rail");
@@ -1597,6 +1795,7 @@ pub fn build(app: &adw::Application, state: Rc<AppState>) {
                 Target::Library => match state.zoom.get() {
                     Zoom::Years => Content::Years,
                     Zoom::Months => Content::Months,
+                    Zoom::Days => Content::Days,
                     Zoom::All => Content::Grid,
                 },
                 Target::Album(_) => Content::Grid,
@@ -1678,17 +1877,17 @@ pub fn build(app: &adw::Application, state: Rc<AppState>) {
             let _ = &grid;
         })
     };
-    search.connect_search_changed({
+    search.connect_changed({
         let run_search = run_search.clone();
-        move |entry| run_search(entry.text().to_string())
+        move |text| run_search(text)
     });
-    rail_search.connect_search_changed({
+    rail_search.connect_changed({
         let run_search = run_search.clone();
-        move |entry| run_search(entry.text().to_string())
+        move |text| run_search(text)
     });
     search.connect_activate({
         let grid = grid.clone();
-        move |_| {
+        move || {
             grid.grab_focus();
         }
     });
@@ -1873,6 +2072,18 @@ pub fn build(app: &adw::Application, state: Rc<AppState>) {
     // Prüfstand: eine Seite oder ein Zustand direkt beim Start
     // (`ICLOUD_PHOTOS_SHOW=library|select|album|map|sync|menu|info|search:…|years|months`),
     // damit sich jeder Zustand ohne Maus fotografieren lässt.
+    // Messung: `ICLOUD_PHOTOS_BENCH=days|grid` scrollt die Ansicht Bild für
+    // Bild durch und schreibt die Abstände der Bilder ins Log.
+    if let Some(which) = std::env::var("ICLOUD_PHOTOS_BENCH")
+        .ok()
+        .filter(|which| !which.is_empty())
+    {
+        let state = state.clone();
+        glib::timeout_add_local_once(std::time::Duration::from_millis(2500), move || {
+            bench_scroll(&state, &which);
+        });
+    }
+
     if let Ok(show) = std::env::var("ICLOUD_PHOTOS_SHOW") {
         let state = state.clone();
         let window = window.clone();
@@ -1911,6 +2122,76 @@ pub fn build(app: &adw::Application, state: Rc<AppState>) {
             glib::ControlFlow::Continue
         });
     }
+}
+
+/// Scrollt „Days" oder das Raster mit fester Geschwindigkeit (je Bild ein
+/// Schritt) und misst, wie gleichmäßig die Bilder kommen: Mittel, 95. Perzentil
+/// und längster Abstand. Ein Bild über 2 × 16,7 ms ist ein sichtbarer Ruck.
+fn bench_scroll(state: &Rc<AppState>, which: &str) {
+    let scroller: Option<gtk::ScrolledWindow> = match which {
+        "grid" => state
+            .grid
+            .borrow()
+            .as_ref()
+            .and_then(|grid| grid.parent())
+            .and_downcast::<gtk::ScrolledWindow>(),
+        _ => state.days.borrow().as_ref().map(|days| days.widget.clone()),
+    };
+    let Some(scroller) = scroller else {
+        tracing::warn!(which, "Messung: Ansicht fehlt");
+        return;
+    };
+    let step: f64 = std::env::var("ICLOUD_PHOTOS_BENCH_STEP")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(40.0);
+    let frames: usize = 900;
+    let times: Rc<RefCell<Vec<i64>>> = Rc::default();
+    let which = which.to_string();
+    let state = state.clone();
+    scroller.add_tick_callback(move |widget, clock| {
+        let mut times = times.borrow_mut();
+        times.push(clock.frame_time());
+        let adjustment = widget.vadjustment();
+        let end = adjustment.upper() - adjustment.page_size();
+        adjustment.set_value((adjustment.value() + step).min(end));
+        if times.len() < frames && adjustment.value() < end {
+            return glib::ControlFlow::Continue;
+        }
+        let mut gaps: Vec<f64> = times
+            .windows(2)
+            .map(|w| (w[1] - w[0]) as f64 / 1000.0)
+            .collect();
+        gaps.sort_by(|a, b| a.total_cmp(b));
+        let n = gaps.len().max(1);
+        let mean = gaps.iter().sum::<f64>() / n as f64;
+        let p95 = gaps.get(n * 95 / 100).copied().unwrap_or(0.0);
+        let max = gaps.last().copied().unwrap_or(0.0);
+        let janky = gaps.iter().filter(|gap| **gap > 33.4).count();
+        let (tiles, images) = state
+            .days
+            .borrow()
+            .as_ref()
+            .map(|d| days::live_tiles(d))
+            .unwrap_or((0, 0));
+        let (bind_us, load_us, binds) = days::COST.with(|cost| cost.get());
+        tracing::info!(
+            which,
+            bind_ms = bind_us / 1000,
+            load_ms = load_us / 1000,
+            binds,
+            frames = times.len(),
+            scrolled = adjustment.value(),
+            mean_ms = format!("{mean:.1}"),
+            p95_ms = format!("{p95:.1}"),
+            max_ms = format!("{max:.1}"),
+            janky,
+            live_tiles = tiles,
+            with_image = images,
+            "BENCH"
+        );
+        glib::ControlFlow::Break
+    });
 }
 
 /// So viele Treffer zeigt eine Suche höchstens.
@@ -1952,7 +2233,7 @@ fn home_event(
             grid.grab_focus();
         }
         Event::Library => {
-            state.zoom.set(Zoom::All);
+            state.zoom.set(Zoom::Days);
             if let Some(sidebar) = &sidebar {
                 sidebar.select(&Target::Library);
             }
@@ -1997,32 +2278,62 @@ fn build_head_controls(
     status: &gtk::Label,
     jump: &gtk::MenuButton,
 ) {
-    let more_menu = gio::Menu::new();
-    let sync = gio::Menu::new();
-    sync.append(Some("Sync Now"), Some("photos.sync"));
-    sync.append(Some("Sync Status…"), Some("photos.sync-manager"));
-    more_menu.append_section(None, &sync);
-    let library = gio::Menu::new();
-    library.append(Some("Add Photos…"), Some("photos.add"));
-    library.append(Some("Jump to a Month…"), Some("photos.jump"));
-    library.append(Some("Select Photos"), Some("photos.select-mode"));
-    more_menu.append_section(None, &library);
-    let view = gio::Menu::new();
-    view.append(Some("Show Sidebar"), Some("photos.toggle-sidebar"));
-    more_menu.append_section(None, &view);
+    // ⋯: Velums Menü mit Symbolen (siehe `menu.rs`), je Knopf ein eigenes —
+    // ein Popover hat genau einen Elternteil.
     let more = || {
-        gtk::MenuButton::builder()
-            .icon_name("view-more-symbolic")
-            .tooltip_text("More")
-            .menu_model(&more_menu)
-            .build()
+        let entries = [
+            menu::item(
+                "restart",
+                "view-refresh-symbolic",
+                "Sync Now",
+                "photos.sync",
+                Some("Ctrl+R"),
+            ),
+            menu::item(
+                "cloud",
+                "emblem-synchronizing-symbolic",
+                "Sync Status…",
+                "photos.sync-manager",
+                Some("Shift+Ctrl+R"),
+            ),
+            menu::Entry::Separator,
+            menu::item(
+                "plus",
+                "list-add-symbolic",
+                "Add Photos…",
+                "photos.add",
+                Some("Shift+Ctrl+I"),
+            ),
+            menu::item(
+                "calendar",
+                "x-office-calendar-symbolic",
+                "Jump to a Month…",
+                "photos.jump",
+                Some("Ctrl+J"),
+            ),
+            menu::item(
+                "check",
+                "object-select-symbolic",
+                "Select Photos",
+                "photos.select-mode",
+                None,
+            ),
+            menu::Entry::Separator,
+            menu::item(
+                "sidebar",
+                "sidebar-show-symbolic",
+                "Show Sidebar",
+                "photos.toggle-sidebar",
+                Some("F9"),
+            ),
+        ];
+        let built = menu::build(&[], &entries);
+        let button = crate::icons::menu_button("more", "view-more-symbolic", "More");
+        button.set_popover(Some(&built.popover));
+        button
     };
     let add = || {
-        let button = chrome::button(
-            Some("list-add-symbolic"),
-            None,
-            "Add Photos… (Ctrl+Shift+I)",
-        );
+        let button = chrome::button(Some("plus"), None, "Add Photos… (Ctrl+Shift+I)");
         button.set_action_name(Some("photos.add"));
         button
     };
@@ -2034,7 +2345,7 @@ fn build_head_controls(
 
     // Home: „Add Photos" mit Text, dann Mehr.
     let add_text = chrome::button(
-        Some("list-add-symbolic"),
+        Some("plus"),
         Some("Add Photos"),
         "Add Photos… (Ctrl+Shift+I)",
     );
@@ -2055,6 +2366,7 @@ fn build_head_controls(
     for (zoom, label) in [
         (Zoom::Years, "Years"),
         (Zoom::Months, "Months"),
+        (Zoom::Days, "Days"),
         (Zoom::All, "All"),
     ] {
         let toggle = gtk::ToggleButton::builder().label(label).build();
@@ -2073,6 +2385,7 @@ fn build_head_controls(
                 state.content.set(match zoom {
                     Zoom::Years => Content::Years,
                     Zoom::Months => Content::Months,
+                    Zoom::Days => Content::Days,
                     Zoom::All => Content::Grid,
                 });
                 state.set_scope(Scope::Library);
@@ -2113,6 +2426,8 @@ fn build_head_controls(
     all.connect_clicked({
         let state = state.clone();
         move |_| {
+            // Alles heißt alles, nicht nur die geladenen Seiten.
+            while state.load_next_page() {}
             if let Some(model) = state.grid.borrow().as_ref().and_then(|grid| grid.model()) {
                 model.select_all();
             }
@@ -2130,16 +2445,31 @@ fn build_head_controls(
 /// Für den Prüfstand: einen Zustand ohne Maus herstellen (siehe
 /// `ICLOUD_PHOTOS_SHOW`). Ein Wort pro Zustand, mehrere mit Komma.
 fn show_for_rig(state: &Rc<AppState>, window: &adw::ApplicationWindow, show: &str) {
+    // Ein Schritt nach dem anderen, mit Luft dazwischen: ein Menü braucht ein
+    // Fenster, das schon steht.
+    let steps: Vec<String> = show.split(',').map(str::to_string).collect();
+    for (index, step) in steps.into_iter().enumerate() {
+        let state = state.clone();
+        let window = window.clone();
+        glib::timeout_add_local_once(
+            std::time::Duration::from_millis(500 * index as u64),
+            move || show_step(&state, &window, &step),
+        );
+    }
+}
+
+fn show_step(state: &Rc<AppState>, window: &adw::ApplicationWindow, step: &str) {
     let sidebar = state.sidebar.borrow().clone();
     let grid = state.grid.borrow().clone();
-    for step in show.split(',') {
+    {
         let (word, arg) = step.split_once(':').unwrap_or((step, ""));
         match word {
-            "library" | "years" | "months" => {
+            "library" | "years" | "months" | "all" => {
                 state.zoom.set(match word {
                     "years" => Zoom::Years,
                     "months" => Zoom::Months,
-                    _ => Zoom::All,
+                    "all" => Zoom::All,
+                    _ => Zoom::Days,
                 });
                 if let Some(sidebar) = &sidebar {
                     sidebar.select(&Target::Library);
@@ -2162,11 +2492,8 @@ fn show_for_rig(state: &Rc<AppState>, window: &adw::ApplicationWindow, show: &st
                 }
             }
             "search" => {
-                if let Some(entry) = window
-                    .first_child()
-                    .and_then(|_| find_search(window.upcast_ref()))
-                {
-                    entry.set_text(arg);
+                if let Some(field) = SEARCH.with_borrow(|slot| slot.clone()) {
+                    field.set_text(arg);
                 }
             }
             "select" => {
@@ -2178,15 +2505,55 @@ fn show_for_rig(state: &Rc<AppState>, window: &adw::ApplicationWindow, show: &st
                 }
             }
             "menu" => {
-                if let (Some(grid), Some(menu)) = (&grid, state.context_menu.borrow().clone()) {
+                // Das Menü der sichtbaren Ansicht: „Days" oder das Raster.
+                let days = state.content.get() == Content::Days;
+                let (parent, menu): (Option<gtk::Widget>, _) = if days {
+                    (
+                        state
+                            .days
+                            .borrow()
+                            .as_ref()
+                            .map(|d| d.list.clone().upcast()),
+                        state.days_menu.borrow().clone(),
+                    )
+                } else {
+                    (
+                        grid.clone().map(|g| g.upcast()),
+                        state.context_menu.borrow().clone(),
+                    )
+                };
+                if let (Some(parent), Some(menu), Some(grid)) = (parent, menu, &grid) {
+                    state.load_until(9);
                     if let Some(model) = grid.model() {
                         model.select_item(9, true);
                     }
-                    let x = grid.width() as f64 * 0.55;
+                    let x = parent.width() as f64 * 0.55;
                     let y = 200.0;
-                    menu.set_pointing_to(Some(&gdk::Rectangle::new(x as i32, y as i32, 1, 1)));
-                    menu.popup();
+                    menu.popover
+                        .set_pointing_to(Some(&gdk::Rectangle::new(x as i32, y as i32, 1, 1)));
+                    state.refresh_favorite_buttons();
+                    menu.popover.popup();
                 }
+            }
+            "more" => {
+                let head = state.head.borrow().clone();
+                if let Some(button) = head
+                    .and_then(|head| head.controls.visible_child())
+                    .and_then(|row| row.last_child())
+                    .and_downcast::<gtk::MenuButton>()
+                {
+                    button.popup();
+                }
+            }
+            "viewermenu" => {
+                let viewer = state.viewer.borrow().clone();
+                if let Some(viewer) = viewer {
+                    viewer.popup_menu();
+                }
+            }
+            "favorite" => {
+                let id = if arg.is_empty() { "demo-0001" } else { arg };
+                state.toggle_favorite(vec![id.to_string()]);
             }
             "sync" => {
                 let _ = WidgetExt::activate_action(window, "photos.sync-manager", None);
@@ -2204,23 +2571,6 @@ fn show_for_rig(state: &Rc<AppState>, window: &adw::ApplicationWindow, show: &st
             _ => {}
         }
     }
-}
-
-/// Das Suchfeld der Seitenleiste.
-fn find_search(root: &gtk::Widget) -> Option<gtk::SearchEntry> {
-    if let Some(entry) = root.downcast_ref::<gtk::SearchEntry>()
-        && entry.has_css_class("photos-search")
-    {
-        return Some(entry.clone());
-    }
-    let mut child = root.first_child();
-    while let Some(widget) = child {
-        if let Some(found) = find_search(&widget) {
-            return Some(found);
-        }
-        child = widget.next_sibling();
-    }
-    None
 }
 
 /// Anmeldemaske für den ersten Start: Apple-ID und Passwort.
@@ -2490,6 +2840,20 @@ fn start_downloader(
                     DELETES.set((pending.saturating_sub(1), done));
                     toast(&format!("A photo couldn’t be deleted: {message}"));
                 }
+                DownloadMessage::Favorited { id, value } => {
+                    tracing::info!(%id, value, "Favorit in iCloud gesetzt");
+                }
+                DownloadMessage::FavoriteFailed { id, value, message } => {
+                    state.favorite_failed(&id, value);
+                    toast(&format!(
+                        "Couldn’t {} Favorites: {message}",
+                        if value {
+                            "add the photo to"
+                        } else {
+                            "remove the photo from"
+                        }
+                    ));
+                }
                 DownloadMessage::Uploaded { path } => {
                     tracing::info!(path = %path.display(), "hochgeladen");
                     let (pending, done) = UPLOADS.get();
@@ -2596,25 +2960,27 @@ fn build_grid(state: &Rc<AppState>, window: &adw::ApplicationWindow) -> gtk::Gri
 
             // Das Video-Kennzeichen liegt ueber der Kachel, nicht daneben: sonst
             // verschoebe es das Raster, sobald ein Video darin vorkommt.
-            let badge = gtk::Image::builder()
-                .icon_name("media-playback-start-symbolic")
-                .halign(gtk::Align::End)
-                .valign(gtk::Align::End)
-                .margin_end(6)
-                .margin_bottom(6)
-                .css_classes(["photo-badge"])
-                .visible(false)
-                .build();
+            let badge = crate::icons::icon("play", crate::icons::Weight::Fill);
+            badge.set_halign(gtk::Align::End);
+            badge.set_valign(gtk::Align::End);
+            badge.add_css_class("photo-badge");
+            badge.set_visible(false);
+            badge.set_can_target(false);
+            // Das Herz der Favoriten unten links, wie im Lab.
+            let heart = crate::icons::icon("heart", crate::icons::Weight::Fill);
+            heart.set_halign(gtk::Align::Start);
+            heart.set_valign(gtk::Align::End);
+            heart.add_css_class("photo-heart");
+            heart.set_visible(false);
+            heart.set_can_target(false);
 
             // Der Ring der Auswahl oben rechts — nur im Auswahlmodus zu sehen
             // (das Stylesheet blendet ihn über `gridview.selecting` ein).
-            let check = gtk::Image::builder()
-                .icon_name("object-select-symbolic")
-                .halign(gtk::Align::End)
-                .valign(gtk::Align::Start)
-                .css_classes(["photo-check"])
-                .can_target(false)
-                .build();
+            let check = crate::icons::icon("check", crate::icons::Weight::Bold);
+            check.set_halign(gtk::Align::End);
+            check.set_valign(gtk::Align::Start);
+            check.add_css_class("photo-check");
+            check.set_can_target(false);
 
             // Die Kachel ist nur das Bild. Ein Dateiname darunter sagt über ein
             // Foto nichts, was man nicht sieht, kostet aber in jeder Reihe eine
@@ -2623,6 +2989,7 @@ fn build_grid(state: &Rc<AppState>, window: &adw::ApplicationWindow) -> gtk::Gri
             let overlay = gtk::Overlay::new();
             overlay.set_child(Some(&picture));
             overlay.add_overlay(&badge);
+            overlay.add_overlay(&heart);
             overlay.add_overlay(&check);
             item.set_child(Some(&overlay));
 
@@ -2772,67 +3139,143 @@ fn build_grid(state: &Rc<AppState>, window: &adw::ApplicationWindow) -> gtk::Gri
     grid
 }
 
-/// Das Kontextmenü der Kacheln wie im Finder (Vorschlag C, von Henri für
-/// alle übernommen): oben eine Reihe großer Knöpfe, darunter die Liste.
-/// Öffnet ohne Übergang; alles wirkt auf die Auswahl.
-fn build_context_menu(state: &Rc<AppState>, grid: &gtk::GridView) {
-    let menu = gio::Menu::new();
-    let row = gio::Menu::new();
-    let custom = gio::MenuItem::new(None, None);
-    custom.set_attribute_value("custom", Some(&"actions".to_variant()));
-    row.append_item(&custom);
-    menu.append_section(None, &row);
-    let open = gio::Menu::new();
-    open.append(Some("Open"), Some("photos.view"));
-    open.append(Some("Open in Default App"), Some("photos.open"));
-    menu.append_section(None, &open);
-    let more = gio::Menu::new();
-    if crate::retouch::available() {
-        more.append(Some("Edit in Retouch"), Some("photos.retouch"));
-    }
-    more.append(Some("Show Info"), Some("photos.info"));
-    menu.append_section(None, &more);
-    let rest = gio::Menu::new();
-    rest.append(Some("Select"), Some("photos.select-mode"));
-    rest.append(Some("Export As…"), Some("photos.save"));
-    menu.append_section(None, &rest);
-
-    let popover = gtk::PopoverMenu::from_model(Some(&menu));
-    popover.set_has_arrow(false);
-    popover.set_halign(gtk::Align::Start);
-    popover.add_css_class("photos-context");
-    let actions = gtk::Box::builder()
-        .orientation(gtk::Orientation::Horizontal)
-        .homogeneous(true)
-        .css_classes(["menu-actions"])
-        .build();
-    for (icon, label, action) in [
-        ("document-save-symbolic", "Export", "photos.save"),
-        ("edit-copy-symbolic", "Copy", "photos.copy"),
-        ("dialog-information-symbolic", "Info", "photos.info"),
-        ("user-trash-symbolic", "Delete", "photos.delete"),
-    ] {
-        let button = chrome::bar_button(icon, label, label, action);
-        button.add_css_class("menu-action");
-        if action == "photos.delete" {
-            button.add_css_class("danger");
-        }
-        button.connect_clicked({
-            let popover = popover.downgrade();
-            move |_| {
-                if let Some(popover) = popover.upgrade() {
-                    popover.popdown();
-                }
+/// Zwei Finger ändern die Kachelgröße (Touchscreen und Touchpad). Sie
+/// springt zwischen festen Stufen, schon während der Geste — ein Raster,
+/// das jeden Zwischenwert neu umbricht, flackert nur.
+fn add_pinch(widget: &impl IsA<gtk::Widget>) {
+    let pinch = gtk::GestureZoom::new();
+    let pinch_start = Rc::new(Cell::new(THUMB_SIZE));
+    pinch.connect_begin({
+        let pinch_start = pinch_start.clone();
+        move |_, _| pinch_start.set(TILE_SIZE.get())
+    });
+    pinch.connect_scale_changed({
+        let pinch_start = pinch_start.clone();
+        move |_, scale| {
+            let step = tile_step_for(pinch_start.get(), scale);
+            if step != TILE_SIZE.get() {
+                set_tile_size(step);
             }
-        });
-        actions.append(&button);
-    }
-    popover.add_child(&actions, "actions");
-    popover.set_parent(grid);
-    *state.context_menu.borrow_mut() = Some(popover);
+        }
+    });
+    widget.add_controller(pinch);
 }
 
-/// Öffnet das Kontextmenü an der Stelle des Klicks auf einer Kachel.
+/// Das Kontextmenü der Kacheln wie im Finder (Lab, Vorschlag C, für alle
+/// übernommen): oben Export · Copy · Favorite · Delete als große Knöpfe,
+/// darunter die Liste. Wirkt auf die Auswahl.
+fn context_menu(parent: &impl IsA<gtk::Widget>) -> Rc<menu::Menu> {
+    let big = [
+        menu::Big {
+            icon: "share",
+            fallback: crate::icons::fallback("share"),
+            label: "Export",
+            action: "photos.save",
+            danger: false,
+        },
+        menu::Big {
+            icon: "duplicate",
+            fallback: crate::icons::fallback("duplicate"),
+            label: "Copy",
+            action: "photos.copy",
+            danger: false,
+        },
+        menu::Big {
+            icon: "heart",
+            fallback: crate::icons::fallback("heart"),
+            label: "Favorite",
+            action: "photos.favorite",
+            danger: false,
+        },
+        menu::Big {
+            icon: "trash",
+            fallback: crate::icons::fallback("trash"),
+            label: "Delete",
+            action: "photos.delete",
+            danger: true,
+        },
+    ];
+    let mut entries = vec![
+        menu::item(
+            "fullscreen",
+            "view-fullscreen-symbolic",
+            "Open",
+            "photos.view",
+            Some("Enter"),
+        ),
+        menu::item(
+            "open.external",
+            "document-open-symbolic",
+            "Open in Default App",
+            "photos.open",
+            Some("Ctrl+O"),
+        ),
+        menu::Entry::Separator,
+    ];
+    if crate::retouch::available() {
+        entries.push(menu::item(
+            "editor",
+            "document-edit-symbolic",
+            "Edit in Retouch",
+            "photos.retouch",
+            None,
+        ));
+    }
+    entries.push(menu::item(
+        "callout",
+        "dialog-information-symbolic",
+        "Show Info",
+        "photos.info",
+        None,
+    ));
+    entries.push(menu::Entry::Separator);
+    entries.push(menu::item(
+        "check",
+        "object-select-symbolic",
+        "Select",
+        "photos.select-mode",
+        None,
+    ));
+    entries.push(menu::item(
+        "downloads",
+        "document-save-as-symbolic",
+        "Export As…",
+        "photos.save",
+        Some("Ctrl+S"),
+    ));
+    let built = menu::build(&big, &entries);
+    built.popover.add_css_class("photos-context");
+    built.popover.set_parent(parent);
+    built
+}
+
+fn build_context_menu(state: &Rc<AppState>, grid: &gtk::GridView) {
+    *state.context_menu.borrow_mut() = Some(context_menu(grid));
+}
+
+/// Öffnet ein Kontextmenü an der Stelle des Klicks auf einer Kachel.
+fn popup_menu(
+    state: &Rc<AppState>,
+    menu: &menu::Menu,
+    parent: &gtk::Widget,
+    tile: &gtk::Widget,
+    x: f64,
+    y: f64,
+) {
+    state.refresh_favorite_buttons();
+    let point = tile
+        .compute_point(parent, &gtk::graphene::Point::new(x as f32, y as f32))
+        .unwrap_or_else(|| gtk::graphene::Point::new(x as f32, y as f32));
+    menu.popover.set_pointing_to(Some(&gdk::Rectangle::new(
+        point.x() as i32,
+        point.y() as i32,
+        1,
+        1,
+    )));
+    menu.popover.popup();
+}
+
+/// Öffnet das Kontextmenü des Rasters an der Stelle des Klicks.
 fn show_context_menu(state: &Rc<AppState>, tile: &gtk::Overlay, x: f64, y: f64) {
     let (Some(menu), Some(grid)) = (
         state.context_menu.borrow().clone(),
@@ -2840,22 +3283,108 @@ fn show_context_menu(state: &Rc<AppState>, tile: &gtk::Overlay, x: f64, y: f64) 
     ) else {
         return;
     };
-    let point = tile
-        .compute_point(&grid, &gtk::graphene::Point::new(x as f32, y as f32))
-        .unwrap_or_else(|| gtk::graphene::Point::new(x as f32, y as f32));
-    menu.set_pointing_to(Some(&gdk::Rectangle::new(
-        point.x() as i32,
-        point.y() as i32,
-        1,
-        1,
-    )));
-    menu.popup();
+    popup_menu(state, &menu, grid.upcast_ref(), tile.upcast_ref(), x, y);
+}
+
+/// „Days" mit seinen Haken in Katalog, Auswahl und Favoriten.
+fn build_days(
+    state: &Rc<AppState>,
+    window: &adw::ApplicationWindow,
+    grid: &gtk::GridView,
+) -> Rc<DaysView> {
+    let selection = grid.model();
+    let hooks = days::Hooks {
+        click: Rc::new({
+            let state = state.clone();
+            let window = window.clone();
+            let selection = selection.clone();
+            move |click, tile| {
+                let Some(model) = selection.as_ref() else {
+                    return;
+                };
+                match click {
+                    days::Click::Select {
+                        position,
+                        toggle,
+                        range,
+                    } => {
+                        state.load_until(position);
+                        match (range, state.days_anchor.get()) {
+                            (true, Some(from)) => {
+                                state.load_until(from.max(position));
+                                let (start, end) = (from.min(position), from.max(position));
+                                model.select_range(start, end - start + 1, !toggle);
+                            }
+                            _ if toggle && model.is_selected(position) => {
+                                model.unselect_item(position);
+                            }
+                            _ => {
+                                model.select_item(position, !toggle);
+                            }
+                        }
+                        state.days_anchor.set(Some(position));
+                    }
+                    days::Click::Open(position) => {
+                        state.load_until(position);
+                        model.select_item(position, true);
+                        open_viewer(&state, &window, position);
+                    }
+                    days::Click::Menu { position, x, y } => {
+                        state.load_until(position);
+                        if !model.is_selected(position) {
+                            model.select_item(position, true);
+                        }
+                        let menu = state.days_menu.borrow().clone();
+                        let days = state.days.borrow().clone();
+                        if let (Some(menu), Some(days)) = (menu, days) {
+                            popup_menu(&state, &menu, days.list.upcast_ref(), tile, x, y);
+                        }
+                    }
+                    days::Click::Day { offset, count } => {
+                        if count == 0 {
+                            return;
+                        }
+                        state.load_until(offset + count - 1);
+                        model.select_range(offset, count, false);
+                    }
+                }
+            }
+        }),
+        load: Rc::new({
+            let state = state.clone();
+            move |offset, count| {
+                state
+                    .catalog
+                    .borrow()
+                    .page_in(&Scope::Library, offset, count)
+                    .unwrap_or_default()
+            }
+        }),
+        selected: Rc::new({
+            let selection = selection.clone();
+            move |position| {
+                selection
+                    .as_ref()
+                    .is_some_and(|model| position < model.n_items() && model.is_selected(position))
+            }
+        }),
+        favorite: Rc::new(is_favorite),
+        selecting: Rc::new({
+            let state = state.clone();
+            move || state.selecting.get()
+        }),
+        today: Rc::new(|| chrono::Local::now().date_naive()),
+    };
+    let view = DaysView::new(hooks, TILE_SIZE.get());
+    *state.days_menu.borrow_mut() = Some(context_menu(&view.list));
+    *state.days.borrow_mut() = Some(view.clone());
+    view
 }
 
 /// Bild und Video-Kennzeichen einer Kachel.
-fn tile_parts(overlay: &gtk::Overlay) -> Option<(gtk::Picture, gtk::Image)> {
+fn tile_parts(overlay: &gtk::Overlay) -> Option<(gtk::Picture, gtk::Widget)> {
     let picture = overlay.child().and_downcast::<gtk::Picture>()?;
-    let badge = picture.next_sibling().and_downcast::<gtk::Image>()?;
+    let badge = picture.next_sibling()?;
     Some((picture, badge))
 }
 
@@ -2954,11 +3483,17 @@ fn show_tile(overlay: &gtk::Overlay, photo: &PhotoObject) {
         picture.set_paintable(gdk::Paintable::NONE);
         picture.set_widget_name("");
         badge.set_visible(false);
+        if let Some(heart) = badge.next_sibling() {
+            heart.set_visible(false);
+        }
         overlay.set_tooltip_text(None);
         return;
     };
 
     badge.set_visible(photo.is_video());
+    if let Some(heart) = badge.next_sibling() {
+        heart.set_visible(is_favorite(&photo.id()));
+    }
     overlay.set_tooltip_text(Some(&format!(
         "{}\n{}",
         photo.filename(),
@@ -3073,6 +3608,7 @@ fn update_page(state: &Rc<AppState>, stack: &gtk::Stack) {
         sidebar.set_library_count(total);
     }
     state.refresh_overview();
+    state.refresh_days();
     state.refresh_head();
     state.refresh_sync_status();
     state.refresh_action_bar();
@@ -3558,11 +4094,12 @@ fn build_jump_button(
         .build();
 
     let popover = gtk::Popover::builder().child(&scroller).build();
-    let button = gtk::MenuButton::builder()
-        .icon_name("x-office-calendar-symbolic")
-        .tooltip_text("Jump to a Month (Ctrl+J)")
-        .popover(&popover)
-        .build();
+    let button = crate::icons::menu_button(
+        "calendar",
+        "x-office-calendar-symbolic",
+        "Jump to a Month (Ctrl+J)",
+    );
+    button.set_popover(Some(&popover));
 
     list.connect_row_activated({
         let state = state.clone();
@@ -3859,14 +4396,31 @@ fn build_selection_actions(
         group.add_action(&entry);
     }
 
+    // Favorit an/aus für die Auswahl (Kontextmenü, Aktionsleiste).
+    let favorite = gio::SimpleAction::new("favorite", None);
+    favorite.set_enabled(false);
+    favorite.connect_activate({
+        let state = state.clone();
+        let grid = grid.clone();
+        move |_, _| {
+            let ids = selected_items(&grid)
+                .into_iter()
+                .map(|item| item.id)
+                .collect();
+            state.toggle_favorite(ids);
+        }
+    });
+    group.add_action(&favorite);
+
     // Auswahlmodus: „Select" im Kopf schaltet ein, „Done" oder Esc aus.
     let select_mode = gio::SimpleAction::new("select-mode", None);
     select_mode.connect_activate({
         let state = state.clone();
         move |_, _| {
-            if state.content.get() != Content::Grid {
-                state.zoom.set(Zoom::All);
-                state.content.set(Content::Grid);
+            if !matches!(state.content.get(), Content::Grid | Content::Days) {
+                state.zoom.set(Zoom::Days);
+                state.content.set(Content::Days);
+                state.set_scope(Scope::Library);
                 state.refresh_ui();
             }
             state.set_selecting(!state.selecting.get());
@@ -3936,11 +4490,15 @@ fn build_selection_actions(
     if let Some(model) = grid.model() {
         model.connect_selection_changed({
             let delete = delete_action.clone();
+            let favorite = favorite.clone();
             let grid = grid.clone();
             let state = state.clone();
             move |_, _, _| {
                 let count = selected_items(&grid).len();
                 delete.set_enabled(count > 0);
+                favorite.set_enabled(count > 0);
+                state.refresh_favorite_buttons();
+                state.refresh_days_marks();
                 for (name, entry) in &entries {
                     // Mehrere Fotos gleichzeitig zu öffnen ergibt keinen Sinn.
                     entry.set_enabled(if *name == "open" {

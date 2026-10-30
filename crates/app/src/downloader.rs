@@ -42,6 +42,17 @@ pub enum DownloadMessage {
         id: String,
         message: String,
     },
+    /// `isFavorite` ist in iCloud gesetzt (der Katalog war es schon vorher).
+    Favorited {
+        id: String,
+        value: bool,
+    },
+    /// iCloud hat abgelehnt — die App nimmt die Änderung zurück.
+    FavoriteFailed {
+        id: String,
+        value: bool,
+        message: String,
+    },
     /// Eine Datei ist in iCloud angekommen; der nächste Sync bringt sie samt
     /// Vorschau in den Katalog.
     Uploaded {
@@ -68,6 +79,7 @@ enum Request {
     Original { id: String, purpose: Purpose },
     Delete { id: String },
     Upload { path: PathBuf },
+    Favorite { id: String, value: bool },
 }
 
 /// Griff auf den Download-Thread.
@@ -103,6 +115,14 @@ impl Downloader {
     /// Löscht ein Foto in iCloud (dort 30 Tage unter "Zuletzt gelöscht").
     pub fn delete(&self, id: &str) {
         let _ = self.requests.send(Request::Delete { id: id.to_string() });
+    }
+
+    /// Setzt oder löst den Favoriten in iCloud.
+    pub fn favorite(&self, id: &str, value: bool) {
+        let _ = self.requests.send(Request::Favorite {
+            id: id.to_string(),
+            value,
+        });
     }
 
     /// Lädt eine Datei in die Mediathek.
@@ -232,6 +252,31 @@ pub fn spawn(
                                 tracing::warn!(%id, %error, "Foto nicht loeschbar");
                                 DownloadMessage::DeleteFailed {
                                     id,
+                                    message: error.to_string(),
+                                }
+                            }
+                        };
+                        let _ = message_tx.send(message);
+                        continue;
+                    }
+                    Request::Favorite { id, value } => {
+                        let master = catalog
+                            .get(&id)
+                            .ok()
+                            .flatten()
+                            .and_then(|photo| photo.record.master_id);
+                        let job = Job::Favorite {
+                            id: id.clone(),
+                            master,
+                            value,
+                        };
+                        let message = match run_job(&mut session, &options, &prompts, &job).await {
+                            Ok(_) => DownloadMessage::Favorited { id, value },
+                            Err(error) => {
+                                tracing::warn!(%id, %error, "Favorit nicht gesetzt");
+                                DownloadMessage::FavoriteFailed {
+                                    id,
+                                    value,
                                     message: error.to_string(),
                                 }
                             }

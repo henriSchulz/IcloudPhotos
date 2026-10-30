@@ -12,6 +12,7 @@ use std::rc::Rc;
 
 use gtk::prelude::*;
 
+use crate::icons::{self, Weight};
 use crate::sync_manager::SyncStatus;
 
 type Callback = Rc<dyn Fn()>;
@@ -35,14 +36,14 @@ pub struct PageHead {
 impl PageHead {
     pub fn new() -> Rc<Self> {
         let nav = gtk::Button::builder()
-            .icon_name("sidebar-show-symbolic")
+            .child(&icons::icon("sidebar", Weight::Regular))
             .tooltip_text("Show Sidebar (F9)")
             .valign(gtk::Align::Center)
             .visible(false)
             .css_classes(["nav-button"])
             .build();
         let crumb_back = gtk::Button::builder()
-            .icon_name("go-previous-symbolic")
+            .child(&icons::icon("chevron.left", Weight::Bold))
             .css_classes(["flat", "crumb-back"])
             .build();
         let crumb_label = gtk::Label::new(None);
@@ -200,14 +201,12 @@ pub fn controls(children: &[&gtk::Widget]) -> gtk::Box {
 pub fn button(icon: Option<&str>, label: Option<&str>, tooltip: &str) -> gtk::Button {
     let button = gtk::Button::builder().tooltip_text(tooltip).build();
     match (icon, label) {
-        (Some(icon), Some(label)) => {
-            let content = adw::ButtonContent::builder()
-                .icon_name(icon)
-                .label(label)
-                .build();
-            button.set_child(Some(&content));
+        (Some(icon), label) => {
+            button.set_child(Some(&icons::content(icon, icons::fallback(icon), label)));
+            if label.is_none() {
+                button.add_css_class("image-button");
+            }
         }
-        (Some(icon), None) => button.set_icon_name(icon),
         (None, Some(label)) => button.set_label(label),
         (None, None) => {}
     }
@@ -218,7 +217,7 @@ pub fn button(icon: Option<&str>, label: Option<&str>, tooltip: &str) -> gtk::Bu
 /// Klick öffnet den Sync-Manager, der kleine Knopf synchronisiert sofort.
 pub struct SyncRow {
     pub widget: gtk::Box,
-    icon: gtk::Image,
+    icon: gtk::Widget,
     spinner: gtk::Spinner,
     title: gtk::Label,
     detail: gtk::Label,
@@ -228,7 +227,7 @@ pub struct SyncRow {
 
 impl SyncRow {
     pub fn new(on_open: Callback, on_sync: Callback) -> Rc<Self> {
-        let icon = gtk::Image::from_icon_name("emblem-synchronizing-symbolic");
+        let icon = icons::icon("restart", Weight::Regular);
         icon.add_css_class("sync-glyph");
         let spinner = gtk::Spinner::builder().visible(false).build();
         let title = gtk::Label::builder()
@@ -250,7 +249,7 @@ impl SyncRow {
         texts.append(&title);
         texts.append(&detail);
         let now = gtk::Button::builder()
-            .icon_name("view-refresh-symbolic")
+            .child(&icons::icon("restart", Weight::Regular))
             .tooltip_text("Sync Now (Ctrl+R)")
             .valign(gtk::Align::Center)
             .css_classes(["flat", "sync-now"])
@@ -288,11 +287,8 @@ impl SyncRow {
         self.spinner.set_visible(status.running);
         self.spinner.set_spinning(status.running);
         self.icon.set_visible(!status.running);
-        self.icon.set_icon_name(Some(if status.failed {
-            "dialog-warning-symbolic"
-        } else {
-            "emblem-synchronizing-symbolic"
-        }));
+        let name = if status.failed { "warning" } else { "restart" };
+        icons::set_glyph(&self.icon, name, Weight::Regular, icons::fallback(name));
         if status.failed {
             self.widget.add_css_class("failed");
         } else {
@@ -334,7 +330,7 @@ pub fn bar_button(icon: &str, label: &str, tooltip: &str, action: &str) -> gtk::
     let content = gtk::Box::builder()
         .orientation(gtk::Orientation::Vertical)
         .build();
-    content.append(&gtk::Image::from_icon_name(icon));
+    content.append(&icons::icon(icon, Weight::Regular));
     content.append(
         &gtk::Label::builder()
             .label(label)
@@ -347,4 +343,90 @@ pub fn bar_button(icon: &str, label: &str, tooltip: &str, action: &str) -> gtk::
         .action_name(action)
         .css_classes(["flat", "bar-button"])
         .build()
+}
+
+/// Das Suchfeld der Seitenleiste mit Velums Lupe (ein `GtkSearchEntry`
+/// brächte das Systemsymbol mit). Meldet Änderungen gebündelt, wie ein
+/// Suchfeld es tut: erst wenn eine Weile nichts getippt wurde.
+pub struct SearchField {
+    pub widget: gtk::Box,
+    pub text: gtk::Text,
+    clear: gtk::Button,
+}
+
+/// Wartezeit nach dem letzten Tastendruck (wie `GtkSearchEntry`).
+const SEARCH_DELAY: std::time::Duration = std::time::Duration::from_millis(150);
+
+impl SearchField {
+    pub fn new(placeholder: &str) -> Rc<Self> {
+        let text = gtk::Text::builder()
+            .placeholder_text(placeholder)
+            .hexpand(true)
+            .build();
+        let clear = gtk::Button::builder()
+            .child(&icons::icon("close", Weight::Bold))
+            .tooltip_text("Clear")
+            .css_classes(["flat", "search-clear"])
+            .visible(false)
+            .build();
+        let glyph = icons::icon("search", Weight::Regular);
+        glyph.add_css_class("search-glyph");
+        let widget = gtk::Box::builder()
+            .orientation(gtk::Orientation::Horizontal)
+            .css_classes(["photos-search"])
+            .build();
+        widget.append(&glyph);
+        widget.append(&text);
+        widget.append(&clear);
+        let click = gtk::GestureClick::new();
+        click.connect_pressed({
+            let text = text.clone();
+            move |_, _, _, _| {
+                text.grab_focus();
+            }
+        });
+        widget.add_controller(click);
+        clear.connect_clicked({
+            let text = text.clone();
+            move |_| text.set_text("")
+        });
+        Rc::new(Self {
+            widget,
+            text,
+            clear,
+        })
+    }
+
+    pub fn text(&self) -> String {
+        self.text.text().to_string()
+    }
+
+    pub fn set_text(&self, value: &str) {
+        self.text.set_text(value);
+    }
+
+    /// `f` mit dem Text, sobald eine Weile nichts mehr getippt wurde.
+    pub fn connect_changed(&self, f: impl Fn(String) + 'static) {
+        let f = Rc::new(f);
+        let pending: Rc<RefCell<Option<gtk::glib::SourceId>>> = Rc::default();
+        let clear = self.clear.clone();
+        self.text.connect_changed(move |text| {
+            clear.set_visible(!text.text().is_empty());
+            if let Some(source) = pending.borrow_mut().take() {
+                source.remove();
+            }
+            let f = f.clone();
+            let value = text.text().to_string();
+            let slot = pending.clone();
+            let source = gtk::glib::timeout_add_local_once(SEARCH_DELAY, move || {
+                slot.borrow_mut().take();
+                f(value);
+            });
+            *pending.borrow_mut() = Some(source);
+        });
+    }
+
+    pub fn connect_activate(&self, f: impl Fn() + 'static) {
+        self.text.connect_activate(move |_| f());
+    }
 }

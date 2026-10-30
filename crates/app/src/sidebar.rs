@@ -44,7 +44,28 @@ pub fn display_name(album: &Album) -> String {
     }
 }
 
-/// Symbol eines Albums in Seitenleiste und Übersicht.
+/// Velum-Symbol eines Albums (Seitenleiste, Übersicht, Home) und das
+/// Systemsymbol als Rückfall ohne Velum.
+pub fn glyph_name(album: &Album) -> (&'static str, &'static str) {
+    let velum = match album.kind {
+        AlbumKind::Folder => "folder",
+        AlbumKind::Album => "image",
+        AlbumKind::Smart => match album.id.as_str() {
+            "Favorites" => "heart",
+            "Videos" => "film",
+            "Live" => "image",
+            "Panoramas" => "layout.columns",
+            "Screenshots" => "display",
+            "Slo-mo" => "film",
+            "Time-lapse" => "clock",
+            "Bursts" => "duplicate",
+            _ => "image",
+        },
+    };
+    (velum, icon_name(album))
+}
+
+/// Systemsymbol eines Albums (Rückfall ohne Velum).
 pub fn icon_name(album: &Album) -> &'static str {
     match album.kind {
         AlbumKind::Folder => "folder-symbolic",
@@ -309,13 +330,19 @@ impl Sidebar {
         });
 
         self.push(
-            entry(Glyph::Icon("user-home-symbolic"), "Home", None, 0, rail),
+            entry(
+                Glyph::Icon("personal", "user-home-symbolic"),
+                "Home",
+                None,
+                0,
+                rail,
+            ),
             Row::Target(Target::Home),
         );
         let total = self.library_count.get();
         self.push(
             entry(
-                Glyph::Icon("image-x-generic-symbolic"),
+                Glyph::Icon("image", "image-x-generic-symbolic"),
                 "Library",
                 (total > 0).then_some(total),
                 0,
@@ -325,7 +352,7 @@ impl Sidebar {
         );
         self.push(
             entry(
-                Glyph::Icon("view-grid-symbolic"),
+                Glyph::Icon("layout.tiles", "view-grid-symbolic"),
                 "Collections",
                 None,
                 0,
@@ -346,7 +373,13 @@ impl Sidebar {
             self.push_album(album, 0);
         }
         self.push(
-            entry(Glyph::Icon("mark-location-symbolic"), "Map", None, 0, rail),
+            entry(
+                Glyph::Icon("network", "mark-location-symbolic"),
+                "Map",
+                None,
+                0,
+                rail,
+            ),
             Row::Target(Target::Map),
         );
         for album in rest {
@@ -375,7 +408,7 @@ impl Sidebar {
             if album.kind == AlbumKind::Folder {
                 let open = self.expanded.borrow().contains(&album.id);
                 let row = entry(
-                    Glyph::Icon(icon_name(album)),
+                    Glyph::Icon(glyph_name(album).0, glyph_name(album).1),
                     &display_name(album),
                     Some(folder_count(albums, &album.id)),
                     depth,
@@ -403,7 +436,7 @@ impl Sidebar {
         // Photos.
         let glyph = match (&album.kind, &album.cover) {
             (AlbumKind::Album, Some(cover)) => Glyph::Cover(cover.clone()),
-            _ => Glyph::Icon(icon_name(album)),
+            _ => Glyph::Icon(glyph_name(album).0, glyph_name(album).1),
         };
         let row = entry(
             glyph,
@@ -423,7 +456,8 @@ impl Sidebar {
 
 /// Was links in einer Zeile steht.
 enum Glyph {
-    Icon(&'static str),
+    /// Velum-Name und Systemsymbol als Rückfall.
+    Icon(&'static str, &'static str),
     /// Titelbild eines Albums (Vorschau-Pfad).
     Cover(std::path::PathBuf),
 }
@@ -444,7 +478,9 @@ fn entry(glyph: Glyph, label: &str, count: Option<u64>, depth: u32, rail: bool) 
         .build();
     content.append(&bar);
     let glyph: gtk::Widget = match glyph {
-        Glyph::Icon(icon) => gtk::Image::from_icon_name(icon).upcast(),
+        Glyph::Icon(name, fallback) => {
+            crate::icons::glyph(name, crate::icons::Weight::Regular, fallback)
+        }
         Glyph::Cover(path) => {
             let picture = gtk::Picture::builder()
                 .content_fit(gtk::ContentFit::Cover)
@@ -494,11 +530,19 @@ fn add_disclosure(row: &gtk::ListBoxRow, open: bool) {
     let Some(content) = row.child().and_downcast::<gtk::Box>() else {
         return;
     };
-    let arrow = gtk::Image::from_icon_name(if open {
-        "pan-down-symbolic"
+    let arrow = if open {
+        crate::icons::glyph(
+            "chevron.down",
+            crate::icons::Weight::Bold,
+            "pan-down-symbolic",
+        )
     } else {
-        "pan-end-symbolic"
-    });
+        crate::icons::glyph(
+            "chevron.right",
+            crate::icons::Weight::Bold,
+            "pan-end-symbolic",
+        )
+    };
     arrow.add_css_class("dim-label");
     arrow.add_css_class("disclosure");
     // Hinter den Akzentstrich, vor das Symbol.

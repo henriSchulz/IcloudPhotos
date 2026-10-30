@@ -25,7 +25,7 @@ use icloud_photos_core::model::AlbumKind;
 
 use crate::layout::{Columns, RatioBox};
 use crate::photo_object::month_name;
-use crate::sidebar::{children, display_name, icon_name, media_types};
+use crate::sidebar::{children, display_name, glyph_name, media_types};
 use crate::sync_manager::{SyncStatus, thousands};
 use crate::velum;
 
@@ -160,11 +160,10 @@ impl Home {
             failed: false,
             phase: String::new(),
         });
-        let glyph = gtk::Image::from_icon_name(if status.failed {
-            "dialog-warning-symbolic"
-        } else {
-            "emblem-synchronizing-symbolic"
-        });
+        let glyph = crate::icons::icon(
+            if status.failed { "warning" } else { "cloud" },
+            crate::icons::Weight::Regular,
+        );
         glyph.add_css_class("stat-glyph");
         glyph.set_valign(gtk::Align::Center);
         let state = if status.running {
@@ -319,27 +318,27 @@ impl Home {
         card.append(&card_head("Recent Days", Some(&link)));
         card.append(&label("Newest first, as in the Library", "card-sub"));
         let count = velum::photos("recentStrip", 5.0) as usize;
+        // Ein Gitter statt Zeilen: die Spalte der Tage ist so breit wie ihr
+        // längster Name (bricht erst sehr lang um), die Streifen stehen in
+        // jeder Zeile gleich.
+        let rows = gtk::Grid::builder().css_classes(["day-rows"]).build();
         for (index, day) in data.recent.iter().enumerate() {
-            let row = gtk::Box::builder()
-                .orientation(gtk::Orientation::Horizontal)
-                .css_classes(if index == 0 {
-                    vec!["day-row", "first"]
-                } else {
-                    vec!["day-row"]
-                })
-                .build();
+            let line = (index * 2) as i32;
+            if index > 0 {
+                let rule = gtk::Separator::builder()
+                    .orientation(gtk::Orientation::Horizontal)
+                    .css_classes(["day-rule"])
+                    .build();
+                rows.attach(&rule, 0, line - 1, 2, 1);
+            }
             let texts = gtk::Box::builder()
                 .orientation(gtk::Orientation::Vertical)
                 .valign(gtk::Align::Center)
-                .hexpand(false)
-                .width_request(velum::photos("recentLabel", 116.0) as i32)
                 .css_classes(["day-label"])
                 .build();
-            // Fest so breit wie die Spalte, lange Tage werden gekürzt — sonst
-            // stünden die Streifen in jeder Zeile woanders.
             let name = label(&day_title(day.day, data.today), "day-title");
-            name.set_ellipsize(gtk::pango::EllipsizeMode::End);
-            name.set_max_width_chars(1);
+            name.set_wrap(true);
+            name.set_max_width_chars(22);
             let title = gtk::Button::builder()
                 .child(&name)
                 .css_classes(["flat", "day-link"])
@@ -352,19 +351,20 @@ impl Home {
                 None => items_word(day.count),
             };
             let sub = label(&sub, "card-sub");
-            sub.set_ellipsize(gtk::pango::EllipsizeMode::End);
-            sub.set_max_width_chars(1);
+            sub.set_wrap(true);
+            sub.set_max_width_chars(22);
             texts.append(&sub);
-            row.append(&texts);
+            rows.attach(&texts, 0, line, 1, 1);
             let strip = strip(count);
             strip.set_hexpand(true);
+            strip.add_css_class("day-strip");
             for photo in day.photos.iter().take(count) {
                 strip.append(&self.photo(photo.thumb_path.as_deref(), photo.id(), 1.0, 64));
             }
             pad_strip(&strip, count);
-            row.append(&strip);
-            card.append(&row);
+            rows.attach(&strip, 1, line, 1, 1);
         }
+        card.append(&rows);
         if data.recent.is_empty() {
             card.append(&label("No photos yet.", "card-sub"));
         }
@@ -375,7 +375,7 @@ impl Home {
         let card = card();
         card.add_css_class("add-card");
         card.set_orientation(gtk::Orientation::Horizontal);
-        let glyph = gtk::Image::from_icon_name("list-add-symbolic");
+        let glyph = crate::icons::icon("plus", crate::icons::Weight::Regular);
         glyph.add_css_class("add-glyph");
         glyph.set_valign(gtk::Align::Center);
         let texts = gtk::Box::new(gtk::Orientation::Vertical, 0);
@@ -428,7 +428,7 @@ impl Home {
                 );
             }
             let cover = RatioBox::new(&grid, 1.0, 96);
-            cover.add_overlay(&badge("starred-symbolic"));
+            cover.add_overlay(&badge("heart"));
             row.append(&self.pin(
                 &cover,
                 "Favorites",
@@ -438,12 +438,12 @@ impl Home {
         }
         if data.located > 0 {
             let cover = thumb(data.map_cover.as_deref(), 1.0, 96);
-            cover.add_overlay(&badge("mark-location-symbolic"));
+            cover.add_overlay(&badge("network"));
             row.append(&self.pin(&cover, "Map", &photos_word(data.located), Event::Map));
         }
         if data.videos > 0 {
             let cover = thumb(data.video_cover.as_deref(), 1.0, 96);
-            cover.add_overlay(&badge("media-playback-start-symbolic"));
+            cover.add_overlay(&badge("play"));
             let videos = data.albums.iter().find(|a| a.id == "Videos");
             let event = match videos {
                 Some(album) => Event::Album(album.id.clone()),
@@ -494,6 +494,8 @@ impl Home {
             .selection_mode(gtk::SelectionMode::None)
             .max_children_per_line(12)
             .min_children_per_line(2)
+            .row_spacing(velum::photos("albumGap", 16.0) as u32)
+            .column_spacing(velum::photos("cardGap", 12.0) as u32)
             .css_classes(["album-grid"])
             .build();
         let min = velum::photos("albumMin", 132.0) as i32;
@@ -550,11 +552,18 @@ impl Home {
         let flow = gtk::FlowBox::builder()
             .selection_mode(gtk::SelectionMode::None)
             .max_children_per_line(12)
+            .row_spacing(velum::photos("chipGap", 6.0) as u32)
+            .column_spacing(velum::photos("chipGap", 6.0) as u32)
             .css_classes(["chips"])
             .build();
         for album in media {
             let content = gtk::Box::new(gtk::Orientation::Horizontal, 0);
-            content.append(&gtk::Image::from_icon_name(icon_name(album)));
+            let (name, fallback) = glyph_name(album);
+            content.append(&crate::icons::glyph(
+                name,
+                crate::icons::Weight::Regular,
+                fallback,
+            ));
             content.append(&label(&display_name(album), "chip-name"));
             content.append(&label(&thousands(album.count), "chip-count"));
             let chip = gtk::Button::builder()
@@ -594,13 +603,12 @@ pub fn thumb(path: Option<&Path>, ratio: f64, natural: i32) -> RatioBox {
     tile
 }
 
-fn badge(icon: &str) -> gtk::Image {
-    gtk::Image::builder()
-        .icon_name(icon)
-        .halign(gtk::Align::Start)
-        .valign(gtk::Align::End)
-        .css_classes(["cover-badge"])
-        .build()
+fn badge(icon: &str) -> gtk::Widget {
+    let badge = crate::icons::icon(icon, crate::icons::Weight::Fill);
+    badge.set_halign(gtk::Align::Start);
+    badge.set_valign(gtk::Align::End);
+    badge.add_css_class("cover-badge");
+    badge
 }
 
 fn card() -> gtk::Box {
