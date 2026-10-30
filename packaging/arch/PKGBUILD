@@ -1,7 +1,7 @@
 # Built from this checkout, not from a download:
 #   cd packaging/arch && makepkg -si
 pkgname=icloud-photos
-pkgver=1.0.0.r37.g4b81984
+pkgver=1.0.0.r38.g2407fca
 pkgrel=1
 pkgdesc="Browse your iCloud Photos library (GTK4)"
 arch=(aarch64 x86_64)
