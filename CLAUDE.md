@@ -213,7 +213,9 @@ Protokoll, alles Menschenlesbare geht nach stderr.
 ```
 
 Im Serve-Modus (`--serve`) kommen Befehle als JSON-Zeilen über stdin:
-`{"cmd": "original", "id": ..., "dest": ...}` und `{"cmd": "quit"}`.
+`{"cmd": "original", "id": ..., "dest": ...}`, `delete`, `upload`,
+`{"cmd": "favorite", "id": ..., "master": ..., "value": true}` und
+`{"cmd": "quit"}`.
 
 `original_failed` trägt ein `kind`: **`missing`** heisst, das Asset gibt es
 nicht oder es hat kein Original — ein zweiter Anlauf wäre vergeblich. Alles
@@ -990,19 +992,52 @@ System Settings und Finder, dann die Bibliothek; Opal als Vorgabe.
   den Betrachter der Bibliothek; Zurück führt nach Home (`home_return`), der
   Knopf heißt dann „Photos". „Show All" und ein Tagesname zeigen den Tag als
   Ausschnitt.
-- **Bibliothek**: Years · Months · All im Kopf (`overview.rs`, aus
-  `month_groups`; ein Klick springt im Raster dorthin). „Days" aus dem Lab
-  fehlt: `GtkGridView` hat keine Abschnittsköpfe. Fuge 2 px, Auswahlring 3 px
-  innen.
+- **Bibliothek**: Years · Months · Days · All im Kopf, Days ist die Vorgabe
+  wie im Lab (`overview.rs` für Jahre/Monate aus `month_groups`; ein Klick
+  springt in Days dorthin). Fuge 2 px, Auswahlring 3 px innen.
+- **Days** (`days.rs`): `GtkGridView` kennt keine Abschnittsköpfe, und eine
+  `GtkListView` aus Tagen stockte beim schnellen Scrollen (verschieden hohe
+  Zeilen, geschätzte Höhen, bei großen Sprüngen ~20 Bindungen je Bild). Days ist
+  deshalb ein eigenes `GtkScrollable` (`DaysCanvas`): die Höhe jedes Tages ist
+  ausgerechnet (Kopf + Reihen gleich großer Kacheln, `layout::TileGrid`, misst
+  ohne die Kinder zu fragen), gebaut werden nur die Tage im Sichtfeld ± ein
+  Bildschirm. Die Tage samt Ort liefert `Catalog::day_groups_in` in einem
+  Durchgang (einzeln je Tag nachgefragt kostete jeder Tag einen Lauf über die
+  Tabelle). Positionen sind die des Rasters, Auswahl und Aktionen teilen sich
+  beide Ansichten; vor einer Wahl lädt `load_until` das Modell nach. Gemessen
+  (Release, 15.000 Fotos, `ICLOUD_PHOTOS_BENCH=days`, 900 Bilder): 40 px/Bild
+  17,1 ms im Mittel, kein Ruck; 120 px/Bild 18,8 ms, 9 Rucke; 240 px/Bild 17,3
+  ms — so gut wie das Raster (120 px/Bild: 18,6 ms, 26 Rucke). Gebaut sind dabei
+  ~65 Kacheln.
 - **Auswahlmodus** (Select im Kopf, „Select Photos" im ⋯-Menü, Esc/Done
   beendet): ein Klick nimmt ein Foto dazu oder heraus, Umschalt bis zum
   letzten (`GestureClick` in der Erfassungsphase je Kachel). Ringe oben rechts
   (`gridview.selecting`). Die schwebende Aktionsleiste (Export, Copy, Open,
   Retouch, Delete) steht im Modus und bei ≥ 2 gewählten Fotos.
 - **Kontextmenü** (Rechtsklick auf eine Kachel; wählt sie, wenn sie es noch
-  nicht ist): oben eine Reihe großer Knöpfe (Export, Copy, Info, Delete —
-  `PopoverMenu` mit `custom`-Eintrag), darunter Open, Open in Default App, Edit
-  in Retouch, Show Info, Select, Export As…. Öffnet ohne Übergang.
+  nicht ist): oben eine Reihe großer Knöpfe (Export, Copy, Favorite/Unfavorite,
+  Delete), darunter Open, Open in Default App, Edit in Retouch, Show Info,
+  Select, Export As…. Öffnet ohne Übergang am Zeiger. Alle Menüs (Kontext, ⋯ im
+  Kopf, ⋯ im Betrachter) baut `menu.rs` selbst: ein `GtkPopoverMenu` kennt nur
+  Systemsymbole, Velums Menüs tragen vor jedem Eintrag ihr Symbol. Achtung: ein
+  Popover an einem Container ist dessen Kind — wer die Kinder durchläuft, muss
+  es überspringen (Days versteckte so die letzte Menüzeile).
+- **Symbole** (`icons.rs`): Velum-Namen (`icons/aliases.json`), gezeichnet als
+  Glyphe in einem Label — SF Symbols, wenn Velums Einstellung `icons: "sf"` ist
+  und die lokale Schrift da ist (Codepunkte aus `icons/sf.json`), sonst
+  Phosphor (Schrift aus Velum, zur Laufzeit in Pango geladen). Ohne Velum die
+  Systemsymbole (`icons::fallback`). Das Suchfeld ist deshalb ein eigenes
+  (`chrome::SearchField`), ein `GtkSearchEntry` brächte seine Lupe mit.
+- **Favoriten**: Herz im Kontextmenü, in der Aktionsleiste, im Betrachterkopf
+  (und Taste `.`), Herz unten links auf jeder Favoriten-Kachel. Alle gewählten
+  schon Favoriten → heraus, sonst alle hinein (wie Photos). Sofort im Katalog
+  (`Catalog::set_favorite`, Album „Favorites", legt es an, wenn es fehlt) und auf
+  dem Schirm, dann über den Serve-Sidecar (`{"cmd": "favorite", "value": …}` →
+  `favorite_set`/`favorite_failed`, pyicloud `PhotoAsset.set_favorite`, setzt
+  `isFavorite` am Asset — wirkt auf allen Geräten). Lehnt iCloud ab, nimmt
+  `AppState::favorite_failed` es zurück und ein Toast sagt es.
+  `ICLOUD_PHOTOS_FAKE_FAVORITE_FAIL=1` lässt den Fake-Sidecar ablehnen. **Gegen
+  die echte API noch nicht geprüft** — zuerst mit einem Wegwerf-Foto.
 - **Alben/Karte/Suche/Tag** bekommen eine Brotkrume zurück (Albums bzw. der
   Ordner, Pinned, Map, Photos) und eine Unterzeile aus `Catalog::summary_in`
   („62 photos · 4 videos · October 10 – 12, 2026").
@@ -1022,8 +1057,12 @@ System Settings und Finder, dann die Bibliothek; Opal als Vorgabe.
   /api/icloud/import`, dann `bin/foto` fürs Fenster. Ohne `~/Projects/foto-app`
   fehlt der Eintrag. `ICLOUD_PHOTOS_RETOUCH=<prog>` ersetzt den Weg (bekommt die
   IDs; Prüfstand).
-- **Favorit setzen gibt es nicht**: das Lab zeigt einen Stern-Knopf, dafür
-  müsste die App in iCloud schreiben (`isFavorite`) — nicht ohne Henris Ja.
+- **Sync-Sheet** wie im Lab: oben eine Karte mit Haken/Warnzeichen, Stand,
+  „Last synced …" und Sync Now (Balken darunter, solange es läuft), darunter
+  „Library" und „Account and Storage" als Karten mit Zeilen Bezeichnung … Wert
+  (`SheetRow`) und „Open Folder".
+- **Recent Days** auf Home ist ein Gitter: die Spalte der Tage ist so breit wie
+  ihr längster Name, nichts wird gekürzt.
 
 Geometrie, die keine Velum-Rolle ist, steht in Velum als `surface.photos`
 (`tokens/surfaces/photos.tokens.json`): das Stylesheet liest `--v-photos-*` aus
@@ -1034,8 +1073,12 @@ Prüfstand auf einen Worktree). Die Rückfallwerte im Code sind dieselben Zahlen
 **Prüfstand** (`~/.cache/photos-home-work/rig/run.sh`, nicht im Repo): nested
 Hyprland aus dem Velum-Worktree (`lab/rig/rig.sh start`), darin der
 Headless-Ausgang `SHOT` in genau der Fenstergröße, eigene XDG-Verzeichnisse,
-eigener D-Bus, `--demo`. `ICLOUD_PHOTOS_SHOW=library|years|months|album[:id]|
-map|collections|search:WORT|library,select|library,menu|sync|viewer|info|nav`
+eigener D-Bus, `--demo`, **Skalierung 2** wie Henris Bildschirm (`SCALE=1` für
+1×). `ICLOUD_PHOTOS_DEMO_SIZE=N` legt N weitere Fotos über drei Jahre an (zum
+Messen), `ICLOUD_PHOTOS_BENCH=days|grid` scrollt durch und schreibt die
+Bildabstände ins Log. `ICLOUD_PHOTOS_SHOW=library|all|years|months|album[:id]|
+map|collections|search:WORT|library,select|library,menu|library,more|sync|viewer|
+viewer,viewermenu|info|nav|favorite:ID`
 stellt einen Zustand ohne Maus her (`show_for_rig`); `ICLOUD_PHOTOS_OFFLINE=1`
 schickt nichts ins Netz (kein Nominatim, Karte ohne Kacheln). Klicks mit
 `~/Projects/velum/shell/henri.launchpad-v3/tests/vptr/vptr SHOT W H …`.

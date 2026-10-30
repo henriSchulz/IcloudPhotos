@@ -274,11 +274,14 @@ pub fn spawn(
                             Ok(_) => DownloadMessage::Favorited { id, value },
                             Err(error) => {
                                 tracing::warn!(%id, %error, "Favorit nicht gesetzt");
-                                DownloadMessage::FavoriteFailed {
-                                    id,
-                                    value,
-                                    message: error.to_string(),
-                                }
+                                // Für den Hinweis nur, was iCloud sagte.
+                                let message = match &error {
+                                    icloud_photos_sync::SyncError::Sidecar { message, .. } => {
+                                        message.clone()
+                                    }
+                                    other => other.to_string(),
+                                };
+                                DownloadMessage::FavoriteFailed { id, value, message }
                             }
                         };
                         let _ = message_tx.send(message);

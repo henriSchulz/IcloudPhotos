@@ -243,15 +243,18 @@ pub fn open(
         .css_classes(["wide-only"])
         .build();
     header.pack_end(&export);
+    // Schmal ohne Export, Retouch und Trenner — beides steht im ⋯-Menü.
+    let mut wide_only: Vec<gtk::Widget> =
+        vec![export.clone().upcast(), nav_separator.clone().upcast()];
     if crate::retouch::available() {
-        header.pack_end(
-            &gtk::Button::builder()
-                .child(&crate::icons::icon("editor", Weight::Regular))
-                .tooltip_text("Edit in Retouch (E)")
-                .action_name("viewer.retouch")
-                .css_classes(["wide-only"])
-                .build(),
-        );
+        let retouch = gtk::Button::builder()
+            .child(&crate::icons::icon("editor", Weight::Regular))
+            .tooltip_text("Edit in Retouch (E)")
+            .action_name("viewer.retouch")
+            .css_classes(["wide-only"])
+            .build();
+        header.pack_end(&retouch);
+        wide_only.push(retouch.upcast());
     }
     // Favorit: das Herz, voll und im Akzent, solange das Foto einer ist.
     let favorite = gtk::ToggleButton::builder()
@@ -327,8 +330,15 @@ pub fn open(
         sheet_below(),
         adw::LengthUnit::Px,
     ));
+    for widget in &wide_only {
+        narrow.add_setter(widget, "visible", Some(&false.to_value()));
+    }
+    // Kopf und Bühne stehen beide in der BreakpointBin: so misst sie die Seite,
+    // und schmal fallen die Knöpfe weg, bevor der Kopf breiter als das
+    // Fenster würde.
+    let body = gtk::Box::new(gtk::Orientation::Vertical, 0);
     let content = adw::BreakpointBin::builder()
-        .child(&split)
+        .child(&body)
         .width_request(320)
         .height_request(200)
         .vexpand(true)
@@ -354,7 +364,9 @@ pub fn open(
     });
     let page = gtk::Box::new(gtk::Orientation::Vertical, 0);
     page.add_css_class("photos-viewer");
-    page.append(&chrome);
+    body.append(&chrome);
+    split.set_vexpand(true);
+    body.append(&split);
     page.append(&content);
     picture.connect_tap({
         let chrome = chrome.clone();

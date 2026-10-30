@@ -3245,6 +3245,8 @@ fn context_menu(parent: &impl IsA<gtk::Widget>) -> Rc<menu::Menu> {
     ));
     let built = menu::build(&big, &entries);
     built.popover.add_css_class("photos-context");
+    // Wie auf dem Mac: das Menü beginnt am Zeiger, nicht mittig darunter.
+    built.popover.set_halign(gtk::Align::Start);
     built.popover.set_parent(parent);
     built
 }
