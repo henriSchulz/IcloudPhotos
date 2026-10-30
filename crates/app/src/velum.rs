@@ -135,9 +135,34 @@ pub fn follow_tablet(window: &impl IsA<gtk::Widget>) {
 
 // ── Federn ────────────────────────────────────────────────────────────────
 
+/// Wo Velum liegt: `VELUM_HOME` (Prüfstand: ein Worktree), sonst die
+/// installierte Kopie `~/.local/share/velum`.
+fn velum_home() -> Option<PathBuf> {
+    std::env::var_os("VELUM_HOME")
+        .map(PathBuf::from)
+        .or_else(|| {
+            std::env::var_os("HOME").map(|home| PathBuf::from(home).join(".local/share/velum"))
+        })
+}
+
+/// Ein Wert aus `surface.photos` (Velum `tokens/surfaces/photos.tokens.json`):
+/// Umbrüche, Breiten, Zahlen der Startseite. Ohne Velum `fallback` — dieselbe
+/// Zahl wie im Token, damit die App auch ohne die Schicht gleich aussieht.
+pub fn photos(name: &str, fallback: f64) -> f64 {
+    thread_local! {
+        static CACHE: std::cell::RefCell<Option<Option<serde_json::Value>>> = const { std::cell::RefCell::new(None) };
+    }
+    let group = CACHE.with_borrow_mut(|slot| {
+        slot.get_or_insert_with(|| core_token(&["surface", "photos"]))
+            .clone()
+    });
+    group
+        .and_then(|group| group.get(name)?.as_f64())
+        .unwrap_or(fallback)
+}
+
 fn core_token(path: &[&str]) -> Option<serde_json::Value> {
-    let path_js = std::env::var_os("HOME")
-        .map(|home| PathBuf::from(home).join(".local/share/velum/qml/Velum/Tokens.js"))?;
+    let path_js = velum_home()?.join("qml/Velum/Tokens.js");
     let text = std::fs::read_to_string(path_js).ok()?;
     let line = text
         .lines()

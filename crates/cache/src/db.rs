@@ -351,6 +351,20 @@ impl Catalog {
         Ok(())
     }
 
+    /// Viele Vorschauen in einer Transaktion — für große Test-Bibliotheken.
+    pub fn set_thumbnails(&mut self, items: &[(String, PathBuf, u64)]) -> Result<(), CacheError> {
+        let tx = self.conn.transaction()?;
+        {
+            let mut stmt =
+                tx.prepare("UPDATE photos SET thumb_path = ?2, thumb_bytes = ?3 WHERE id = ?1")?;
+            for (id, path, bytes) in items {
+                stmt.execute(params![id, path.to_string_lossy(), to_sql_bytes(*bytes)])?;
+            }
+        }
+        tx.commit()?;
+        Ok(())
+    }
+
     pub fn set_thumbnail(&self, id: &str, path: &Path, bytes: u64) -> Result<(), CacheError> {
         self.conn.execute(
             "UPDATE photos SET thumb_path = ?2, thumb_bytes = ?3 WHERE id = ?1",
@@ -784,7 +798,7 @@ fn decode_ts(raw: &str) -> Result<DateTime<Utc>, CacheError> {
 
 /// `rusqlite` erlaubt in der Mapper-Closure nur `rusqlite::Error`, deshalb
 /// reicht die Zeile das Zeitstempel-Ergebnis nach außen durch.
-fn row_to_photo(row: &Row<'_>) -> rusqlite::Result<Result<Photo, CacheError>> {
+pub(crate) fn row_to_photo(row: &Row<'_>) -> rusqlite::Result<Result<Photo, CacheError>> {
     Ok(build_photo(row))
 }
 

@@ -33,6 +33,19 @@ pub struct Overview {
     pub full_res_dir: PathBuf,
 }
 
+/// Wie es um die Synchronisation steht — für die Zeile unten in der
+/// Seitenleiste und die iCloud-Karte der Startseite.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SyncStatus {
+    pub running: bool,
+    /// Der letzte Lauf ist gescheitert (bis zum nächsten gelungenen).
+    pub failed: bool,
+    /// Was gerade geschieht, wie es der Manager oben zeigt.
+    pub phase: String,
+}
+
+type StatusListener = Rc<dyn Fn(&SyncStatus)>;
+
 /// Der Sync-Manager samt Kopfzeilen-Knopf.
 pub struct SyncManager {
     dialog: adw::Dialog,
@@ -42,24 +55,26 @@ pub struct SyncManager {
     button_icon: gtk::Image,
 
     spinner: gtk::Spinner,
+    /// Haken oder Warnzeichen — verborgen, solange der Kreisel läuft.
+    glyph: gtk::Widget,
     title: gtk::Label,
     detail: gtk::Label,
     bar: gtk::ProgressBar,
     sync_now: gtk::Button,
 
-    photos_row: adw::ActionRow,
-    icloud_row: adw::ActionRow,
-    last_sync_row: adw::ActionRow,
-    full_pass_row: adw::ActionRow,
-    cache_row: adw::ActionRow,
-    thumbs_row: adw::ActionRow,
+    photos_row: SheetRow,
+    icloud_row: SheetRow,
+    last_sync_row: SheetRow,
+    full_pass_row: SheetRow,
+    cache_row: SheetRow,
+    thumbs_row: SheetRow,
     /// Wohin die Ordner-Knoepfe fuehren. Kommt mit jeder Uebersicht neu,
     /// weil die Pfade in der Konfiguration stehen.
     thumbnail_dir: RefCell<PathBuf>,
     full_res_dir: RefCell<PathBuf>,
-    account_row: adw::ActionRow,
-    result_row: adw::ActionRow,
-    error_row: adw::ActionRow,
+    account_row: SheetRow,
+    result_row: SheetRow,
+    error_row: SheetRow,
 
     /// Gesamtbestand laut iCloud, sobald bekannt.
     expected: Cell<u64>,
@@ -78,6 +93,10 @@ pub struct SyncManager {
     /// Ob der letzte Lauf gescheitert ist und das noch niemand gesehen hat.
     unseen_error: Cell<bool>,
     on_sync: RefCell<Option<Rc<dyn Fn()>>>,
+    /// Ob der letzte Lauf scheiterte — anders als `unseen_error` auch dann
+    /// noch, wenn jemand hineingesehen hat.
+    last_failed: Cell<bool>,
+    listeners: RefCell<Vec<StatusListener>>,
 }
 
 impl SyncManager {
@@ -93,51 +112,57 @@ impl SyncManager {
             .tooltip_text("Sync (Ctrl+Shift+R)")
             .build();
 
-        // --- Aktueller Lauf ----------------------------------------------
+        // --- Aktueller Lauf: die Karte oben (Lab `.sync .stat`) ---------
         let spinner = gtk::Spinner::builder().visible(false).build();
+        let glyph = crate::icons::icon("check", crate::icons::Weight::Bold);
+        glyph.add_css_class("stat-glyph");
+        glyph.set_valign(gtk::Align::Center);
         let title = gtk::Label::builder()
             .xalign(0.0)
-            .hexpand(true)
             .wrap(true)
-            .css_classes(["heading"])
+            .css_classes(["stat-title"])
             .label("Ready")
             .build();
         let detail = gtk::Label::builder()
-            .xalign(1.0)
-            .css_classes(["dim-label", "numeric"])
+            .xalign(0.0)
+            .wrap(true)
+            .css_classes(["card-sub", "numeric"])
             .build();
-        let line = gtk::Box::new(gtk::Orientation::Horizontal, 10);
-        line.append(&spinner);
-        line.append(&title);
-        line.append(&detail);
-
-        let bar = gtk::ProgressBar::builder().visible(false).build();
-
+        let texts = gtk::Box::builder()
+            .orientation(gtk::Orientation::Vertical)
+            .hexpand(true)
+            .valign(gtk::Align::Center)
+            .build();
+        texts.append(&title);
+        texts.append(&detail);
         let sync_now = gtk::Button::builder()
             .label("Sync Now")
-            .halign(gtk::Align::Center)
-            .css_classes(["pill", "suggested-action"])
+            .valign(gtk::Align::Center)
+            .css_classes(["suggested-action"])
+            .build();
+        let line = gtk::Box::builder()
+            .orientation(gtk::Orientation::Horizontal)
+            .css_classes(["stat"])
+            .build();
+        line.append(&glyph);
+        line.append(&spinner);
+        line.append(&texts);
+        line.append(&sync_now);
+
+        let bar = gtk::ProgressBar::builder()
+            .visible(false)
+            .css_classes(["sync-bar"])
             .build();
 
-        let current = gtk::Box::new(gtk::Orientation::Vertical, 10);
-        current.add_css_class("card");
-        current.set_margin_bottom(6);
-        let inner = gtk::Box::new(gtk::Orientation::Vertical, 10);
-        inner.set_margin_top(14);
-        inner.set_margin_bottom(14);
-        inner.set_margin_start(16);
-        inner.set_margin_end(16);
-        inner.append(&line);
-        inner.append(&bar);
-        current.append(&inner);
+        let current = gtk::Box::builder()
+            .orientation(gtk::Orientation::Vertical)
+            .css_classes(["sheet-card", "sync-stat"])
+            .build();
+        current.append(&line);
+        current.append(&bar);
 
         // --- Bestand und Zustand -----------------------------------------
-        let row = |title: &str| {
-            adw::ActionRow::builder()
-                .title(title)
-                .css_classes(["property"])
-                .build()
-        };
+        let row = SheetRow::new;
         let photos_row = row("Photos on This Device");
         let icloud_row = row("Photos in iCloud");
         icloud_row.set_subtitle("determined on the next full sync");
@@ -145,23 +170,33 @@ impl SyncManager {
         let full_pass_row = row("Last Full Sync");
         let result_row = row("Last Result");
         result_row.set_visible(false);
+        let library = sheet_group(
+            "Library",
+            &[
+                &photos_row,
+                &icloud_row,
+                &last_sync_row,
+                &full_pass_row,
+                &result_row,
+            ],
+        );
 
-        let library = adw::PreferencesGroup::builder().title("Library").build();
-        library.add(&photos_row);
-        library.add(&icloud_row);
-        library.add(&last_sync_row);
-        library.add(&full_pass_row);
-        library.add(&result_row);
-
-        let error_row = adw::ActionRow::builder()
-            .title("Last Sync Failed")
-            .subtitle_selectable(true)
-            .css_classes(["error"])
+        let error_row = SheetRow::note("Last Sync Failed");
+        error_row.set_visible(false);
+        let problems = gtk::Box::builder()
+            .orientation(gtk::Orientation::Vertical)
+            .css_classes(["sheet-card", "sheet-error"])
             .visible(false)
             .build();
-        error_row.add_prefix(&gtk::Image::from_icon_name("dialog-warning-symbolic"));
-        let problems = adw::PreferencesGroup::new();
-        problems.add(&error_row);
+        problems.append(&error_row.row);
+        error_row.row.connect_visible_notify({
+            let problems = problems.downgrade();
+            move |row| {
+                if let Some(problems) = problems.upgrade() {
+                    problems.set_visible(row.is_visible());
+                }
+            }
+        });
 
         let thumbs_row = row("Thumbnails");
         let cache_row = row("Originals Cache");
@@ -169,37 +204,32 @@ impl SyncManager {
         // Je ein Knopf, der den Ordner im Dateimanager oeffnet.
         let folder_button = || {
             gtk::Button::builder()
-                .icon_name("folder-open-symbolic")
+                .label("Open Folder")
                 .tooltip_text("Open Folder")
                 .valign(gtk::Align::Center)
-                .css_classes(["flat"])
+                .css_classes(["small-button"])
                 .build()
         };
         let open_thumbs = folder_button();
         let open_originals = folder_button();
-        thumbs_row.add_suffix(&open_thumbs);
-        cache_row.add_suffix(&open_originals);
+        thumbs_row.row.append(&open_thumbs);
+        cache_row.row.append(&open_originals);
+        let details = sheet_group(
+            "Account and Storage",
+            &[&account_row, &thumbs_row, &cache_row],
+        );
 
-        let details = adw::PreferencesGroup::builder()
-            .title("Account and Storage")
+        let column = gtk::Box::builder()
+            .orientation(gtk::Orientation::Vertical)
+            .css_classes(["sync-sheet"])
             .build();
-        details.add(&account_row);
-        details.add(&thumbs_row);
-        details.add(&cache_row);
-
-        let column = gtk::Box::new(gtk::Orientation::Vertical, 18);
-        column.set_margin_top(12);
-        column.set_margin_bottom(24);
-        column.set_margin_start(12);
-        column.set_margin_end(12);
         column.append(&current);
-        column.append(&sync_now);
         column.append(&problems);
         column.append(&library);
         column.append(&details);
 
         let clamp = adw::Clamp::builder()
-            .maximum_size(520)
+            .maximum_size(crate::velum::photos("sheet", 480.0) as i32)
             .child(&column)
             .build();
         let scroller = gtk::ScrolledWindow::builder()
@@ -214,7 +244,8 @@ impl SyncManager {
 
         let dialog = adw::Dialog::builder()
             .title("Sync")
-            .content_width(480)
+            .content_width(crate::velum::photos("sheet", 480.0) as i32)
+            .css_classes(["photos-sync"])
             .child(&toolbar)
             .build();
 
@@ -224,6 +255,7 @@ impl SyncManager {
             button_spinner,
             button_icon,
             spinner,
+            glyph,
             title,
             detail,
             bar,
@@ -246,6 +278,8 @@ impl SyncManager {
             reached: Cell::new(0),
             unseen_error: Cell::new(false),
             on_sync: RefCell::new(None),
+            last_failed: Cell::new(false),
+            listeners: RefCell::new(Vec::new()),
         });
 
         manager.sync_now.connect_clicked({
@@ -299,6 +333,20 @@ impl SyncManager {
 
     /// Bestand, Zeitpunkte und Speicher — was auch ohne laufenden Sync gilt.
     pub fn show_overview(&self, overview: &Overview) {
+        // Vor dem ersten Lauf dieser Sitzung: der Stand des letzten.
+        if !self.spinner.is_visible()
+            && self.title.label() == "Ready"
+            && overview.last_sync.is_some()
+        {
+            self.title.set_label("Up to Date");
+        }
+        // Ruht der Sync, sagt die Karte, wie frisch der Stand ist.
+        if !self.spinner.is_visible() {
+            self.detail.set_label(&match &overview.last_sync {
+                Some(when) => format!("Last synced {when}"),
+                None => "Not synced yet".to_string(),
+            });
+        }
         self.photos_row.set_subtitle(&thousands(overview.photos));
         self.last_sync_row
             .set_subtitle(overview.last_sync.as_deref().unwrap_or("never"));
@@ -314,6 +362,29 @@ impl SyncManager {
             } else {
                 &overview.apple_id
             });
+    }
+
+    /// Der Stand jetzt.
+    pub fn status(&self) -> SyncStatus {
+        let running = self.spinner.is_visible();
+        SyncStatus {
+            running,
+            failed: self.last_failed.get() && !running,
+            phase: self.title.label().to_string(),
+        }
+    }
+
+    /// Ruft `f` bei jedem Wechsel von Lauf, Phase oder Fehler.
+    pub fn connect_status(&self, f: impl Fn(&SyncStatus) + 'static) {
+        self.listeners.borrow_mut().push(Rc::new(f));
+    }
+
+    fn notify(&self) {
+        let status = self.status();
+        let listeners = self.listeners.borrow().clone();
+        for listener in listeners {
+            listener(&status);
+        }
     }
 
     fn update_button(&self, running: bool) {
@@ -333,9 +404,27 @@ impl SyncManager {
         } else {
             "Sync (Ctrl+Shift+R)"
         }));
+        self.notify();
     }
 
     fn set_running(&self, running: bool) {
+        self.glyph.set_visible(!running);
+        let name = if self.last_failed.get() {
+            "warning"
+        } else {
+            "check"
+        };
+        crate::icons::set_glyph(
+            &self.glyph,
+            name,
+            crate::icons::Weight::Bold,
+            crate::icons::fallback(name),
+        );
+        if self.last_failed.get() {
+            self.glyph.add_css_class("failed");
+        } else {
+            self.glyph.remove_css_class("failed");
+        }
         self.spinner.set_visible(running);
         self.spinner.set_spinning(running);
         self.bar.set_visible(running);
@@ -469,6 +558,7 @@ impl SyncManager {
 
     /// Der Lauf ist durch.
     pub fn finished(&self, message: &str) {
+        self.last_failed.set(false);
         self.set_running(false);
         self.title.set_label("Up to Date");
         self.detail.set_label("");
@@ -481,12 +571,102 @@ impl SyncManager {
     /// Kopfzeile zeigt ein Warnzeichen, bis jemand hineingesehen hat.
     pub fn failed(&self, message: &str, detail: &str) {
         self.unseen_error.set(true);
+        self.last_failed.set(true);
         self.set_running(false);
         self.title.set_label(message);
         self.detail.set_label("");
         self.error_row.set_subtitle(detail);
         self.error_row.set_visible(true);
     }
+}
+
+/// Eine Zeile des Sheets: Bezeichnung links, Wert rechts (wie im Lab), oder
+/// als Hinweis eine Überschrift über einem wählbaren Text.
+pub struct SheetRow {
+    pub row: gtk::Box,
+    value: gtk::Label,
+}
+
+impl SheetRow {
+    fn new(title: &str) -> Self {
+        let name = gtk::Label::builder()
+            .label(title)
+            .xalign(0.0)
+            .hexpand(true)
+            .css_classes(["sheet-name"])
+            .build();
+        // Werte stehen in einer Zeile; nur lange (der Hinweis zu „in iCloud")
+        // brechen um, und dann erst bei einem Teil der Breite.
+        let value = gtk::Label::builder()
+            .xalign(1.0)
+            .max_width_chars(24)
+            .justify(gtk::Justification::Right)
+            .selectable(true)
+            .css_classes(["sheet-value", "numeric"])
+            .build();
+        let row = gtk::Box::builder()
+            .orientation(gtk::Orientation::Horizontal)
+            .css_classes(["sheet-row"])
+            .build();
+        row.append(&name);
+        row.append(&value);
+        Self { row, value }
+    }
+
+    fn note(title: &str) -> Self {
+        let name = gtk::Label::builder()
+            .label(title)
+            .xalign(0.0)
+            .css_classes(["sheet-name", "heading"])
+            .build();
+        let value = gtk::Label::builder()
+            .xalign(0.0)
+            .wrap(true)
+            .selectable(true)
+            .css_classes(["sheet-value"])
+            .build();
+        let row = gtk::Box::builder()
+            .orientation(gtk::Orientation::Vertical)
+            .css_classes(["sheet-note"])
+            .build();
+        row.append(&name);
+        row.append(&value);
+        Self { row, value }
+    }
+
+    fn set_subtitle(&self, value: &str) {
+        // Nur lange Werte brechen um; kurze („31 minutes ago") nie.
+        self.value.set_wrap(value.chars().count() > 24);
+        self.value.set_label(value);
+    }
+
+    fn set_visible(&self, visible: bool) {
+        self.row.set_visible(visible);
+    }
+}
+
+/// Eine Gruppe: Überschrift, darunter die Zeilen auf einer Karte.
+fn sheet_group(title: &str, rows: &[&SheetRow]) -> gtk::Box {
+    let group = gtk::Box::builder()
+        .orientation(gtk::Orientation::Vertical)
+        .css_classes(["sheet-section"])
+        .build();
+    group.append(
+        &gtk::Label::builder()
+            .label(title)
+            .xalign(0.0)
+            .css_classes(["sheet-heading"])
+            .build(),
+    );
+    let card = gtk::Box::builder()
+        .orientation(gtk::Orientation::Vertical)
+        .css_classes(["sheet-card", "sheet-group"])
+        .build();
+    for row in rows {
+        card.append(&row.row);
+    }
+    group.append(&card);
+    group
 }
 
 /// Oeffnet einen Ordner im Dateimanager. Fehlt er noch — vor dem ersten

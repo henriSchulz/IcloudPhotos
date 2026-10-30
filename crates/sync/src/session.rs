@@ -63,6 +63,16 @@ enum SessionMessage {
         #[serde(default = "retryable")]
         kind: String,
     },
+    /// `isFavorite` ist gesetzt.
+    FavoriteSet {
+        id: String,
+    },
+    FavoriteFailed {
+        id: String,
+        message: String,
+        #[serde(default = "retryable")]
+        kind: String,
+    },
     /// Die Datei ist in iCloud. `id` fehlt, solange iCloud sie noch nicht
     /// indiziert hat (oder sie schon kannte) — der nächste Sync bringt sie.
     Uploaded {
@@ -89,6 +99,12 @@ pub enum Job {
     Delete { id: String, master: Option<String> },
     /// Eine Datei in die Mediathek laden.
     Upload { path: PathBuf },
+    /// Favorit setzen (`true`) oder lösen.
+    Favorite {
+        id: String,
+        master: Option<String>,
+        value: bool,
+    },
 }
 
 /// Was ein erledigter Auftrag ergibt.
@@ -96,6 +112,7 @@ pub enum Job {
 pub enum Done {
     Original(Original),
     Deleted,
+    Favorited,
     Uploaded { id: Option<String> },
 }
 
@@ -246,6 +263,12 @@ impl SidecarSession {
                 "cmd": "upload",
                 "path": path.to_string_lossy(),
             }),
+            Job::Favorite { id, master, value } => serde_json::json!({
+                "cmd": "favorite",
+                "id": id,
+                "master": master,
+                "value": value,
+            }),
         };
         write_line(&mut self.stdin, &line.to_string()).await?;
 
@@ -291,6 +314,21 @@ impl SidecarSession {
                 (
                     Job::Delete { id, .. },
                     SessionMessage::DeleteFailed {
+                        id: got,
+                        message,
+                        kind,
+                    },
+                ) if &got == id => {
+                    return Err(SyncError::Sidecar { kind, message });
+                }
+                (Job::Favorite { id, .. }, SessionMessage::FavoriteSet { id: got })
+                    if &got == id =>
+                {
+                    return Ok(Done::Favorited);
+                }
+                (
+                    Job::Favorite { id, .. },
+                    SessionMessage::FavoriteFailed {
                         id: got,
                         message,
                         kind,

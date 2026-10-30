@@ -242,3 +242,34 @@ async fn deletes_and_uploads_through_the_same_process() {
     );
     session.shutdown().await;
 }
+
+#[tokio::test]
+async fn sets_and_clears_favorites() {
+    let python = python_or_skip!();
+    let mut session = SidecarSession::start(&options(&python, 10), &Prompts::default())
+        .await
+        .unwrap();
+    for value in [true, false] {
+        let done = session
+            .run(&Job::Favorite {
+                id: "fake-00003".into(),
+                master: None,
+                value,
+            })
+            .await
+            .unwrap();
+        assert_eq!(done, Done::Favorited);
+    }
+    // Ein unbekanntes Foto ist endgültig verloren, kein zweiter Anlauf.
+    match session
+        .run(&Job::Favorite {
+            id: "nope".into(),
+            master: None,
+            value: true,
+        })
+        .await
+    {
+        Err(SyncError::Sidecar { kind, .. }) => assert_eq!(kind, "missing"),
+        other => panic!("erwartet missing, bekam {other:?}"),
+    }
+}

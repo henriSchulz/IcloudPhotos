@@ -9,6 +9,9 @@ adw = { version = "0.9.2", package = "libadwaita", features = ["v1_5"] }
 anyhow = "1.0.104"
 chrono = { version = "0.4.45", default-features = false, features = ["clock", "std"] }
 gtk = { version = "0.11.4", package = "gtk4", features = ["v4_12"] }
+# Für `FontMap::add_font_file`: Velums Phosphor-Schrift wird zur Laufzeit
+# geladen, sie ist nicht im System installiert.
+pango = { version = "0.22", features = ["v1_56"] }
 icloud-photos-cache.workspace = true
 icloud-photos-core.workspace = true
 icloud-photos-sync.workspace = true

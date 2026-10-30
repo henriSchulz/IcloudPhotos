@@ -139,6 +139,35 @@ impl Catalog {
         Ok(())
     }
 
+    /// Nimmt ein Foto in „Favorites" auf oder heraus — sofort, bevor iCloud
+    /// geantwortet hat; schlägt das fehl, ruft die App es mit dem alten Wert
+    /// noch einmal. Gibt es das intelligente Album noch nicht (ein Konto ohne
+    /// Favoriten), wird es angelegt, wie der nächste Album-Sync es täte.
+    pub fn set_favorite(&self, id: &str, favorite: bool) -> Result<(), CacheError> {
+        if favorite {
+            self.conn.execute(
+                "INSERT OR IGNORE INTO albums (id, name, kind, parent_id, position, size)
+                 VALUES ('Favorites', 'Favorites', 'smart', NULL, -1, NULL)",
+                [],
+            )?;
+            self.conn.execute(
+                "INSERT OR IGNORE INTO album_photos (album_id, photo_id) VALUES ('Favorites', ?1)",
+                params![id],
+            )?;
+        } else {
+            self.conn.execute(
+                "DELETE FROM album_photos WHERE album_id = 'Favorites' AND photo_id = ?1",
+                params![id],
+            )?;
+        }
+        Ok(())
+    }
+
+    /// Die IDs der Favoriten — für das Herz auf den Kacheln.
+    pub fn favorite_ids(&self) -> Result<std::collections::HashSet<String>, CacheError> {
+        Ok(self.album_member_ids("Favorites")?.into_iter().collect())
+    }
+
     /// Die Größe jedes Albums laut iCloud beim letzten Laden.
     pub fn album_sizes(&self) -> Result<HashMap<String, u64>, CacheError> {
         let mut stmt = self
@@ -249,6 +278,21 @@ mod tests {
             size: Some(members.len() as u64),
             members: members.iter().map(|m| m.to_string()).collect(),
         }
+    }
+
+    #[test]
+    fn favorites_change_at_once_and_create_the_album() {
+        let catalog = catalog();
+        assert!(catalog.favorite_ids().unwrap().is_empty());
+        catalog.set_favorite("b", true).unwrap();
+        catalog.set_favorite("b", true).unwrap();
+        assert!(catalog.favorite_ids().unwrap().contains("b"));
+        let favorites = catalog.albums().unwrap();
+        let favorites = favorites.iter().find(|a| a.id == "Favorites").unwrap();
+        assert_eq!(favorites.kind, AlbumKind::Smart);
+        assert_eq!(favorites.count, 1);
+        catalog.set_favorite("b", false).unwrap();
+        assert!(catalog.favorite_ids().unwrap().is_empty());
     }
 
     #[test]

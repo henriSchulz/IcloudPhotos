@@ -679,6 +679,7 @@ dependencies = [
  "kamadak-exif",
  "libadwaita",
  "libshumate",
+ "pango",
  "serde_json",
  "tempfile",
  "tokio",

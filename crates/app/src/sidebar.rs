@@ -21,10 +21,15 @@ use crate::sync_manager::thousands;
 /// Was ausgewählt werden kann.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Target {
+    /// Die Startseite mit den Karten (Vorschlag A des Velum-Labs).
+    Home,
     Library,
     Collections,
     Map,
     Album(String),
+    /// Ein Ordner — nur aus der schmalen Leiste, die keine Unterzeilen zeigt:
+    /// er öffnet sich in „Collections".
+    Folder(String),
 }
 
 /// Intelligente Alben, die oben unter „Pinned" stehen — wie in Photos.
@@ -39,7 +44,28 @@ pub fn display_name(album: &Album) -> String {
     }
 }
 
-/// Symbol eines Albums in Seitenleiste und Übersicht.
+/// Velum-Symbol eines Albums (Seitenleiste, Übersicht, Home) und das
+/// Systemsymbol als Rückfall ohne Velum.
+pub fn glyph_name(album: &Album) -> (&'static str, &'static str) {
+    let velum = match album.kind {
+        AlbumKind::Folder => "folder",
+        AlbumKind::Album => "image",
+        AlbumKind::Smart => match album.id.as_str() {
+            "Favorites" => "heart",
+            "Videos" => "film",
+            "Live" => "image",
+            "Panoramas" => "layout.columns",
+            "Screenshots" => "display",
+            "Slo-mo" => "film",
+            "Time-lapse" => "clock",
+            "Bursts" => "duplicate",
+            _ => "image",
+        },
+    };
+    (velum, icon_name(album))
+}
+
+/// Systemsymbol eines Albums (Rückfall ohne Velum).
 pub fn icon_name(album: &Album) -> &'static str {
     match album.kind {
         AlbumKind::Folder => "folder-symbolic",
@@ -118,6 +144,10 @@ type SelectCallback = Rc<dyn Fn(&Target)>;
 
 pub struct Sidebar {
     pub widget: gtk::ScrolledWindow,
+    /// Nur Symbole (schmales Fenster, `surface.photos.railBelow`).
+    rail: std::cell::Cell<bool>,
+    /// Gesamtzahl der Bibliothek für die Zeile „Library".
+    library_count: std::cell::Cell<u64>,
     list: gtk::ListBox,
     rows: RefCell<Vec<(gtk::ListBoxRow, Row)>>,
     albums: RefCell<Vec<Album>>,
@@ -145,7 +175,9 @@ impl Sidebar {
             rows: RefCell::new(Vec::new()),
             albums: RefCell::new(Vec::new()),
             expanded: RefCell::new(HashSet::new()),
-            current: RefCell::new(Target::Library),
+            current: RefCell::new(Target::Home),
+            rail: std::cell::Cell::new(false),
+            library_count: std::cell::Cell::new(0),
             on_select: RefCell::new(None),
         });
 
@@ -163,6 +195,26 @@ impl Sidebar {
 
     pub fn connect_select(&self, callback: impl Fn(&Target) + 'static) {
         *self.on_select.borrow_mut() = Some(Rc::new(callback));
+    }
+
+    /// Schaltet zwischen voller Leiste und Symbolleiste.
+    pub fn set_rail(&self, rail: bool) {
+        if self.rail.replace(rail) != rail {
+            self.rebuild();
+        }
+    }
+
+    /// Die Zahl neben „Library".
+    pub fn set_library_count(&self, count: u64) {
+        if self.library_count.replace(count) != count {
+            self.rebuild();
+        }
+    }
+
+    /// Keine Zeile markiert — für Seiten ohne eigenen Eintrag (Suche, ein
+    /// Tag von der Startseite). Das gemerkte Ziel bleibt.
+    pub fn unhighlight(&self) {
+        self.list.unselect_all();
     }
 
     pub fn albums(&self) -> Vec<Album> {
@@ -270,13 +322,42 @@ impl Sidebar {
             self.list.remove(&child);
         }
         self.rows.borrow_mut().clear();
+        let rail = self.rail.get();
+        self.list.set_css_classes(if rail {
+            &["navigation-sidebar", "rail"]
+        } else {
+            &["navigation-sidebar"]
+        });
 
         self.push(
-            entry("image-x-generic-symbolic", "Library", None, 0),
+            entry(
+                Glyph::Icon("personal", "user-home-symbolic"),
+                "Home",
+                None,
+                0,
+                rail,
+            ),
+            Row::Target(Target::Home),
+        );
+        let total = self.library_count.get();
+        self.push(
+            entry(
+                Glyph::Icon("image", "image-x-generic-symbolic"),
+                "Library",
+                (total > 0).then_some(total),
+                0,
+                rail,
+            ),
             Row::Target(Target::Library),
         );
         self.push(
-            entry("view-grid-symbolic", "Collections", None, 0),
+            entry(
+                Glyph::Icon("layout.tiles", "view-grid-symbolic"),
+                "Collections",
+                None,
+                0,
+                rail,
+            ),
             Row::Target(Target::Collections),
         );
 
@@ -284,7 +365,7 @@ impl Sidebar {
 
         // Die Karte steht immer da, wie in Photos zwischen Favorites und
         // Videos. Ohne Fotos mit Ort zeigt sie, warum sie leer ist.
-        self.list.append(&heading("Pinned"));
+        self.list.append(&heading("Pinned", rail));
         let (favorites, rest): (Vec<&Album>, Vec<&Album>) = pinned(&albums)
             .into_iter()
             .partition(|album| album.id == "Favorites");
@@ -292,7 +373,13 @@ impl Sidebar {
             self.push_album(album, 0);
         }
         self.push(
-            entry("mark-location-symbolic", "Map", None, 0),
+            entry(
+                Glyph::Icon("network", "mark-location-symbolic"),
+                "Map",
+                None,
+                0,
+                rail,
+            ),
             Row::Target(Target::Map),
         );
         for album in rest {
@@ -300,13 +387,13 @@ impl Sidebar {
         }
 
         if !children(&albums, None).is_empty() {
-            self.list.append(&heading("Albums"));
+            self.list.append(&heading("Albums", rail));
             self.push_tree(&albums, None, 0);
         }
 
         let media = media_types(&albums);
         if !media.is_empty() {
-            self.list.append(&heading("Media Types"));
+            self.list.append(&heading("Media Types", rail));
             for album in media {
                 self.push_album(album, 0);
             }
@@ -316,15 +403,23 @@ impl Sidebar {
     }
 
     fn push_tree(&self, albums: &[Album], parent: Option<&str>, depth: u32) {
+        let rail = self.rail.get();
         for album in children(albums, parent) {
             if album.kind == AlbumKind::Folder {
                 let open = self.expanded.borrow().contains(&album.id);
                 let row = entry(
-                    icon_name(album),
+                    Glyph::Icon(glyph_name(album).0, glyph_name(album).1),
                     &display_name(album),
                     Some(folder_count(albums, &album.id)),
                     depth,
+                    rail,
                 );
+                // Die Leiste zeigt keine Unterzeilen: dort öffnet ein Ordner
+                // sich in „Collections".
+                if rail {
+                    self.push(row, Row::Target(Target::Folder(album.id.clone())));
+                    continue;
+                }
                 add_disclosure(&row, open);
                 self.push(row, Row::Folder(album.id.clone()));
                 if open {
@@ -337,11 +432,18 @@ impl Sidebar {
     }
 
     fn push_album(&self, album: &Album, depth: u32) {
+        // Eigene Alben zeigen ihr Titelbild, intelligente ihr Symbol — wie in
+        // Photos.
+        let glyph = match (&album.kind, &album.cover) {
+            (AlbumKind::Album, Some(cover)) => Glyph::Cover(cover.clone()),
+            _ => Glyph::Icon(glyph_name(album).0, glyph_name(album).1),
+        };
         let row = entry(
-            icon_name(album),
+            glyph,
             &display_name(album),
             Some(album.count),
             depth,
+            self.rail.get(),
         );
         self.push(row, Row::Target(Target::Album(album.id.clone())));
     }
@@ -352,15 +454,58 @@ impl Sidebar {
     }
 }
 
-/// Eine Zeile: Symbol, Name und rechts die Anzahl.
-fn entry(icon: &str, label: &str, count: Option<u64>, depth: u32) -> gtk::ListBoxRow {
+/// Was links in einer Zeile steht.
+enum Glyph {
+    /// Velum-Name und Systemsymbol als Rückfall.
+    Icon(&'static str, &'static str),
+    /// Titelbild eines Albums (Vorschau-Pfad).
+    Cover(std::path::PathBuf),
+}
+
+/// Eine Zeile: der Akzentstrich der Wahl, Symbol oder Titelbild, Name und
+/// rechts die Anzahl. In der Leiste nur das Symbol, der Name als Tooltip.
+fn entry(glyph: Glyph, label: &str, count: Option<u64>, depth: u32, rail: bool) -> gtk::ListBoxRow {
     let content = gtk::Box::builder()
         .orientation(gtk::Orientation::Horizontal)
-        .spacing(10)
+        .css_classes(["sidebar-entry"])
         // Unterordner rücken ein, wie im Finder.
-        .margin_start(depth as i32 * 16)
+        .margin_start(if rail { 0 } else { depth as i32 * 16 })
         .build();
-    content.append(&gtk::Image::from_icon_name(icon));
+    // Der Strich links neben der gewählten Zeile (Velum: wie Settings).
+    let bar = gtk::Box::builder()
+        .css_classes(["nav-bar"])
+        .valign(gtk::Align::Center)
+        .build();
+    content.append(&bar);
+    let glyph: gtk::Widget = match glyph {
+        Glyph::Icon(name, fallback) => {
+            crate::icons::glyph(name, crate::icons::Weight::Regular, fallback)
+        }
+        Glyph::Cover(path) => {
+            let picture = gtk::Picture::builder()
+                .content_fit(gtk::ContentFit::Cover)
+                .build();
+            crate::window::set_image(&picture, &path.to_string_lossy());
+            let cover = crate::layout::RatioBox::fixed(
+                &picture,
+                1.0,
+                crate::velum::photos("cover", 20.0) as i32,
+            );
+            cover.add_css_class("album-cover");
+            cover.set_valign(gtk::Align::Center);
+            cover.upcast()
+        }
+    };
+    glyph.add_css_class("row-glyph");
+    content.append(&glyph);
+    if rail {
+        content.set_halign(gtk::Align::Center);
+        content.set_tooltip_text(Some(label));
+        return gtk::ListBoxRow::builder()
+            .child(&content)
+            .css_classes(["rail-row"])
+            .build();
+    }
     let name = gtk::Label::builder()
         .label(label)
         .xalign(0.0)
@@ -373,7 +518,7 @@ fn entry(icon: &str, label: &str, count: Option<u64>, depth: u32) -> gtk::ListBo
         content.append(
             &gtk::Label::builder()
                 .label(thousands(count))
-                .css_classes(["dim-label", "numeric", "caption"])
+                .css_classes(["dim-label", "numeric", "caption", "row-count"])
                 .build(),
         );
     }
@@ -385,17 +530,41 @@ fn add_disclosure(row: &gtk::ListBoxRow, open: bool) {
     let Some(content) = row.child().and_downcast::<gtk::Box>() else {
         return;
     };
-    let arrow = gtk::Image::from_icon_name(if open {
-        "pan-down-symbolic"
+    let arrow = if open {
+        crate::icons::glyph(
+            "chevron.down",
+            crate::icons::Weight::Bold,
+            "pan-down-symbolic",
+        )
     } else {
-        "pan-end-symbolic"
-    });
+        crate::icons::glyph(
+            "chevron.right",
+            crate::icons::Weight::Bold,
+            "pan-end-symbolic",
+        )
+    };
     arrow.add_css_class("dim-label");
-    content.prepend(&arrow);
+    arrow.add_css_class("disclosure");
+    // Hinter den Akzentstrich, vor das Symbol.
+    content.insert_child_after(&arrow, content.first_child().as_ref());
 }
 
-/// Abschnittsüberschrift — nicht auswählbar.
-fn heading(title: &str) -> gtk::ListBoxRow {
+/// Abschnittsüberschrift — nicht auswählbar. In der Leiste ein kurzer
+/// Trennstrich statt des Worts.
+fn heading(title: &str, rail: bool) -> gtk::ListBoxRow {
+    if rail {
+        let line = gtk::Separator::builder()
+            .halign(gtk::Align::Center)
+            .css_classes(["rail-separator"])
+            .build();
+        return gtk::ListBoxRow::builder()
+            .child(&line)
+            .css_classes(["sidebar-section"])
+            .selectable(false)
+            .activatable(false)
+            .can_focus(false)
+            .build();
+    }
     let label = gtk::Label::builder()
         .label(title)
         .xalign(0.0)

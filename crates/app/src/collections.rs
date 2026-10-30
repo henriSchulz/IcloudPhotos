@@ -11,7 +11,7 @@ use gtk::prelude::*;
 use icloud_photos_cache::Album;
 use icloud_photos_core::model::AlbumKind;
 
-use crate::sidebar::{children, display_name, folder_count, icon_name, media_types, pinned};
+use crate::sidebar::{children, display_name, folder_count, glyph_name, media_types, pinned};
 use crate::sync_manager::thousands;
 
 /// Kantenlänge eines Titelbilds.
@@ -125,11 +125,8 @@ impl Collections {
     /// Kopfzeile eines geöffneten Ordners: zurück und Name.
     fn folder_header(self: &Rc<Self>, title: &str, parent: Option<String>) -> gtk::Box {
         let row = gtk::Box::builder().spacing(8).margin_bottom(6).build();
-        let back = gtk::Button::builder()
-            .icon_name("go-previous-symbolic")
-            .tooltip_text("Back")
-            .css_classes(["flat"])
-            .build();
+        let back = crate::icons::button("chevron.left", "go-previous-symbolic", None, "Back");
+        back.add_css_class("flat");
         back.connect_clicked({
             let weak = Rc::downgrade(self);
             move |_| {
@@ -195,11 +192,10 @@ impl Collections {
             Some(path) => picture.set_filename(Some(&path)),
             // Ohne Titelbild ein Symbol auf der leeren Karte.
             None => {
-                let icon = gtk::Image::builder()
-                    .icon_name(icon_name(album))
-                    .pixel_size(48)
-                    .css_classes(["dim-label"])
-                    .build();
+                let (name, fallback) = glyph_name(album);
+                let icon = crate::icons::glyph(name, crate::icons::Weight::Regular, fallback);
+                icon.add_css_class("dim-label");
+                icon.add_css_class("cover-glyph");
                 frame.add_overlay(&icon);
             }
         }

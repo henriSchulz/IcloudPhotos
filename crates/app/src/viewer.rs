@@ -12,7 +12,9 @@ use adw::prelude::*;
 use gtk::{gdk, gio, glib};
 
 use crate::export;
+use crate::icons::Weight;
 use crate::info_panel::InfoPanel;
+use crate::menu;
 use crate::photo_object::PhotoObject;
 use crate::window::{AppState, UiAction};
 use crate::zoom_view::{Swipe, ZOOM_STEP, ZoomView};
@@ -21,10 +23,11 @@ use crate::zoom_view::{Swipe, ZOOM_STEP, ZoomView};
 /// er deckt den nächsten Tastendruck ab, ohne die Leitung vollzulaufen.
 const PREFETCH_NEIGHBOURS: i32 = 1;
 
-/// Unterhalb dieser Breite legt sich das Info-Panel über das Foto, statt es
-/// zu verdrängen. 720 sp sind das Panel (höchstens 340) plus ein Foto, das
-/// daneben noch als Foto zu erkennen ist.
-const INFO_OVERLAY_BELOW_SP: f64 = 720.0;
+/// Unterhalb dieser Seitenbreite wird Info ein Sheet unten über dem Foto
+/// (Velum `surface.photos.compactBelow`, wie die Container-Abfrage im Lab).
+fn sheet_below() -> f64 {
+    crate::velum::photos("compactBelow", 640.0)
+}
 
 thread_local! {
     /// Ob das Info-Panel offen ist. Die Seite wird bei jedem Öffnen neu
@@ -61,8 +64,21 @@ pub struct Viewer {
     /// ausblendet.
     info: Rc<InfoPanel>,
     split: adw::OverlaySplitView,
+    /// Die Info-Karte (Kopf „Info" + Panel) — rechts in der Teilung oder,
+    /// auf schmaler Seite, als Sheet im Overlay über der Bühne.
+    inspector: gtk::Box,
+    stage: gtk::Overlay,
+    narrow: Cell<bool>,
+    info_toggle: gtk::ToggleButton,
+    favorite: gtk::ToggleButton,
+    menu_button: gtk::MenuButton,
     /// Position im Modell des Rasters.
     position: Cell<u32>,
+}
+
+/// Info beim nächsten Öffnen zeigen (Kontextmenü „Show Info").
+pub fn set_info_open(open: bool) {
+    INFO_OPEN.set(open);
 }
 
 /// Öffnet den Betrachter an dieser Position im Raster.
@@ -121,51 +137,133 @@ pub fn open(
         .show_end_title_buttons(false)
         .build();
 
+    // Der Zurück-Knopf nennt die Seite, von der man kam („Library",
+    // Albumname, „Photos" für die Startseite).
+    let back_label = state.viewer_back.borrow().clone();
+    let back_label = if back_label.is_empty() {
+        "Library".to_string()
+    } else {
+        back_label
+    };
     let back = gtk::Button::builder()
-        .icon_name("go-previous-symbolic")
-        .tooltip_text("Back to Library (Esc)")
+        .child(&crate::icons::content(
+            "chevron.left",
+            "go-previous-symbolic",
+            Some(&back_label),
+        ))
+        .tooltip_text(format!("Back to {back_label} (Esc)"))
+        .css_classes(["back"])
         .build();
     header.pack_start(&back);
+    let head_separator = || {
+        gtk::Separator::builder()
+            .orientation(gtk::Orientation::Vertical)
+            .valign(gtk::Align::Center)
+            .css_classes(["head-separator"])
+            .build()
+    };
+    let nav_separator = head_separator();
+    header.pack_start(&nav_separator);
 
     let previous = gtk::Button::builder()
-        .icon_name("go-up-symbolic")
+        .child(&crate::icons::icon("chevron.left", Weight::Bold))
         .tooltip_text("Previous Photo (←)")
         .build();
     let next = gtk::Button::builder()
-        .icon_name("go-down-symbolic")
+        .child(&crate::icons::icon("chevron.right", Weight::Bold))
         .tooltip_text("Next Photo (→)")
         .build();
     let navigation = gtk::Box::new(gtk::Orientation::Horizontal, 0);
-    navigation.add_css_class("linked");
     navigation.append(&previous);
     navigation.append(&next);
     header.pack_start(&navigation);
 
     let fullscreen = gtk::Button::builder()
-        .icon_name("view-fullscreen-symbolic")
+        .child(&crate::icons::icon("fullscreen", Weight::Regular))
         .tooltip_text("Full Screen (F)")
         .build();
     header.pack_end(&fullscreen);
 
     let info_toggle = gtk::ToggleButton::builder()
-        .icon_name("dialog-information-symbolic")
+        .child(&crate::icons::icon("callout", Weight::Regular))
         .tooltip_text("Info (I)")
+        .active(INFO_OPEN.get())
         .build();
     header.pack_end(&info_toggle);
+    header.pack_end(&head_separator());
 
-    let menu = gio::Menu::new();
-    menu.append(Some("Export…"), Some("viewer.save"));
-    menu.append(Some("Copy"), Some("viewer.copy"));
-    menu.append(Some("Open With…"), Some("viewer.open"));
-    let danger = gio::Menu::new();
-    danger.append(Some("Delete…"), Some("viewer.delete"));
-    menu.append_section(None, &danger);
-    let menu_button = gtk::MenuButton::builder()
-        .icon_name("view-more-symbolic")
-        .menu_model(&menu)
-        .tooltip_text("Actions")
-        .build();
+    let mut entries = vec![
+        menu::item(
+            "share",
+            "document-save-symbolic",
+            "Export…",
+            "viewer.save",
+            Some("Ctrl+S"),
+        ),
+        menu::item(
+            "duplicate",
+            "edit-copy-symbolic",
+            "Copy",
+            "viewer.copy",
+            Some("Ctrl+C"),
+        ),
+        menu::item(
+            "open.external",
+            "document-open-symbolic",
+            "Open in Default App",
+            "viewer.open",
+            Some("Ctrl+O"),
+        ),
+    ];
+    if crate::retouch::available() {
+        entries.push(menu::item(
+            "editor",
+            "document-edit-symbolic",
+            "Edit in Retouch",
+            "viewer.retouch",
+            Some("E"),
+        ));
+    }
+    entries.push(menu::Entry::Separator);
+    entries.push(menu::danger(
+        "trash",
+        "user-trash-symbolic",
+        "Delete…",
+        "viewer.delete",
+        Some("Del"),
+    ));
+    let actions_menu = menu::build(&[], &entries);
+    let menu_button = crate::icons::menu_button("more", "view-more-symbolic", "Actions");
+    menu_button.set_popover(Some(&actions_menu.popover));
     header.pack_end(&menu_button);
+    let export = gtk::Button::builder()
+        .child(&crate::icons::icon("share", Weight::Regular))
+        .tooltip_text("Export… (Ctrl+S)")
+        .action_name("viewer.save")
+        .css_classes(["wide-only"])
+        .build();
+    header.pack_end(&export);
+    // Schmal ohne Export, Retouch und Trenner — beides steht im ⋯-Menü.
+    let mut wide_only: Vec<gtk::Widget> =
+        vec![export.clone().upcast(), nav_separator.clone().upcast()];
+    if crate::retouch::available() {
+        let retouch = gtk::Button::builder()
+            .child(&crate::icons::icon("editor", Weight::Regular))
+            .tooltip_text("Edit in Retouch (E)")
+            .action_name("viewer.retouch")
+            .css_classes(["wide-only"])
+            .build();
+        header.pack_end(&retouch);
+        wide_only.push(retouch.upcast());
+    }
+    // Favorit: das Herz, voll und im Akzent, solange das Foto einer ist.
+    let favorite = gtk::ToggleButton::builder()
+        .child(&crate::icons::icon("heart", Weight::Regular))
+        .tooltip_text("Favorite (.)")
+        .action_name("viewer.favorite")
+        .css_classes(["favorite"])
+        .build();
+    header.pack_end(&favorite);
 
     let zoom_label = gtk::Label::builder()
         .css_classes(["dim-label", "numeric"])
@@ -173,23 +271,55 @@ pub fn open(
         .build();
     header.pack_end(&zoom_label);
 
-    // Das Info-Panel als Seitenleiste rechts. Eine OverlaySplitView wie bei
-    // der Bibliothek: im breiten Fenster rückt das Foto beiseite — `ZoomView`
-    // passt sich über seine Zuteilung neu ein, Maßstab und Mittelpunkt
-    // bleiben —, im schmalen legt sich das Panel darüber.
-    let info = InfoPanel::new();
-    let split = adw::OverlaySplitView::builder()
-        .content(&stack)
-        .sidebar(&info.widget)
-        .sidebar_position(gtk::PackType::End)
-        .min_sidebar_width(260.0)
-        .max_sidebar_width(340.0)
-        .show_sidebar(INFO_OPEN.get())
+    // Die Bühne: das Foto auf einer ruhigen, gerundeten Fläche (Lab
+    // `.vstage`). Ein Overlay, damit Info auf schmaler Seite als Sheet
+    // darüber liegen kann.
+    let stage_box = gtk::Box::builder()
+        .css_classes(["photos-stage"])
+        .overflow(gtk::Overflow::Hidden)
         .build();
-    split
-        .bind_property("show-sidebar", &info_toggle, "active")
-        .bidirectional()
-        .sync_create()
+    stack.set_hexpand(true);
+    stage_box.append(&stack);
+    let stage = gtk::Overlay::builder().child(&stage_box).build();
+
+    // Info als Karte: Kopf „Info" mit Schließen, darunter das Panel.
+    let info = InfoPanel::new();
+    let close_info = gtk::Button::builder()
+        .child(&crate::icons::icon("close", Weight::Bold))
+        .tooltip_text("Hide Info (I)")
+        .css_classes(["flat"])
+        .build();
+    let info_head = gtk::Box::builder()
+        .orientation(gtk::Orientation::Horizontal)
+        .css_classes(["inspector-head"])
+        .build();
+    let info_title = gtk::Label::builder()
+        .label("Info")
+        .xalign(0.0)
+        .hexpand(true)
+        .build();
+    info_head.append(&info_title);
+    info_head.append(&close_info);
+    info.widget.set_vexpand(true);
+    info.widget.set_propagate_natural_height(true);
+    let inspector = gtk::Box::builder()
+        .orientation(gtk::Orientation::Vertical)
+        .css_classes(["photos-inspector"])
+        .overflow(gtk::Overflow::Hidden)
+        .build();
+    inspector.append(&info_head);
+    inspector.append(&info.widget);
+
+    // Breit: Info rechts neben dem Foto. `ZoomView` passt sich über seine
+    // Zuteilung neu ein, Maßstab und Mittelpunkt bleiben.
+    let split = adw::OverlaySplitView::builder()
+        .content(&stage)
+        .sidebar(&inspector)
+        .sidebar_position(gtk::PackType::End)
+        .min_sidebar_width(crate::velum::photos("inspector", 290.0))
+        .max_sidebar_width(crate::velum::photos("inspector", 290.0))
+        .show_sidebar(INFO_OPEN.get())
+        .css_classes(["photos-viewer-split"])
         .build();
     // Der Umbruch hängt an einer eigenen BreakpointBin, nicht am Fenster: die
     // Seite wird bei jedem Öffnen neu gebaut, und ein Breakpoint am Fenster
@@ -197,17 +327,23 @@ pub fn open(
     // bleibt bewusst klein, sonst hielte sie das Fenster vom Schrumpfen ab.
     let narrow = adw::Breakpoint::new(adw::BreakpointCondition::new_length(
         adw::BreakpointConditionLengthType::MaxWidth,
-        INFO_OVERLAY_BELOW_SP,
-        adw::LengthUnit::Sp,
+        sheet_below(),
+        adw::LengthUnit::Px,
     ));
-    narrow.add_setter(&split, "collapsed", Some(&true.to_value()));
+    for widget in &wide_only {
+        narrow.add_setter(widget, "visible", Some(&false.to_value()));
+    }
+    // Kopf und Bühne stehen beide in der BreakpointBin: so misst sie die Seite,
+    // und schmal fallen die Knöpfe weg, bevor der Kopf breiter als das
+    // Fenster würde.
+    let body = gtk::Box::new(gtk::Orientation::Vertical, 0);
     let content = adw::BreakpointBin::builder()
-        .child(&split)
-        .width_request(360)
+        .child(&body)
+        .width_request(320)
         .height_request(200)
         .vexpand(true)
         .build();
-    content.add_breakpoint(narrow);
+    content.add_breakpoint(narrow.clone());
 
     // Im Tablet-Modus blendet ein Tipp aufs Foto die Leiste aus und wieder
     // ein, wie in Photos auf dem iPad; das Foto steht dann auf Schwarz.
@@ -228,7 +364,9 @@ pub fn open(
     });
     let page = gtk::Box::new(gtk::Orientation::Vertical, 0);
     page.add_css_class("photos-viewer");
-    page.append(&chrome);
+    body.append(&chrome);
+    split.set_vexpand(true);
+    body.append(&split);
     page.append(&content);
     picture.connect_tap({
         let chrome = chrome.clone();
@@ -275,20 +413,38 @@ pub fn open(
         failed: failed_page,
         info,
         split: split.clone(),
+        inspector: inspector.clone(),
+        stage: stage.clone(),
+        narrow: Cell::new(false),
+        info_toggle: info_toggle.clone(),
+        favorite: favorite.clone(),
+        menu_button: menu_button.clone(),
         position: Cell::new(position),
     });
 
     connect_navigation(&viewer, &previous, &next);
-    split.connect_show_sidebar_notify({
+    info_toggle.connect_toggled({
         let weak = Rc::downgrade(&viewer);
-        move |split| {
-            INFO_OPEN.set(split.shows_sidebar());
-            // Geschlossen wird nichts nachgeführt; beim Öffnen holt das Panel
-            // den Stand des gerade gezeigten Fotos.
-            if split.shows_sidebar() {
-                with(&weak, |viewer| viewer.refresh_info());
-            }
+        move |toggle| {
+            let open = toggle.is_active();
+            with(&weak, |viewer| {
+                if INFO_OPEN.get() != open || viewer.shows_info() != open {
+                    viewer.set_info(open);
+                }
+            });
         }
+    });
+    close_info.connect_clicked({
+        let weak = Rc::downgrade(&viewer);
+        move |_| with(&weak, |viewer| viewer.set_info(false))
+    });
+    narrow.connect_apply({
+        let weak = Rc::downgrade(&viewer);
+        move |_| with(&weak, |viewer| viewer.set_narrow(true))
+    });
+    narrow.connect_unapply({
+        let weak = Rc::downgrade(&viewer);
+        move |_| with(&weak, |viewer| viewer.set_narrow(false))
     });
     // Der Maßstab steht nur im Kopf, solange hineingezoomt ist.
     picture.connect_changed({
@@ -359,7 +515,7 @@ impl Viewer {
         }
         // Erst jetzt gibt es EXIF. Ist das Panel zu, holt es beim Öffnen den
         // Katalogstand — der Downloader hat das Original dort schon vermerkt.
-        if self.split.shows_sidebar() {
+        if INFO_OPEN.get() {
             self.info.original_arrived(id, path);
         }
     }
@@ -485,6 +641,7 @@ impl Viewer {
         self.stop_video();
         self.picture.reset();
         self.refresh_info();
+        self.refresh_favorite();
 
         let Some(photo) = self.current() else {
             self.stack.set_visible_child_name("failed");
@@ -643,7 +800,7 @@ impl Viewer {
     /// Beim Blättern mit geschlossenem Panel kostete jedes Foto sonst eine
     /// Katalogabfrage und das Lesen des Originals, das niemand sieht.
     fn refresh_info(&self) {
-        if !self.split.shows_sidebar() {
+        if !INFO_OPEN.get() {
             return;
         }
         let Some(photo) = self.current().filter(|photo| !photo.is_placeholder()) else {
@@ -673,8 +830,106 @@ impl Viewer {
             .show(&row, &photo.captured_label(), place.as_deref());
     }
 
+    /// Öffnet das ⋯-Menü (Prüfstand).
+    pub fn popup_menu(&self) {
+        self.menu_button.popup();
+    }
+
+    /// Das Herz im Kopf auf den Stand des gezeigten Fotos.
+    pub fn refresh_favorite(&self) {
+        let on = self
+            .current()
+            .filter(|photo| !photo.is_placeholder())
+            .is_some_and(|photo| crate::window::is_favorite(&photo.id()));
+        if self.favorite.is_active() != on {
+            self.favorite.set_active(on);
+        }
+        if let Some(glyph) = self.favorite.child() {
+            let weight = if on { Weight::Fill } else { Weight::Regular };
+            crate::icons::set_glyph(&glyph, "heart", weight, crate::icons::fallback("heart"));
+        }
+        self.favorite
+            .set_tooltip_text(Some(if on { "Unfavorite (.)" } else { "Favorite (.)" }));
+    }
+
     fn toggle_info(&self) {
-        self.split.set_show_sidebar(!self.split.shows_sidebar());
+        self.set_info(!INFO_OPEN.get());
+    }
+
+    /// Ob Info gerade zu sehen ist — rechts oder als Sheet.
+    fn shows_info(&self) -> bool {
+        if self.narrow.get() {
+            self.inspector.is_visible()
+                && self
+                    .inspector
+                    .parent()
+                    .is_some_and(|p| p != *self.split.upcast_ref::<gtk::Widget>())
+        } else {
+            self.split.shows_sidebar()
+        }
+    }
+
+    /// Info zeigen oder verbergen; der Zustand überlebt das Blättern und das
+    /// Schließen des Betrachters (`INFO_OPEN`).
+    fn set_info(&self, open: bool) {
+        INFO_OPEN.set(open);
+        if self.narrow.get() {
+            self.inspector.set_visible(open);
+        } else {
+            self.inspector.set_visible(true);
+            self.split.set_show_sidebar(open);
+        }
+        if self.info_toggle.is_active() != open {
+            self.info_toggle.set_active(open);
+        }
+        // Geschlossen wird nichts nachgeführt; beim Öffnen holt das Panel
+        // den Stand des gerade gezeigten Fotos.
+        if open {
+            self.refresh_info();
+        }
+    }
+
+    /// Schmale Seite: Info wandert aus der Teilung als Sheet unten über die
+    /// Bühne (höchstens `surface.photos.sheetShare` der Höhe) — und zurück.
+    fn set_narrow(&self, narrow: bool) {
+        if self.narrow.replace(narrow) == narrow {
+            return;
+        }
+        if narrow {
+            self.page.add_css_class("narrow");
+            self.split.set_show_sidebar(false);
+            self.split.set_sidebar(gtk::Widget::NONE);
+            self.inspector.set_valign(gtk::Align::End);
+            self.inspector.set_vexpand(false);
+            let height =
+                self.window.height().max(1) as f64 * crate::velum::photos("sheetShare", 0.56);
+            if let Some(scroller) = self
+                .inspector
+                .last_child()
+                .and_downcast::<gtk::ScrolledWindow>()
+            {
+                scroller.set_max_content_height(height as i32);
+                scroller.set_vexpand(false);
+            }
+            self.stage.add_overlay(&self.inspector);
+            self.inspector.set_visible(INFO_OPEN.get());
+        } else {
+            self.page.remove_css_class("narrow");
+            self.stage.remove_overlay(&self.inspector);
+            self.inspector.set_valign(gtk::Align::Fill);
+            self.inspector.set_vexpand(true);
+            if let Some(scroller) = self
+                .inspector
+                .last_child()
+                .and_downcast::<gtk::ScrolledWindow>()
+            {
+                scroller.set_max_content_height(-1);
+                scroller.set_vexpand(true);
+            }
+            self.inspector.set_visible(true);
+            self.split.set_sidebar(Some(&self.inspector));
+            self.split.set_show_sidebar(INFO_OPEN.get());
+        }
     }
 
     fn toggle_fullscreen(&self) {
@@ -740,6 +995,13 @@ fn connect_keys(viewer: &Rc<Viewer>) {
                 gdk::Key::_1 | gdk::Key::KP_1 => viewer.picture.actual_size(None),
                 gdk::Key::f | gdk::Key::F11 => viewer.toggle_fullscreen(),
                 gdk::Key::i | gdk::Key::I => viewer.toggle_info(),
+                // Wie in Photos: „." legt das Foto zu den Favoriten.
+                gdk::Key::period => {
+                    let _ = WidgetExt::activate_action(&viewer.page, "viewer.favorite", None);
+                }
+                gdk::Key::e | gdk::Key::E if crate::retouch::available() => {
+                    let _ = WidgetExt::activate_action(&viewer.page, "viewer.retouch", None);
+                }
                 // Vor dem Kürzel des Rasters: im Betrachter gilt das offene Foto.
                 gdk::Key::Delete | gdk::Key::KP_Delete => {
                     let _ = WidgetExt::activate_action(&viewer.page, "viewer.delete", None);
@@ -748,8 +1010,8 @@ fn connect_keys(viewer: &Rc<Viewer>) {
                     // Erst was über dem Foto liegt, dann das Vollbild, dann
                     // zurueck ins Raster — sonst waere das Foto weg, bevor man
                     // wieder etwas sieht.
-                    if viewer.split.is_collapsed() && viewer.split.shows_sidebar() {
-                        viewer.split.set_show_sidebar(false);
+                    if viewer.narrow.get() && INFO_OPEN.get() {
+                        viewer.set_info(false);
                     } else if viewer.window.is_fullscreen() {
                         viewer.window.unfullscreen();
                     } else {
@@ -775,6 +1037,7 @@ fn connect_actions(viewer: &Rc<Viewer>, group: &gio::SimpleActionGroup) {
         ("save", UiAction::Save),
         ("copy", UiAction::Clipboard),
         ("open", UiAction::Open),
+        ("retouch", UiAction::Retouch),
     ] {
         let entry = gio::SimpleAction::new(name, None);
         entry.connect_activate({
@@ -789,6 +1052,20 @@ fn connect_actions(viewer: &Rc<Viewer>, group: &gio::SimpleActionGroup) {
         });
         group.add_action(&entry);
     }
+
+    // Favorit an/aus für das gezeigte Foto (Herz im Kopf, Taste „.").
+    let favorite = gio::SimpleAction::new("favorite", None);
+    favorite.connect_activate({
+        let weak = Rc::downgrade(viewer);
+        move |_, _| {
+            with(&weak, |viewer| {
+                if let Some(item) = viewer.item() {
+                    viewer.state.toggle_favorite(vec![item.id]);
+                }
+            });
+        }
+    });
+    group.add_action(&favorite);
 
     // Löschen: nachfragen, dann zurück ins Raster und in iCloud löschen.
     let delete = gio::SimpleAction::new("delete", None);
