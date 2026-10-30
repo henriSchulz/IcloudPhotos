@@ -846,7 +846,8 @@ def run_serve(username: str, cookie_dir: str | None) -> int:
 
     Befehle sind JSON-Zeilen: ``{"cmd": "original", "id": ..., "dest": ...}``,
     ``{"cmd": "delete", "id": ..., "master": ...}`` (in iCloud nach "Zuletzt
-    geloescht"), ``{"cmd": "upload", "path": ...}`` und ``{"cmd": "quit"}``.
+    geloescht"), ``{"cmd": "favorite", "id": ..., "master": ..., "value": bool}``,
+    ``{"cmd": "upload", "path": ...}`` und ``{"cmd": "quit"}``.
     """
     api = authenticate(username, cookie_dir)
     resolver = AssetResolver(api)
@@ -870,6 +871,9 @@ def run_serve(username: str, cookie_dir: str | None) -> int:
             continue
         if name == "upload":
             serve_upload(api, command)
+            continue
+        if name == "favorite":
+            serve_favorite(resolver, command)
             continue
         if name != "original":
             emit({"type": "error", "kind": "protocol", "message": f"unknown command: {name}"})
@@ -924,6 +928,43 @@ def serve_delete(resolver: AssetResolver, command: dict[str, Any]) -> None:
     emit({"type": "photo_deleted", "id": asset_id})
 
 
+def favorite_failed(asset_id: str, value: bool, message: str, kind: str = "error") -> dict[str, Any]:
+    """Antwort, wenn iCloud ``isFavorite`` nicht setzen liess."""
+    return {"type": "favorite_failed", "id": asset_id, "value": value, "kind": kind, "message": message}
+
+
+def serve_favorite(resolver: AssetResolver, command: dict[str, Any]) -> None:
+    """Setzt oder loescht ``isFavorite`` am Asset-Record — das Herz in
+    Photos, auf allen Geraeten. pyicloud (cloudkit) kann das selbst
+    (``PhotoAsset.set_favorite``); fehlt die Methode, ist es ein Fehler."""
+    asset_id = command.get("id") or ""
+    value = bool(command.get("value"))
+    if not asset_id:
+        emit(favorite_failed("", value, "id fehlt", kind="missing"))
+        return
+    try:
+        asset = resolver.get(asset_id, command.get("master"))
+    except Exception as exc:  # noqa: BLE001 - fremde API
+        emit(favorite_failed(asset_id, value, f"{type(exc).__name__}: {exc}"))
+        return
+    if asset is None:
+        emit(favorite_failed(asset_id, value, "Asset not found", kind="missing"))
+        return
+    setter = getattr(asset, "set_favorite", None)
+    if setter is None:
+        emit(favorite_failed(asset_id, value, "This pyicloud can't change favorites", kind="missing"))
+        return
+    try:
+        ok = setter(value)
+    except Exception as exc:  # noqa: BLE001 - fremde API
+        emit(favorite_failed(asset_id, value, f"{type(exc).__name__}: {exc}"))
+        return
+    if ok is False:
+        emit(favorite_failed(asset_id, value, "iCloud refused the change"))
+        return
+    emit({"type": "favorite_set", "id": asset_id, "value": value})
+
+
 def serve_upload(api: Any, command: dict[str, Any]) -> None:
     """Laedt eine Datei in die Mediathek. Das neue Foto kommt mit dem
     naechsten Sync samt Vorschau in den Katalog; hier geht es nur um den
@@ -972,6 +1013,18 @@ def run_fake_serve(count: int, needs_password: bool, needs_terms: bool = False) 
                 emit({"type": "photo_deleted", "id": asset_id})
             else:
                 emit(delete_failed(asset_id, "Asset not found", kind="missing"))
+            continue
+        if command.get("cmd") == "favorite":
+            # Ohne iCloud: `ICLOUD_PHOTOS_FAKE_FAVORITE_FAIL=1` laesst iCloud
+            # ablehnen, damit die App ihre Rueckname zeigen muss.
+            asset_id = command.get("id", "")
+            value = bool(command.get("value"))
+            if os.environ.get("ICLOUD_PHOTOS_FAKE_FAVORITE_FAIL"):
+                emit(favorite_failed(asset_id, value, "iCloud refused the change"))
+            elif asset_id.startswith(("fake-", "demo-")):
+                emit({"type": "favorite_set", "id": asset_id, "value": value})
+            else:
+                emit(favorite_failed(asset_id, value, "Asset not found", kind="missing"))
             continue
         if command.get("cmd") == "upload":
             path = command.get("path") or ""
