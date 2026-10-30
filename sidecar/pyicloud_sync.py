@@ -973,8 +973,15 @@ def serve_upload(api: Any, command: dict[str, Any]) -> None:
     if not path or not Path(path).is_file():
         emit(upload_failed(path, "file not found"))
         return
+    album_name = command.get("album") or None
     try:
-        asset = api.photos.upload(path)
+        if album_name:
+            # Das Foto landet in der Mediathek und zusaetzlich im Album;
+            # das Album wird beim ersten Mal angelegt.
+            album = api.photos.albums.find(album_name) or api.photos.create_album(album_name)
+            asset = api.photos.upload(path, album=album)
+        else:
+            asset = api.photos.upload(path)
     except Exception as exc:  # noqa: BLE001 - fremde API
         emit(upload_failed(path, f"{type(exc).__name__}: {exc}"))
         return
