@@ -2964,6 +2964,7 @@ fn build_grid(state: &Rc<AppState>, window: &adw::ApplicationWindow) -> gtk::Gri
             badge.set_halign(gtk::Align::End);
             badge.set_valign(gtk::Align::End);
             badge.add_css_class("photo-badge");
+            badge.add_css_class("photo-mark");
             badge.set_visible(false);
             badge.set_can_target(false);
             // Das Herz der Favoriten unten links, wie im Lab.

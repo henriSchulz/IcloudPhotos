@@ -282,7 +282,23 @@ window.velum-photos.velum-touch .photo-check {
   min-height: var(--v-photos-check-touch);
 }
 
-/* Video-Kennzeichen und Datumszeile liegen auf Fotos: deckender Popover-Ton. */
+/* Herz und Video-Kennzeichen der Kacheln liegen wie in Apple Photos ohne
+   Plakette direkt auf dem Foto: weiß, mit weichem Schatten, damit sie auch auf
+   hellen Bildern tragen. */
+window.velum-photos .photo-badge.photo-mark,
+window.velum-photos .photo-heart {
+  margin: var(--v-photos-badge-inset);
+  padding: 0;
+  background: none;
+  box-shadow: none;
+  color: var(--v-photos-mark-ink);
+  text-shadow: var(--v-photos-mark-shadow);
+  -gtk-icon-shadow: var(--v-photos-mark-shadow);
+  font-size: var(--v-type-callout);
+  -gtk-icon-size: var(--v-type-callout);
+}
+/* Der Ladekreis im Betrachter und die Datumszeile liegen auf Fotos:
+   deckender Popover-Ton. */
 window.velum-photos .photo-badge {
   margin: var(--v-photos-badge-inset);
   min-height: var(--v-photos-badge);
@@ -294,17 +310,6 @@ window.velum-photos .photo-badge {
   border-radius: var(--v-radius-pill);
   font-size: var(--v-type-caption);
   -gtk-icon-size: var(--v-type-caption);
-}
-/* Das Herz liegt wie in Apple Photos ohne Plakette direkt auf dem Foto:
-   weiß, mit weichem Schatten, damit es auch auf hellen Bildern trägt. */
-window.velum-photos .photo-heart {
-  margin: var(--v-photos-badge-inset);
-  padding: 0;
-  color: var(--v-photos-mark-ink);
-  text-shadow: var(--v-photos-mark-shadow);
-  -gtk-icon-shadow: var(--v-photos-mark-shadow);
-  font-size: var(--v-type-callout);
-  -gtk-icon-size: var(--v-type-callout);
 }
 window.velum-photos .photo-date {
   padding: var(--v-space-6) var(--v-space-12);
@@ -526,12 +531,9 @@ window.velum-photos .pin-title {
 window.velum-photos .cover-glyph { font-size: var(--v-photos-stat-glyph); -gtk-icon-size: var(--v-photos-stat-glyph); }
 window.velum-photos .cover-badge {
   margin: var(--v-space-6);
-  min-width: var(--v-photos-cover-badge);
-  min-height: var(--v-photos-cover-badge);
-  border-radius: var(--v-radius-pill);
-  background-color: var(--v-popover-bg-opaque);
-  box-shadow: var(--v-popover-shadow);
-  color: var(--v-popover-ink);
+  color: var(--v-photos-mark-ink);
+  text-shadow: var(--v-photos-mark-shadow);
+  -gtk-icon-shadow: var(--v-photos-mark-shadow);
   font-size: var(--v-type-callout);
   -gtk-icon-size: var(--v-type-callout);
 }

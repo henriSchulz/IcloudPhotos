@@ -535,6 +535,7 @@ fn build_tile(
     if photo.record.is_video() {
         let badge = icons::glyph("play", Weight::Fill, "media-playback-start-symbolic");
         badge.add_css_class("photo-badge");
+        badge.add_css_class("photo-mark");
         badge.set_halign(gtk::Align::End);
         badge.set_valign(gtk::Align::End);
         badge.set_can_target(false);
